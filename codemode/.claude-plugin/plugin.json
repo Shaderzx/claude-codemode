@@ -1,0 +1,1 @@
+{ "name": "codemode", "version": "0.1.0", "author": { "name": "Shad" }, "description": "Makes one script tool the only tool Claude can call directly: every other tool runs from inside a JavaScript script, and only the script's output reaches the model." }

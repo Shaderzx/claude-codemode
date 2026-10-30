@@ -10,34 +10,37 @@ const SEARCH = 'ToolSearch'
 const AGENTS_PLUGIN = 'codemode-agents'
 const AGENTS_TOOL = `mcp__${AGENTS_PLUGIN}__spawn`
 const DEFAULT_TIMEOUT_MS = 600_000
-const DEFAULT_MAX_CHARS = 40_000
+const DEFAULT_MAX_CHARS = 20_000
+// Images and PDFs attached to one script's output, at most.
+const MAX_PICTURES = 10
+// Cut outputs kept whole on disk, newest first.
+const KEEP_SPILLS = 20
 
-const DESCRIPTION = `Run a JavaScript script that calls tools. This is the only tool that does work: every other tool (Read, Bash, Agent, AskUserQuestion, Skill, MCP tools, ...) is called from inside a script, and calling one directly is refused. ToolSearch is the one exception, and only for loading a tool's schema so you know its arguments; the call itself still goes in a script. Only what the script outputs reaches you, so batch independent calls with Promise.all and cut large results down before returning them.
+const DESCRIPTION = `Run a JavaScript script that calls tools. This is the only tool that does work: every other tool (Read, Bash, Agent, AskUserQuestion, Skill, MCP tools, ...) is called from inside a script, and calling one directly is refused. Only what the script outputs reaches you, so batch independent calls with Promise.all and cut large results down before returning them.
 
-Input \`script\` is raw JavaScript, the body of an async function: top-level await and return work. An optional first line sets limits:
-// @options: {"timeout_ms": 600000, "max_output_chars": 40000}
+Input \`script\` is the body of an async function: top-level await and return work. An optional first line sets limits:
+// @options: {"timeout_ms": 600000, "max_output_chars": 20000}
+Longer output is cut in the middle, and the cut names a file that holds all of it.
 
 Globals:
-- tools.<Name>(args): call a tool by its exact name (characters invalid in identifiers become _, e.g. tools.mcp__lean_ctx__ctx_read for mcp__lean-ctx__ctx_read). Resolves to the result text the tool would have shown you; rejects with an Error on a denied or failed call. Use Promise.allSettled to keep partial results.
-- call(name, args): the same, but never throws. Resolves to { ok, text, result, error }, where result is the tool's structured output.
-- text(value): add an output item (non-strings as JSON). A top-level return value is added too.
-- console.log/info/warn/error(...): lines in a <console_output> block after the other output.
-- ALL_TOOLS: [{ name, description }] for every tool a script can call.
-- searchTools(query, { limit = 8 }?): rank ALL_TOOLS by name and description match. Sync.
-- describeTool(name): async; { name, description } with the tool's full description.
-- store(key, value) / load(key): async; keep small JSON values across runs.
-- exit(): stop the script successfully.
-Scripts have no fetch, timers, process, require or import: they reach the outside world only through tools.
+- tools.<Name>(args): call a tool by its exact name (characters invalid in identifiers become _, e.g. tools.mcp__lean_ctx__ctx_read for mcp__lean-ctx__ctx_read). Resolves to the result text; rejects with an Error on a denied or failed call. Promise.allSettled keeps partial results.
+- call(name, args): the same, but never throws: { ok, text, result, error }, result being the tool's structured output.
+- text(value) and a top-level return add output items; console.log/info/warn/error(...) add lines to a <console_output> block.
+- describeTool(name): async { name, description, input }, input being the tool's arguments as a TypeScript type. Far cheaper than ToolSearch. A call with bad arguments gets the type in its error too.
+- ask(prompt, { model = "haiku", system, maxTokens = 1024 }?): async; one completion by another model, without tools, resolving to its text. Boil large data down with it so only the answer reaches you.
+- Images and PDFs from tools arrive as markers like [image #1 image/png 12KB]; a marker in the output attaches the picture for you to see.
+- ALL_TOOLS: [{ name, description }]; searchTools(query, { limit = 8 }?) ranks them (sync).
+- store(key, value) / load(key): async; small JSON values kept across runs. exit(): stop successfully.
+No fetch, timers, process, require or import: only tools reach the outside world.
 
-Common arguments (check ALL_TOOLS for what this session has):
+Common arguments (ALL_TOOLS lists what this session has; describeTool gives the rest):
 - Read({ file_path, offset?, limit? })   - Write({ file_path, content })
 - Edit({ file_path, old_string, new_string, replace_all? })   (Read the file first)
 - Bash({ command, description?, timeout?, run_in_background? })
 - Agent({ description, prompt, subagent_type? })   - Skill({ skill, args? })
 - AskUserQuestion({ questions: [{ question, header, multiSelect, options: [{ label, description }] }] })
-For any other tool whose arguments you have not seen, load its schema first with ToolSearch ("select:<name>").
 
-Tool calls are real and are not undone when a later line fails. Calls still running when the script ends or times out are abandoned, not stopped.
+Tool calls are real: a later failure undoes nothing, and calls still running when the script ends or times out are abandoned, not stopped.
 
 Example:
 const [a, b] = await Promise.all([
@@ -74,6 +77,12 @@ const show = (v) => {
 }
 const ident = (n) => n.replace(/[^A-Za-z0-9_$]/g, '_')
 class Exit extends Error {}
+// Frames of the runner and of Node say nothing about the script; keep its own.
+const clean = (err) => {
+  const stack = err && typeof err.stack === 'string' ? err.stack : ''
+  if (!stack) return (err && err.message) || show(err)
+  return stack.split('\n').filter((l) => !/^\s+at /.test(l) || l.includes('script.js')).join('\n')
+}
 async function main({ script, tools: all, dir, timeout }) {
   fs.mkdirSync(dir, { recursive: true })
   const items = [], logs = []
@@ -142,17 +151,23 @@ async function main({ script, tools: all, dir, timeout }) {
     text: (v) => { keep(items, show(v)) },
     console: { log, info: log, warn: log, error: log, debug: log },
     describeTool: async (name) => (await req('describe', { tool: resolve(name) })).value,
+    ask: async (prompt, opts) => {
+      const o = opts && typeof opts === 'object' ? opts : {}
+      const r = await req('ask', { prompt: String(prompt), model: o.model, system: o.system, maxTokens: o.maxTokens, effort: o.effort })
+      if (!r.ok) throw new Error('ask: ' + r.error)
+      return r.text
+    },
     store: async (key, value) => { const r = await req('store', { key: String(key), value }); if (!r.ok) throw new Error('store: ' + r.error) },
     load: async (key) => (await req('load', { key: String(key) })).value,
     exit: () => { throw new Exit() },
   })
   let failure
   try {
-    const fn = vm.runInContext('(async () => {"use strict";\n' + script + '\n})', ctx, { filename: 'script.js' })
+    const fn = vm.runInContext('(async () => {"use strict";\n' + script + '\n})', ctx, { filename: 'script.js', lineOffset: -1 })
     const value = await fn()
     if (value !== undefined) keep(items, show(value))
   } catch (err) {
-    if (!(err instanceof Exit)) failure = (err && (err.stack || err.message)) || show(err)
+    if (!(err instanceof Exit)) failure = clean(err)
   }
   finish(failure)
 }
@@ -161,12 +176,11 @@ async function main({ script, tools: all, dir, timeout }) {
 type Options = { timeout_ms?: number; max_output_chars?: number }
 
 export const parseOptions = (script: string): { options: Options; error?: string } => {
-  const lines = script.split('\n')
-  const at = lines.findIndex((l) => /^\s*\/\/\s*@options:/.test(l))
-  if (at > 0) return { options: {}, error: 'The // @options: line must be the first line of the script.' }
-  if (at === -1) return { options: {} }
+  // Only the first non-blank line counts, so a script can carry the text in a string.
+  const first = script.split('\n').find((l) => l.trim()) ?? ''
+  if (!/^\s*\/\/\s*@options:/.test(first)) return { options: {} }
   try {
-    const options: unknown = JSON.parse((lines[0] ?? '').trim().replace(/^\/\/\s*@options:/, '').trim())
+    const options: unknown = JSON.parse(first.trim().replace(/^\/\/\s*@options:/, '').trim())
     if (!options || typeof options !== 'object' || Array.isArray(options))
       return { options: {}, error: 'The // @options: line must hold a JSON object.' }
     return { options: options as Options }
@@ -175,19 +189,121 @@ export const parseOptions = (script: string): { options: Options; error?: string
   }
 }
 
-export const clip = (out: string, max: number) =>
-  out.length <= max
-    ? out
-    : `${out.slice(0, Math.floor(max / 2))}\n…${out.length - max} chars truncated…\n${out.slice(out.length - Math.floor(max / 2))}`
+// Keeps the head and the tail; `file`, when given, holds the whole output.
+export const clip = (out: string, max: number, file?: string) => {
+  if (out.length <= max) return out
+  const half = Math.floor(max / 2)
+  const note = file ? `; all of it is in ${file}` : ''
+  return `${out.slice(0, half)}\n…${out.length - max} chars cut${note}…\n${out.slice(out.length - half)}`
+}
 
+// A run that worked says nothing about itself: only its output reaches the model.
 export const format = (ms: number, d: { items: string[]; logs: string[]; failure?: string }) => {
-  const parts = [`Script ${d.failure ? 'failed' : 'completed'} in ${ms}ms`]
+  const parts: string[] = []
   if (d.items.length > 1) d.items.forEach((t, i) => parts.push(`==> text ${i + 1}/${d.items.length} <==\n${t}`))
   else parts.push(...d.items)
   if (d.logs.length) parts.push(`<console_output>\n${d.logs.join('\n')}\n</console_output>`)
-  if (d.failure) parts.push(`Script error: ${d.failure}`)
-  return parts.join('\n')
+  if (d.failure) parts.push(`Script failed after ${ms}ms: ${d.failure}`)
+  return parts.join('\n') || '(no output)'
 }
+
+// A tool's arguments as one TypeScript type, from a JSON schema.
+export const tsType = (s: unknown, depth = 0): string => {
+  if (!s || typeof s !== 'object' || depth > 6) return 'unknown'
+  const o = s as Record<string, unknown>
+  if (Array.isArray(o.enum)) return o.enum.map((v) => JSON.stringify(v)).join(' | ')
+  if ('const' in o) return JSON.stringify(o.const)
+  const alts = o.anyOf ?? o.oneOf
+  if (Array.isArray(alts)) return alts.map((a) => tsType(a, depth + 1)).join(' | ')
+  const types = Array.isArray(o.type) ? o.type : [o.type]
+  if (types.includes('array')) {
+    const item = tsType(o.items, depth + 1)
+    return /[ |]/.test(item) ? `(${item})[]` : `${item}[]`
+  }
+  if (types.includes('object') || o.properties) {
+    const required = new Set(Array.isArray(o.required) ? o.required : [])
+    const props = Object.entries((o.properties ?? {}) as Record<string, unknown>).map(
+      ([k, v]) => `${/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)}${required.has(k) ? '' : '?'}: ${tsType(v, depth + 1)}`,
+    )
+    return props.length ? `{ ${props.join('; ')} }` : 'object'
+  }
+  const named = types.filter((t): t is string => typeof t === 'string').map((t) => (t === 'integer' ? 'number' : t))
+  return named.length ? named.join(' | ') : 'unknown'
+}
+
+// One tool's input type from a `.d.ts` Claude Code generates for mods: the
+// block under its key, dedented.
+export const inputType = (source: string, tool: string): string | undefined => {
+  const lines = source.split('\n')
+  const key = tool.replace(/[.*+?^$|{}()[\]\\]/g, '\\$&')
+  const head = new RegExp(`^    (?:${key}|"${key}"|'${key}'): (.*)$`)
+  const at = lines.findIndex((l) => head.test(l))
+  if (at < 0) return undefined
+  const body = [(lines[at] as string).replace(head, '$1')]
+  if (body[0]?.trim() !== '{}')
+    for (const l of lines.slice(at + 1)) {
+      // The next key (or its doc comment) at the same depth, or the interface's end.
+      if (/^ {4}[^ }]/.test(l) || /^ {0,3}\S/.test(l)) break
+      body.push(l.slice(4))
+    }
+  return body.join('\n').trimEnd()
+}
+
+// Bad arguments come back with advice to load the tool through ToolSearch and
+// its whole JSON schema. A script needs neither: keep the engine's first lines
+// and give the arguments as one TypeScript type.
+export const tidy = (tool: string, message: string): { message: string; type?: string } => {
+  const plain = message.replace(/^<tool_use_error>/, '').replace(/<\/tool_use_error>$/, '')
+  const at = plain.indexOf("This tool's schema was not sent to the API")
+  const marker = "this tool's input schema is: "
+  const from = plain.indexOf(marker, at)
+  if (at < 0 || from < 0) return { message: plain }
+  try {
+    const type = tsType(JSON.parse(plain.slice(from + marker.length, plain.lastIndexOf('}') + 1)))
+    return { message: `${plain.slice(0, at).trimEnd()}\n${tool} takes ${type}`, type }
+  } catch {
+    return { message: plain }
+  }
+}
+
+type Picture = { kind: 'image' | 'document'; media: string; data: string }
+
+// An image or PDF in a tool's result: the API's block, an MCP block, Read's
+// image or PDF, or a page image Read extracted.
+const pictureOf = (o: Record<string, unknown>): Picture | undefined => {
+  const src = o.source as Record<string, unknown> | undefined
+  const file = o.file as Record<string, unknown> | undefined
+  if (o.type === 'image' && src?.type === 'base64' && typeof src.data === 'string')
+    return { kind: 'image', media: String(src.media_type), data: src.data }
+  if (o.type === 'image' && typeof o.data === 'string') return { kind: 'image', media: String(o.mimeType ?? 'image/png'), data: o.data }
+  if (o.type === 'image' && typeof file?.base64 === 'string') return { kind: 'image', media: String(file.type), data: file.base64 }
+  if (o.type === 'pdf' && typeof file?.base64 === 'string') return { kind: 'document', media: 'application/pdf', data: file.base64 }
+  if (typeof o.base64 === 'string' && o.base64 && typeof o.mediaType === 'string') return { kind: 'image', media: o.mediaType, data: o.base64 }
+  return undefined
+}
+
+// Swaps each picture in a result for a short marker and keeps it aside, so no
+// base64 reaches the script; a marker in the output brings the picture back.
+export const strip = (v: unknown, pictures: Picture[], markers: string[], depth = 0): unknown => {
+  if (v === null || typeof v !== 'object' || depth > 8) return v
+  if (Array.isArray(v)) return v.map((x) => strip(x, pictures, markers, depth + 1))
+  const p = pictureOf(v as Record<string, unknown>)
+  if (!p) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, strip(x, pictures, markers, depth + 1)]))
+  pictures.push(p)
+  const kb = Math.max(1, Math.round((p.data.length * 3) / 4 / 1024))
+  const marker = `[${p.kind === 'image' ? 'image' : 'pdf'} #${pictures.length} ${p.media} ${kb}KB]`
+  markers.push(marker)
+  return marker
+}
+
+// The pictures whose markers made it into the output, as content blocks.
+export const attach = (out: string, pictures: Picture[]) =>
+  [...new Set([...out.matchAll(/\[(?:image|pdf) #(\d+) /g)].map((m) => Number(m[1])))]
+    .flatMap((n) => {
+      const p = pictures[n - 1]
+      return p ? [{ type: p.kind, source: { type: 'base64', media_type: p.media, data: p.data } }] : []
+    })
+    .slice(0, MAX_PICTURES)
 
 const ident = (name: string) => name.replace(/[^A-Za-z0-9_$]/g, '_')
 
@@ -200,9 +316,9 @@ const show = (v: unknown): string => {
   }
 }
 
-type Request = { id: number; kind: 'call' | 'describe' | 'store' | 'load'; payload: Record<string, unknown> }
+type Request = { id: number; kind: 'call' | 'describe' | 'store' | 'load' | 'ask'; payload: Record<string, unknown> }
 type Done = { done: true; items: string[]; logs: string[]; failure?: string }
-const KINDS = new Set(['call', 'describe', 'store', 'load'])
+const KINDS = new Set(['call', 'describe', 'store', 'load', 'ask'])
 
 // Keys `$.tool.call` reads beside a tool's arguments. `consent` would stand in
 // for the user's own approval, so a script never gets to set any of them.
@@ -212,6 +328,11 @@ const num = (v: unknown, fallback: number, min: number, max: number) =>
   typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(v, min), max) : fallback
 
 let runs = 0
+
+// Tool input types: the generated `.d.ts` files, read once, then the schemas
+// that calls with bad arguments brought back.
+let typeSources: string[] | undefined
+const learned = new Map<string, string>()
 
 // The Skill tool's result is only "Launching skill: x"; the engine sends the
 // skill's text to the model as a separate message, which a script never sees.
@@ -291,7 +412,30 @@ export const register: Register = (on) => {
       if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
       if (m.kind === 'describe') {
         const t = all.find((x) => x.name === p.tool)
-        return { ok: true, value: t ? { ...t, schema: `load it with ToolSearch "select:${t.name}"` } : undefined }
+        if (!t) return { ok: true, value: undefined }
+        if (typeSources === undefined) {
+          const found: string[] = []
+          for (const f of ['claude-code-tools', 'claude-code-mcp']) {
+            const text = await $.fs.read(`${$.plugin.root}/.claude-plugin/types/${f}/index.d.ts`).catch(() => '')
+            if (typeof text === 'string' && text) found.push(text.split('interface BuiltinToolResults')[0] ?? text)
+          }
+          typeSources = found
+        }
+        const input = typeSources.map((s) => inputType(s, t.name)).find(Boolean) ?? learned.get(t.name)
+        return { ok: true, value: { ...t, input: input ?? `not known here; ToolSearch "select:${t.name}" loads its schema` } }
+      }
+      if (m.kind === 'ask') {
+        const effort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(String(p.effort)) ? (p.effort as 'low') : undefined
+        const r = await $.model.complete({
+          model: typeof p.model === 'string' && p.model ? p.model : 'haiku',
+          prompt: String(p.prompt ?? ''),
+          ...(typeof p.system === 'string' ? { system: p.system } : {}),
+          maxTokens: Math.floor(num(p.maxTokens, 1024, 1, 64_000)),
+          ...(effort ? { effort } : {}),
+          timeoutMs: timeout,
+        })
+        if (r.isAnswered) return { ok: true, text: r.text }
+        return { ok: false, error: r.reason === 'api-error' ? `api-error ${r.status ?? ''} ${r.error}` : r.reason }
       }
       const tool = String(p.tool)
       if (tool === FULL) return { ok: false, error: 'A script cannot run another script.' }
@@ -307,17 +451,24 @@ export const register: Register = (on) => {
       if (tool === 'Skill') skillTexts.delete(key)
       const r = await $.tool.call({ ...args, tool: target } as never)
       if (r.deny !== undefined) return { ok: false, error: r.deny }
-      let text = r.text ?? show(r.result)
+      const markers: string[] = []
+      const result = strip(r.result, pictures, markers)
+      let text = r.text ?? show(result)
       if (tool === 'Skill' && !r.isError) {
         const body = skillTexts.get(key)
         skillTexts.delete(key)
         if (body !== undefined) text = `${text}\n\n${body}`
       }
-      return r.isError ? { ok: false, error: text, text, result: r.result } : { ok: true, text, result: r.result }
+      if (markers.length) text = [text.trim(), ...markers].filter(Boolean).join('\n')
+      if (!r.isError) return { ok: true, text, result }
+      const bad = tidy(tool, text)
+      if (bad.type) learned.set(tool, bad.type)
+      return { ok: false, error: bad.message, text: bad.message, result }
     }
 
     let over = false
     const writes = new Set<Promise<unknown>>()
+    const pictures: Picture[] = []
     const respond = async (m: Request) => {
       let out: Record<string, unknown>
       try {
@@ -402,11 +553,26 @@ export const register: Register = (on) => {
     // A reply already being written could recreate the dir after it is removed.
     await Promise.allSettled([...writes])
     await $.process.run(['rm', '-rf', dir]).catch(() => {})
-    const result =
+    const ended =
       done ??
       (killed
         ? { items: [], logs: [], failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
         : { items: [], logs: [], failure: `script runner exited without a result.\n${stderr.trim()}` })
-    return { result: clip(format(Date.now() - started, result), maxChars) }
+    const full = format(Date.now() - started, ended)
+    // A cut output is kept whole on disk, so nothing in it needs a second run.
+    let file: string | undefined
+    if (full.length > maxChars) {
+      const spills = `${home}/.claude/codemode/out`
+      const path = `${spills}/${dir.slice(root.length + 1)}.txt`
+      file = await $.fs.write(path, full).then(() => path, () => undefined)
+      const old = ((await $.fs.list(spills).catch(() => [])) ?? [])
+        .filter((x) => x.name.endsWith('.txt'))
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+        .slice(KEEP_SPILLS)
+      if (old.length) await $.process.run(['rm', '-f', ...old.map((x) => `${spills}/${x.name}`)]).catch(() => {})
+    }
+    const out = clip(full, maxChars, file)
+    const blocks = attach(out, pictures)
+    return { result: blocks.length ? ([{ type: 'text', text: out }, ...blocks] as never) : out }
   })
 }

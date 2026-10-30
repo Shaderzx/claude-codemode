@@ -58,6 +58,48 @@ Scripts are not handed `fetch`, timers, `process`, `require` or `import`. The `v
 4. **Skills.** The Skill tool's own result is only `Launching skill: <name>`; Claude Code sends the skill's text to the model as a separate message, which a script never sees. The mod keeps the text expanded at `skill.prompt` and appends it to the Skill result, so `tools.Skill({ skill })` returns the whole skill.
 5. **Subagents.** A plugin cannot call the Agent tool; Claude Code says to use `$.agent.spawn` instead. Claude Code also skips a plugin's hooks for every subagent started inside that plugin's chain of calls, even through another plugin's tool. So `tools.Agent(...)` (or the old name `tools.Task(...)`) is forwarded to `mcp__codemode-agents__spawn`, which queues the request; a loop started in `codemode-agents`' `session.start` does the real `$.agent.spawn` outside codemode's chain, and its `turn.complete` hook collects the answer. Subagents therefore get `mcp__codemode__run` and are held to scripts like the main session. The spawn tool refuses any caller but codemode, refuses `isolation` and `effort` (which `$.agent.spawn` cannot express) instead of dropping them, waits at most an hour for a started subagent's answer, and reports a subagent that ended with an error, refusal or abort as a failed call. `Workflow` is refused from scripts, because its agents would start inside codemode's chain and skip its hooks.
 
+## Performance
+
+Scripts are cheap. Tool calls are not. Measured on the machine this was written on.
+
+| Thing | Cost |
+| --- | --- |
+| Starting a script (spawn Node, boot, run dir) | ~60 ms, once per run |
+| codemode's own request/reply path (file write + poll) | ~1.5 ms per call |
+| One tool call, sequentially | ~160 ms (native tool) to ~260 ms (MCP tool) |
+
+Two things follow, and only one of them is a number.
+
+**Batch independent calls with `Promise.all`.** This is the whole win, and it costs nothing to adopt. Forty shell calls one after another took 9.5 s; the same forty through `Promise.all` took 0.7 s. Better still, prefer a tool that already takes many inputs, or one shell call that does several jobs internally, over N calls that lean on batching to save you.
+
+**lean-ctx's MCP tools appear to have a concurrency ceiling of 16, and it is not codemode's.** Each tool call becomes one `$.tool.call`, which the engine forwards to the MCP server. Measured with one-second sleeps, instrumented server-side so polling lag cannot fake a limit:
+
+| Batch | Wall clock | Peak overlap |
+| --- | --- | --- |
+| 8 | 1.3 s | 8 |
+| 16 | 2.4 s | 15 |
+| 32 | 3.4 s | 16 |
+| 64 | 5.8 s | 16 |
+
+Native engine tools did not hit it in the same test: 64 concurrent native `Read` calls finished in ~0.8 s, where 64 capped calls would have taken several waves. That is one tool on small files, so it rules out a limit on all engine tools, not one specific to MCP calls. Who owns the ceiling is likely lean-ctx but not proven. Its binary lists `agents.max_concurrent_workers` as retired (`registration never applied it`), and an older config on this machine carried the comment "Built-in defaults are 12 workers / 4 mutating, which is why ~15 agents broke" beside a setting this version no longer has. That matches 16, but a retired key and a `.bak` comment are clues, not proof. Settling it needs the same overlap test against a different MCP server, which was not measured.
+
+**What to do about the ceiling: stop fighting it and make fewer calls.** Inside codemode there is no lever. `$.tool.call` has no concurrency argument, and the mod never awaits one reply before reading the next request, so it throttles nothing. Raising the number is an MCP-server-side or engine-side change. The portable workaround is to hand the work to one process that parallelises itself:
+
+```js
+// 32 two-second jobs in 2.3 s through ONE call, versus 4.4 s as 32 calls.
+// Timing sketch: a bare `wait` ignores each job's exit status, so a real
+// script should collect the pids and check them before trusting the result.
+await tools.mcp__lean_ctx__ctx_shell({
+  command: 'for i in $(seq 1 32); do ( work_"$i" ) & done; wait',
+})
+```
+
+That trick is honest only where the work can be backgrounded, chiefly shell work. It buys throughput, not lower latency per operation.
+
+**What not to bother with.** Replacing the file-based request/reply with a socket buys at most 1.5 ms on a call that takes 160-260 ms. Keeping a Node runner warm between runs saves ~60 ms per run, which only matters to a run that makes one call and nothing else, and it trades away the clean isolation where each run gets its own directory that is deleted afterwards.
+
+**On choosing a language for scripts.** JavaScript is the contract codemode implements, not a law of nature. The request/reply protocol is plain text lines and files, so a runner in another language would not need a second bridge. But no language choice touches the two numbers that matter: a tool call still costs 160-260 ms, and the ceiling above is still 16. The one cost a language could move is the ~60 ms startup, which is noise beside a single call. Rust as the script language makes that worse, not better, because every script would be compiled before it ran; a Rust binary that hosts a JavaScript engine is a different and much larger project. Python starts in roughly the same ballpark as Node. Java would be the clear worst of the three, since a JVM per run dwarfs the runner itself.
+
 ## Gotchas
 
 - No `eval` and no `setTimeout` in the mod runtime. Use `$.clock.after` for timers.

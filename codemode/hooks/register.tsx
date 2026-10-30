@@ -572,7 +572,8 @@ export const register: Register = (on) => {
       if (old.length) await $.process.run(['rm', '-f', ...old.map((x) => `${spills}/${x.name}`)]).catch(() => {})
     }
     const out = clip(full, maxChars, file)
-    const blocks = attach(out, pictures)
+    // A marker the cut removed still counts: the script chose to show it.
+    const blocks = attach(full, pictures)
     return { result: blocks.length ? ([{ type: 'text', text: out }, ...blocks] as never) : out }
   })
 }

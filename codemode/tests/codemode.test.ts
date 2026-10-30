@@ -147,6 +147,17 @@ test('an image whose marker is left out of the output is not attached', { timeou
   expect(r.result).toBe('nothing to see')
 })
 
+test('an image whose marker falls in the cut middle is still attached', { timeoutMs: 10_000 }, async ($, on) => {
+  const image = { type: 'image', file: { base64: 'QUJDREVG', type: 'image/png', originalSize: 6 } }
+  const big = 'a'.repeat(15_000) + '[image #1 image/png 1KB]' + 'b'.repeat(15_000)
+  setup(on, oneCall([big]), { answer: { result: image, text: '' } })
+  await $.session.start(START)
+  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  const blocks = r.result as unknown as { type: string; source?: { data: string } }[]
+  expect(blocks[1]?.type).toBe('image')
+  expect(blocks[1]?.source?.data).toBe('QUJDREVG')
+})
+
 test('a cut output is saved whole and the cut names the file', { timeoutMs: 10_000 }, async ($, on) => {
   const big = 'a'.repeat(15_000) + 'MIDDLE' + 'b'.repeat(15_000)
   const f = setup(on, async function* () {

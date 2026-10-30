@@ -275,6 +275,8 @@ export const register: Register = (on) => {
       .filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
       .map((t) => ({ name: t.name, description: t.description }))
     const home = (await $.env.get('HOME')) ?? '/tmp'
+    // A host whose own node is older than 25 points this at a newer one.
+    const node = (await $.env.get('CODEMODE_NODE')) || 'node'
     const root = `${home}/.claude/codemode/runs`
     const dir = `${root}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${++runs}`
 
@@ -359,7 +361,7 @@ export const register: Register = (on) => {
     })
     try {
       const child = $.process.spawn({
-        argv: ['node', '--permission', `--allow-fs-read=${dir}`, `--allow-fs-write=${dir}`, '-e', RUNNER],
+        argv: [node, '--permission', `--allow-fs-read=${dir}`, `--allow-fs-write=${dir}`, '-e', RUNNER],
         input: JSON.stringify({ script, tools: all, dir, timeout }),
       })
       for await (const piece of child) {

@@ -23,6 +23,8 @@ mkdir -p ~/.claude/mods
 cp -R claude-codemode/codemode claude-codemode/codemode-agents ~/.claude/mods/
 ```
 
+If the `node` on Claude Code's `PATH` is older than 25, install a newer one anywhere and set `env.CODEMODE_NODE` in `~/.claude/settings.json` to its path; the runner uses it instead of `node`.
+
 Then add both folders to the end of `env.CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json` (colon separated), for example `"CLAUDE_CODE_PLUGIN_DIRS": "...:~/.claude/mods/codemode:~/.claude/mods/codemode-agents"`. Both mods load in every new session; sessions that are already running are not affected. Claude Code writes the TypeScript types the `tsconfig.json` files point at into `.claude-plugin/types/` on load; that folder is not committed.
 
 **To turn it off:** remove the two paths from `CLAUDE_CODE_PLUGIN_DIRS` and start a new session. To try it in one session only, leave settings alone and run `claude --plugin-dir ~/.claude/mods/codemode --plugin-dir ~/.claude/mods/codemode-agents`.

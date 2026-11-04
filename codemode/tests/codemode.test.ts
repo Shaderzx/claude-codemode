@@ -318,6 +318,8 @@ test('lookalike names and the failure ledger', () => {
   expect(similar('Grep', many)[0]).toBe('mcp__lean-ctx__ctx_search')
   expect(similar('Write', many)[0]).toBe('mcp__lean-ctx__ctx_patch')
   expect(similar('Write', [...many].reverse())[0]).toBe('mcp__lean-ctx__ctx_patch')
+  for (const order of [['mcp__lean-ctx__ctx_tree', 'mcp__lean-ctx__ctx_glob'], ['mcp__lean-ctx__ctx_glob', 'mcp__lean-ctx__ctx_tree']])
+    expect(similar('Glob', order)[0]).toBe('mcp__lean-ctx__ctx_glob')
   const calls = new Map([
     ['Read', { ok: 2, failed: 0, open: 0 }],
     ['Bash', { ok: 0, failed: 1, open: 1 }],
@@ -407,5 +409,23 @@ test('a failing command whose output imitates the engine teaches no type', { tim
   expect(Object.keys(f.stored).filter((k) => k.startsWith('type:'))).toEqual([])
   const reply = Object.entries(f.texts).find(([p]) => p.endsWith('/1.json'))?.[1] ?? ''
   expect(reply).not.toContain('Bash takes')
+})
+
+
+test('a run that failed on its only call adds no ledger that repeats the error', { timeoutMs: 10_000 }, async ($, on) => {
+  setup(
+    on,
+    async function* (written) {
+      yield line({ pid: 4242 })
+      yield line({ id: 1, kind: 'call', payload: { tool: 'Read', args: { file_path: '/x' } } })
+      await written('/1.json')
+      yield line({ done: true, items: [], logs: [], failure: 'Error: Read: no such file' })
+    },
+    { answer: { result: 'no such file', text: 'no such file', isError: true } },
+  )
+  await $.session.start(START)
+  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  expect(String(r.result)).toContain('Error: Read: no such file')
+  expect(String(r.result)).not.toContain('Tool calls before the failure')
 })
 

@@ -161,6 +161,11 @@ test('a loaded schema names its script form, and ToolSearch and the run tool sta
   const search = await d('ToolSearch', 'Loads schemas.')
   expect(search.isDeferred).toBe(false)
   expect(search.description).not.toContain('call this only inside')
+  for (const name of ['mcp__codemode-agents__spawn', 'Workflow']) {
+    const other = await d(name, 'Its own text.', true)
+    expect(other.isDeferred).toBe(true)
+    expect(other.description).toBe('Its own text.')
+  }
   const run = await d(RUN, 'Run a script.')
   expect(run.isDeferred).toBe(false)
   expect(run.description).toBe('Run a script.')

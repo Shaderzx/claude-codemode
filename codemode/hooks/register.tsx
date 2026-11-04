@@ -535,6 +535,9 @@ export const register: Register = (on) => {
     if (e.tool === SEARCH)
       return { ...r, isDeferred: false, description: `${r.description}\n\nUnder codemode a loaded tool is still called from a ${FULL} script (tools.<Name>(args)), never directly.` }
     if (e.tool === FULL) return { ...r, isDeferred: false }
+    // Neither is called as tools.<name>: the spawn tool's own description sends
+    // callers to Agent, and Workflow is refused from scripts as well.
+    if (e.tool === AGENTS_TOOL || e.tool === 'Workflow') return { ...r, isDeferred: true }
     // The loaded schema is what the model reads as it decides how to call, so it
     // names the script form too: GLM 5.3 read the note above, loaded a tool and
     // still called it directly. Deferred, the line costs nothing until loaded.

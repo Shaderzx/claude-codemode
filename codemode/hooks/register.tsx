@@ -107,7 +107,14 @@ const json = (v) => {
 }
 // The script's objects come from the vm context's realm, so plainness is read
 // from the prototype chain, not compared with this realm's Object.prototype.
-const plain = (v) => Array.isArray(v) || (v !== null && typeof v === 'object' && Object.getPrototypeOf(Object.getPrototypeOf(v) ?? {}) === null && Object.prototype.toString.call(v) === '[object Object]')
+const plain = (v) => {
+  try {
+    if (Array.isArray(v)) return true
+    if (v === null || typeof v !== 'object') return false
+    const proto = Object.getPrototypeOf(v)
+    return proto === null || (Object.getPrototypeOf(proto) === null && Object.prototype.toString.call(v) === '[object Object]')
+  } catch { return false }
+}
 // Multi-line text inside an object prints raw under one heading per key, not
 // as JSON full of \n and \" escapes; other values stay JSON.
 const show = (v) => {
@@ -182,9 +189,15 @@ async function main({ script, tools: all, dir, timeout }) {
   })
   // A listing carries each tool's first sentence; describeTool has the rest.
   const brief = (d) => {
-    const s = String(d).split('\n')[0].trim()
-    const m = /^.*?[.!?](?=\s|$)/.exec(s)
-    const o = m ? m[0] : s
+    // The first line with words (some start with a blank line or a heading), up to
+    // its first sentence end that is not an abbreviation.
+    const s = String(d).split('\n').map((l) => l.trim().replace(/^[-*]\s+/, '')).find((l) => l && !l.startsWith('#')) || ''
+    let o = s
+    for (const m of s.matchAll(/[.!?](?=\s|$)/g)) {
+      if (/\b(?:e\.g|i\.e|etc|vs)$/i.test(s.slice(0, m.index))) continue
+      o = s.slice(0, m.index + 1)
+      break
+    }
     if (o.length <= 120) return o
     const cut = o.lastIndexOf(' ', 119)
     return o.slice(0, cut > 60 ? cut : 119) + '…'
@@ -256,7 +269,8 @@ export const clip = (out: string, max: number, file?: string) => {
     for (let i = out.indexOf('\n'); i >= 0 && i < at; i = out.indexOf('\n', i + 1)) n++
     return n
   }
-  const where = `lines ${line(half)}-${line(end)} of ${line(out.length)}`
+  // A trailing newline ends the last line; it does not start another.
+  const where = `lines ${line(half)}-${line(end - 1)} of ${line(out.endsWith('\n') ? out.length - 1 : out.length)}`
   const note = file ? `; all of it is in ${file}, so read back only the lines you need` : ''
   return `${out.slice(0, half)}\n…${out.length - max} chars cut (${where})${note}…\n${out.slice(end)}`
 }
@@ -318,6 +332,9 @@ export const inputType = (source: string, tool: string): string | undefined => {
 // and give the arguments as one TypeScript type.
 export const tidy = (tool: string, message: string): { message: string; type?: string } => {
   const plain = message.replace(/^<tool_use_error>/, '').replace(/<\/tool_use_error>$/, '')
+  // Only the engine's own validation error counts: a failing command's output
+  // could print the same advice and plant a type.
+  if (!plain.startsWith(`InputValidationError: ${tool} failed due to the following issue`)) return { message: plain }
   const at = plain.indexOf("This tool's schema was not sent to the API")
   const marker = "this tool's input schema is: "
   const from = plain.indexOf(marker, at)
@@ -379,6 +396,7 @@ export const ALIKE: Record<string, string[]> = {
   write: ['patch'],
   grep: ['search'],
   glob: ['glob', 'tree'],
+  read: [],
 }
 
 // A tool name's words: mcp__lean-ctx__ctx_shell is lean, ctx, ctx, shell.
@@ -398,11 +416,15 @@ export const similar = (name: string, names: string[]): string[] => {
   return names
     .filter((n) => n !== name && n !== SEARCH && n !== FULL)
     .map((n) => {
-      const has = new Set(words(n))
-      return { n, score: wanted.filter((w) => has.has(w)).length * 2 + (n.startsWith('mcp__') ? 1 : 0) }
+      const own = words(n)
+      const has = new Set(own)
+      // A name ending in the wanted word (ctx_search for Grep) beats one that only
+      // holds it (hindsight_search_knowledge_pages); then the shorter name wins.
+      const last = wanted.includes(own[own.length - 1] ?? '') ? 2 : 0
+      return { n, size: own.length, score: wanted.filter((w) => has.has(w)).length * 2 + last + (n.startsWith('mcp__') ? 1 : 0) }
     })
     .filter((x) => x.score > 1)
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => b.score - a.score || a.size - b.size)
     .slice(0, 3)
     .map((x) => x.n)
 }
@@ -454,6 +476,21 @@ const learned = new Map<string, string>()
 const skillTexts = new Map<string, { text: string; seq: number }>()
 let skillSeq = 0
 const skillKey = (name: string) => name.replace(/^\//, '').split(':').pop() ?? name
+const skillTurns = new Map<string, Promise<void>>()
+
+// Waits for earlier calls to the same skill; resolves to the end of this call's turn.
+const skillTurn = async (key: string): Promise<() => void> => {
+  const before = skillTurns.get(key) ?? Promise.resolve()
+  let end = () => {}
+  const mine = new Promise<void>((r) => (end = r))
+  const turn = before.then(() => mine)
+  skillTurns.set(key, turn)
+  await before
+  return () => {
+    end()
+    if (skillTurns.get(key) === turn) skillTurns.delete(key)
+  }
+}
 
 export const register: Register = (on) => {
   on('session.start', async ($, e, next) => {
@@ -519,9 +556,15 @@ export const register: Register = (on) => {
     // Every tool call this run made, so a failure can say what already ran.
     const calls = new Map<string, Tally>()
     // Stored types belong to one engine version: an upgrade can change a schema.
+    // No version known: nothing is stored or read, rather than a key every version shares.
     let version: Promise<string> | undefined
-    const typeKey = async (tool: string) =>
-      `type:${await (version ??= $.session.version().then((v) => v.version, () => ''))}:${tool}`
+    const typeKey = async (tool: string): Promise<string | undefined> => {
+      version ??= Promise.resolve()
+        .then(() => $.session.version())
+        .then((v) => (typeof v?.version === 'string' ? v.version : ''), () => '')
+      const v = await version
+      return v ? `type:${v}:${tool}` : undefined
+    }
     const home = (await $.env.get('HOME')) ?? '/tmp'
     // A host whose own node is older than 25 points this at a newer one.
     const node = (await $.env.get('CODEMODE_NODE')) || 'node'
@@ -554,7 +597,8 @@ export const register: Register = (on) => {
         // A type this process just learned beats a generated file, which beats one stored earlier.
         let input = learned.get(t.name) ?? typeSources.map((s) => inputType(s, t.name)).find(Boolean)
         if (input === undefined && !isMcp.has(t.name)) {
-          const kept = await $.store.get(await typeKey(t.name)).catch(() => undefined)
+          const k = await typeKey(t.name)
+          const kept = k ? await $.store.get(k).catch(() => undefined) : undefined
           if (typeof kept === 'string') input = kept
         }
         // Only a built-in's bad-arguments error carries its type; an MCP server's does not.
@@ -586,7 +630,9 @@ export const register: Register = (on) => {
       // Plugins cannot run the Agent tool; codemode-agents spawns instead.
       const target = tool === 'Agent' || tool === 'Task' ? AGENTS_TOOL : tool
       const key = skillKey(String(args.skill ?? ''))
-      // Only text expanded after this call started counts, not an earlier expansion.
+      // Calls to one skill take turns, so each gets its own expansion (its args may
+      // differ); only text expanded after this call started counts.
+      const release = tool === 'Skill' ? await skillTurn(key) : undefined
       const since = skillSeq
       const tally = calls.get(tool) ?? { ok: 0, failed: 0, open: 0 }
       calls.set(tool, tally)
@@ -594,11 +640,14 @@ export const register: Register = (on) => {
       const r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
         tally.open--
         tally.failed++
+        release?.()
         const msg = (err as Error)?.message ?? String(err)
         // A tool a setting or another mod removed: name what may replace it.
         const near = msg.includes('no tool named') ? similar(tool, all.map((x) => x.name)) : []
         throw new Error(near.length ? `${msg}; similar: ${near.join(', ')}` : msg)
       })
+      const body = release ? skillTexts.get(key) : undefined
+      release?.()
       tally.open--
       if (r.deny !== undefined || r.isError) tally.failed++
       else tally.ok++
@@ -607,7 +656,6 @@ export const register: Register = (on) => {
       const result = strip(r.result, pictures, markers)
       let text = r.text ?? show(result)
       if (tool === 'Skill' && !r.isError) {
-        const body = skillTexts.get(key)
         if (body && body.seq > since) text = `${text}\n\n${body.text}`
       }
       if (markers.length) text = [text.trim(), ...markers].filter(Boolean).join('\n')
@@ -619,7 +667,8 @@ export const register: Register = (on) => {
         learned.set(tool, bad.type)
         // Kept across sessions: the engine no longer writes the type files, so a
         // built-in's bad-arguments error is the only other source of its type.
-        await $.store.set(await typeKey(tool), bad.type as never).catch(() => {})
+        const k = await typeKey(tool)
+        if (k) await $.store.set(k, bad.type as never).catch(() => {})
       }
       return { ok: false, error: bad.message, text: bad.message, result }
     }
@@ -716,8 +765,8 @@ export const register: Register = (on) => {
       (killed
         ? { items: [], logs: [], failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
         : { items: [], logs: [], failure: `script runner exited without a result.\n${stderr.trim()}` })
-    // Only calls that worked or are still running left effects worth naming.
-    const ran = [...calls.values()].some((t) => t.ok || t.open) ? ledger(calls) : ''
+    // A failed call can have changed things too (a command that wrote, then exited non-zero).
+    const ran = ledger(calls)
     if (ended.failure && ran) ended = { ...ended, failure: `${ended.failure}\nTool calls before the failure: ${ran}` }
     const full = format(Date.now() - started, ended)
     // A cut output is kept whole on disk, so nothing in it needs a second run.

@@ -43,7 +43,8 @@ export const describeRun = (names: ReadonlySet<string>): string => {
     .filter((n) => !has(n))
     .map((n) => {
       const alt = ALIKE[n.toLowerCase()] ? similar(n, [...names])[0] : undefined
-      return alt ? `${n} (use ${alt})` : n
+      // In its script form: named bare, a model loads it with ToolSearch and calls it directly (refused).
+      return alt ? `${n} (use tools.${ident(alt)})` : n
     })
   const example = has('Read')
     ? 'const [a, b] = await Promise.all([\n  tools.Read({ file_path: "/repo/src/a.ts" }),\n  tools.Read({ file_path: "/repo/src/b.ts" }),\n])\nconst imports = a.split("\\n").filter((l) => l.includes("import"))\nreturn { imports: imports.join("\\n"), b: b.slice(0, 2000) }'

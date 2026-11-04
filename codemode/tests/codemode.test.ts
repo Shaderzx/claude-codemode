@@ -262,9 +262,9 @@ test('the description offers only the tools this session has', { timeoutMs: 10_0
   expect(d).toContain('Not in this session: Write, Edit, Bash, Agent, Skill, AskUserQuestion, Grep, Glob.')
   // A missing built-in is named with the session's likeliest replacement.
   const lean = describeRun(new Set(['Read', 'ToolSearch', 'mcp__lean-ctx__ctx_shell', 'mcp__lean-ctx__ctx_patch', 'mcp__lean-ctx__ctx_search']))
-  expect(lean).toContain('Bash (use mcp__lean-ctx__ctx_shell)')
-  expect(lean).toContain('Edit (use mcp__lean-ctx__ctx_patch)')
-  expect(lean).toContain('Grep (use mcp__lean-ctx__ctx_search)')
+  expect(lean).toContain('Bash (use tools.mcp__lean_ctx__ctx_shell)')
+  expect(lean).toContain('Edit (use tools.mcp__lean_ctx__ctx_patch)')
+  expect(lean).toContain('Grep (use tools.mcp__lean_ctx__ctx_search)')
   // No list yet: every common tool is described, none is called missing.
   expect(describeRun(new Set())).toContain('Bash({ command')
   expect(describeRun(new Set())).not.toContain('Not in this session')

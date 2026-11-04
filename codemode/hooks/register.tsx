@@ -534,7 +534,15 @@ export const register: Register = (on) => {
     // A schema ToolSearch loads tempts a direct call, which is refused: one wasted round trip.
     if (e.tool === SEARCH)
       return { ...r, isDeferred: false, description: `${r.description}\n\nUnder codemode a loaded tool is still called from a ${FULL} script (tools.<Name>(args)), never directly.` }
-    return { ...r, isDeferred: e.tool !== FULL }
+    if (e.tool === FULL) return { ...r, isDeferred: false }
+    // The loaded schema is what the model reads as it decides how to call, so it
+    // names the script form too: GLM 5.3 read the note above, loaded a tool and
+    // still called it directly. Deferred, the line costs nothing until loaded.
+    return {
+      ...r,
+      isDeferred: true,
+      description: `${r.description}\n\nUnder codemode, call this only inside a ${FULL} script: await tools.${ident(e.tool)}({...}). A direct call is refused.`,
+    }
   })
 
   on('tool.call', async ($, e, next) => {

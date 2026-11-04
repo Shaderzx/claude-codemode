@@ -144,6 +144,28 @@ test('Workflow is refused from a script', { timeoutMs: 10_000 }, async ($, on) =
   expect(f.calls.some((c) => c.tool === 'Workflow')).toBe(false)
 })
 
+test('a loaded schema names its script form, and ToolSearch and the run tool stay in front', async ($, on) => {
+  setup(on, async function* () {})
+  // The engine's own answer: the description as computed, placement unchanged.
+  on('tool.describe', async (_$, e) => ({ description: e.description, ...(e.isDeferred ? { isDeferred: true } : {}) }) as never)
+  await $.session.start(START)
+  const d = (tool: string, description: string, isDeferred?: true) =>
+    $.tool.describe({ tool, description, isDeferred, provider: { plugin: 'engine', tier: 'core' } } as never)
+  const shell = await d('mcp__lean-ctx__ctx_shell', 'Runs a command.', true)
+  expect(shell.isDeferred).toBe(true)
+  expect(shell.description.startsWith('Runs a command.')).toBe(true)
+  expect(shell.description).toContain('await tools.mcp__lean_ctx__ctx_shell({...})')
+  const read = await d('Read', 'Reads a file.')
+  expect(read.isDeferred).toBe(true)
+  expect(read.description).toContain('await tools.Read({...})')
+  const search = await d('ToolSearch', 'Loads schemas.')
+  expect(search.isDeferred).toBe(false)
+  expect(search.description).not.toContain('call this only inside')
+  const run = await d(RUN, 'Run a script.')
+  expect(run.isDeferred).toBe(false)
+  expect(run.description).toBe('Run a script.')
+})
+
 test('a model call to another tool is refused', async ($, on) => {
   setup(on, async function* () {})
   await $.session.start(START)

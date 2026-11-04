@@ -191,7 +191,7 @@ async function main({ script, tools: all, dir, timeout }) {
   const brief = (d) => {
     // The first line with words (some start with a blank line or a heading), up to
     // its first sentence end that is not an abbreviation.
-    const s = String(d).split('\n').map((l) => l.trim().replace(/^(?:[-*]|\d+[.)])\s+/, '')).find((l) => l && !l.startsWith('#') && !/^[-*=_]+$/.test(l)) || ''
+    const s = String(d).split('\n').map((l) => l.trim().replace(/^(?:[-*]|\d+[.)])\s+/, '')).find((l) => l && !l.startsWith('#') && !/^[-*=_\s]+$/.test(l)) || ''
     let o = s
     for (const m of s.matchAll(/[.!?](?=\s|$)/g)) {
       if (/\b(?:e\.g|i\.e|etc|vs)$/i.test(s.slice(0, m.index))) continue
@@ -478,15 +478,21 @@ let skillSeq = 0
 const skillKey = (name: string) => name.replace(/^\//, '').split(':').pop() ?? name
 const skillTurns = new Map<string, Promise<void>>()
 
-// Waits for earlier calls to the same skill, or for `limit` should one of them
-// never settle; resolves to the end of this call's turn.
-const skillTurn = async (key: string, limit: Promise<unknown>): Promise<() => void> => {
+// Waits for earlier calls to the same skill; resolves to the end of this call's
+// turn, or to undefined when one of them has not settled by `limit`. Two calls
+// never share a turn, since each must get the text expanded for its own args.
+export const skillTurn = async (key: string, limit: Promise<unknown>): Promise<(() => void) | undefined> => {
   const before = skillTurns.get(key) ?? Promise.resolve()
   let end = () => {}
   const mine = new Promise<void>((r) => (end = r))
+  // Chained on `before` even past a time-out, so no later call overlaps one still running.
   const turn = before.then(() => mine)
   skillTurns.set(key, turn)
-  await Promise.race([before, limit])
+  const ready = await Promise.race([before.then(() => true), limit.then(() => false)])
+  if (!ready) {
+    end()
+    return undefined
+  }
   return () => {
     end()
     if (skillTurns.get(key) === turn) skillTurns.delete(key)
@@ -633,8 +639,12 @@ export const register: Register = (on) => {
       const key = skillKey(String(args.skill ?? ''))
       // Calls to one skill take turns, so each gets its own expansion (its args may
       // differ); only text expanded after this call started counts.
+      const timer: { handle?: { cancel: () => unknown } } = {}
       const release =
-        tool === 'Skill' ? await skillTurn(key, new Promise((r) => void $.clock.after(60_000, () => r(undefined)))) : undefined
+        tool === 'Skill' ? await skillTurn(key, new Promise((r) => (timer.handle = $.clock.after(60_000, () => r(undefined))))) : undefined
+      timer.handle?.cancel()
+      if (tool === 'Skill' && !release)
+        return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
       const since = skillSeq
       const tally = calls.get(tool) ?? { ok: 0, failed: 0, open: 0 }
       calls.set(tool, tally)
@@ -770,7 +780,11 @@ export const register: Register = (on) => {
     // A failed call can have changed things too (a command that wrote, then exited non-zero).
     const only = calls.size === 1 ? [...calls][0] : undefined
     // One failed call whose own error ended the run says nothing the error does not.
-    const echo = only !== undefined && only[1].ok + only[1].open === 0 && only[1].failed === 1 && Boolean(ended.failure?.includes(ident(only[0])))
+    const echo =
+      only !== undefined &&
+      only[1].ok + only[1].open === 0 &&
+      only[1].failed === 1 &&
+      [only[0], ident(only[0])].some((n) => ended.failure?.includes(`Error: ${n}: `) === true)
     const ran = echo ? '' : ledger(calls)
     if (ended.failure && ran) ended = { ...ended, failure: `${ended.failure}\nTool calls before the failure: ${ran}` }
     const full = format(Date.now() - started, ended)

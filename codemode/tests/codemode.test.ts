@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { clip, describeRun, inputType, ledger, parseOptions, similar, tidy } from '../hooks/register'
+import { clip, describeRun, inputType, ledger, parseOptions, similar, skillTurn, tidy } from '../hooks/register'
 
 // The runner is a Node child; these tests stand in for it with a fake
 // `process.spawn` that writes chosen lines, and check what the mod does with them.
@@ -427,5 +427,20 @@ test('a run that failed on its only call adds no ledger that repeats the error',
   const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
   expect(String(r.result)).toContain('Error: Read: no such file')
   expect(String(r.result)).not.toContain('Tool calls before the failure')
+})
+
+
+test('a Skill call that waits too long for an earlier one fails instead of sharing its turn', async () => {
+  const never = new Promise(() => {})
+  const first = await skillTurn('slow', never)
+  expect(first).toBeDefined()
+  // The first is still running: the second gives up rather than overlap it, and so does a third.
+  expect(await skillTurn('slow', Promise.resolve())).toBeUndefined()
+  expect(await skillTurn('slow', Promise.resolve())).toBeUndefined()
+  first?.()
+  // Once it has finished the next call gets its turn.
+  const next = await skillTurn('slow', never)
+  expect(next).toBeDefined()
+  next?.()
 })
 

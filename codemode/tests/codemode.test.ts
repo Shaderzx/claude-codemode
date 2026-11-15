@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { clip, describeRun, inputType, ledger, parseOptions, similar, skillTurn, tidy } from '../hooks/register'
+import { describeRun, inputType, ledger, parseOptions, similar, skillTurn, tidy } from '../hooks/register'
 
 // The runner is a Node child; these tests stand in for it with a fake
 // `process.spawn` that writes chosen lines, and check what the mod does with them.
@@ -231,10 +231,6 @@ test('a cut output is saved whole and the cut names the file', { timeoutMs: 10_0
   expect(String(r.result)).not.toContain('MIDDLE')
   expect(String(r.result)).toContain(`read them back with tools.Read({ file_path: ${JSON.stringify(spill)}, offset: 1, limit: 1 })`)
   expect(String(r.result)).toContain('chars cut (lines 1-1)')
-  expect(clip('a\nb\nc\nd\ne\nf\n', 4)).toContain('(lines 2-5 of 6)')
-  expect(clip('a\nb\nc\nd\ne\nf\ng\nh', 4, '/f.txt')).toBe(
-    'a\n\n…11 chars cut (lines 2-7 of 8); all of it is in /f.txt, so read back only the lines you need…\n\nh',
-  )
 })
 
 test('bad arguments come back as one TypeScript type, without the ToolSearch advice', { timeoutMs: 10_000 }, async ($, on) => {

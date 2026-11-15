@@ -711,23 +711,6 @@ export const extractText = (script: string): { script: string; texts: Record<str
   return { script: lines.join('\n'), texts }
 }
 
-// Keeps the head and the tail; `file`, when given, holds the whole output.
-export const clip = (out: string, max: number, file?: string) => {
-  if (out.length <= max) return out
-  const half = Math.floor(max / 2)
-  const end = out.length - half
-  // The cut's line numbers let the next run read back only the part it needs.
-  const line = (at: number) => {
-    let n = 1
-    for (let i = out.indexOf('\n'); i >= 0 && i < at; i = out.indexOf('\n', i + 1)) n++
-    return n
-  }
-  // A trailing newline ends the last line; it does not start another.
-  const where = `lines ${line(half)}-${line(end - 1)} of ${line(out.endsWith('\n') ? out.length - 1 : out.length)}`
-  const note = file ? `; all of it is in ${file}, so read back only the lines you need` : ''
-  return `${out.slice(0, half)}\n…${out.length - max} chars cut (${where})${note}…\n${out.slice(end)}`
-}
-
 export type Ended = { items: string[]; keys?: (string[] | undefined)[]; logs: string[]; failure?: string; kind?: string; notes?: string[] }
 
 export const sections = (ms: number, d: Ended, split = false): string[] => {

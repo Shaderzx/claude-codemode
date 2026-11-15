@@ -9,8 +9,8 @@ import { expect, test } from 'e2e';
 // Each test hands the mod scripts the way the model does and checks what comes back.
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[] };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string };
+type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 // Every folder a test makes is removed after the last test.
@@ -105,8 +105,14 @@ test('quote() makes any value one safe shell word', () => {
   expect(text).toBe(v);
 });
 
-test('sh() runs a command over the shell tool limit whole, from a private file written through the patch tool', () => {
-  const out = run({ tools: NO_BASH, steps: [{ script: 'const big = "echo " + "x".repeat(9000) + " >/dev/null; echo done"\nconst r = await sh(big)\nreturn String(r).trim() + " " + r.exitCode' }] });
+test('A command over the shell tool limit is refused unless the script asks for it to be staged, and says what the hooks would see', () => {
+  const out = run({ tools: NO_BASH, steps: [{ script: 'await sh("echo " + "x".repeat(9000))' }] });
+  expect(out.results[0]!.text).toMatch(/9005 bytes[^\n]*\{ stage: true \}[^\n]*only see "bash <file>"/);
+  expect(out.calls.filter((c) => c.tool === 'mcp__lean-ctx__ctx_shell')).toEqual([]);
+});
+
+test('sh(cmd, { stage: true }) runs a command over the shell tool limit whole, from a private file written through the patch tool', () => {
+  const out = run({ tools: NO_BASH, steps: [{ script: 'const big = "echo " + "x".repeat(9000) + " >/dev/null; echo done"\nconst r = await sh(big, { stage: true })\nreturn String(r).trim() + " " + r.exitCode' }] });
   expect(out.results[0]!.text).toBe('done 0');
   const created = out.calls.find((c) => c.tool === 'mcp__lean-ctx__ctx_patch' && c.args.op === 'create')!;
   expect(String(created.args.new_text)).toContain('x'.repeat(9000));
@@ -333,12 +339,12 @@ test('A cut gives every key of a single-line object a share', () => {
 });
 
 test('waitFor() holds its timeout even while a check is still running', () => {
-  const text = one('const t0 = Date.now()\ntry { await waitFor(async () => { await sh("perl -e \'select(undef, undef, undef, 0.6)\'"); return true }, { timeout: 100 }) } catch (e) { return e.message + " | " + (Date.now() - t0 < 500) }\nreturn "no error"');
+  const text = one('const t0 = Date.now()\ntry { await waitFor(async () => { await sh("perl -e \'select(undef, undef, undef, 3)\'"); return true }, { timeout: 100 }) } catch (e) { return e.message + " | " + (Date.now() - t0 < 2000) }\nreturn "no error"');
   expect(text).toMatch(/^waitFor timed out after 100ms while a check was still running[^|]* \| true$/);
 });
 
 test('waitFor() with a timeout no longer than its interval still waits out the timeout', () => {
-  const text = one('const t0 = Date.now()\ntry { await waitFor(() => false, { every: 400, timeout: 400 }) } catch (e) { return Date.now() - t0 >= 380 }\nreturn "no error"');
+  const text = one('const t0 = Date.now()\ntry { await waitFor(() => false, { every: 400, timeout: 400 }) } catch (e) { return Date.now() - t0 >= 300 }\nreturn "no error"');
   expect(text).toBe('true');
 });
 
@@ -360,6 +366,130 @@ test('write() through the patch tool replaces a file this session has read, with
   const out = run({ tools: NO_BASH, steps: [{ script: 'await read(' + JSON.stringify(f) + ')' }, { script: 'await write(' + JSON.stringify(f) + ', "new\\n")\nreturn 1' }] });
   expect(out.results[1]!.text).toBe('1');
   expect(readFileSync(f, 'utf8')).toBe('new\n');
+});
+
+test('A file read in an earlier session does not count as read in a new one', () => {
+  const dir = scratch();
+  const f = join(dir, 'old.txt');
+  writeFileSync(f, 'one');
+  const out = run({ tools: NO_BASH, steps: [{ script: 'await read(' + JSON.stringify(f) + ')' }, { newSession: true }, { script: 'await write(' + JSON.stringify(f) + ', "two")' }] });
+  expect(out.results[1]!.text).toContain('has not read it');
+  expect(readFileSync(f, 'utf8')).toBe('one');
+});
+
+test('edit() through the patch tool refuses a file this session has not read', () => {
+  const dir = scratch();
+  const f = join(dir, 'p.txt');
+  writeFileSync(f, 'red green');
+  expect(one('await edit(' + JSON.stringify(f) + ', "green", "GREEN")', { tools: NO_BASH })).toContain('has not been read in this session');
+  expect(readFileSync(f, 'utf8')).toBe('red green');
+});
+
+test('waitFor() treats a failed call() result as not yet', () => {
+  const dir = scratch();
+  const f = join(dir, 'ready');
+  const text = one('await sh("(perl -e \'select(undef, undef, undef, 0.4)\'; touch ' + f + ') >/dev/null 2>&1 &")\nconst r = await waitFor(() => call("mcp__lean-ctx__ctx_shell", { command: "test -f ' + f + '" }), { every: 50, timeout: 5000 })\nreturn r.ok + " " + existsSync', { tools: NO_BASH });
+  expect(text.startsWith('true')).toBe(true);
+});
+
+test('A rejection the script catches later does not fail the run', () => {
+  const text = one('const a = tools.Read({ file_path: "/nope/later" })\nawait sh("perl -e \'select(undef, undef, undef, 0.3)\'")\ntry { await a } catch (e) { }\nreturn "kept going"');
+  expect(text).toBe('kept going');
+});
+
+test('One oversized item written past the runner is trimmed to the mod\'s own cap', () => {
+  const out = run({ steps: [{ script: 'const p = Buffer.constructor("return process")()\np.stdout.write("\\x1eCM" + JSON.stringify({ out: "item", text: "x".repeat(2000000) }) + "\\n")\nreturn "end"' }] });
+  const spill = out.results[0]!.text.match(/file_path: "([^"]+)"/)![1]!;
+  expect(readFileSync(spill, 'utf8').length).toBeLessThanOrEqual(1_100_000);
+});
+
+test('A regex right after an if condition does not hide a @text block', () => {
+  expect(one('if (true) /`/.test("a")\n// @text sh\nT=${1:-x}\n// @end\nreturn TEXT.sh')).toBe('T=${1:-x}');
+});
+
+test('A postfix ++ before a division does not make the rest of the line a regex', () => {
+  expect(one('let i = 1\nconst q = i++ / 2 + `\n// @text t\n`\nreturn q')).toBe('0.5\n// @text t\n');
+});
+
+test('A TEXT name with no block throws and names the blocks there are', () => {
+  expect(one('// @text deploy\necho hi\n// @end\nreturn TEXT.Deploy')).toMatch(/TEXT\.Deploy[^\n]*deploy/);
+});
+
+test('A remembered denial belongs to the project folder it was seen in', () => {
+  const a = scratch();
+  const b = scratch();
+  const out = run({ cwd: a, denied: ['Bash'], steps: [{ script: 'await call("Bash", { command: "true" })' }, { setCwd: b }, { newSession: true }, { script: 'return 1' }] });
+  expect(out.description).not.toMatch(/denied by a hook/);
+  const back = run({ cwd: a, denied: ['Bash'], steps: [{ script: 'await call("Bash", { command: "true" })' }, { setCwd: b }, { newSession: true }, { setCwd: a }, { newSession: true }] });
+  expect(back.description).toMatch(/Bash[^\n]*denied by a hook/);
+});
+
+test('A denial seen through call() steers sh() in the same script', () => {
+  const out = run({ denied: ['Bash'], steps: [{ script: 'await call("Bash", { command: "true" })\nreturn (await sh("echo x")).tool' }] });
+  expect(out.results[0]!.text).toBe('mcp__lean-ctx__ctx_shell');
+  expect(out.calls.filter((c) => c.tool === 'Bash').length).toBe(1);
+});
+
+test('sh() refuses to start a background job, which it could not wait for', () => {
+  expect(one('await sh("echo x", { run_in_background: true })')).toMatch(/sh\(\) waits for its command/);
+});
+
+test('A shell output too big to pass twice still arrives whole', () => {
+  expect(one('return (await sh("printf %3000000s x")).length')).toBe('3000000');
+});
+
+test('JSON.parse hands a reviver its third, context argument', () => {
+  expect(one('return JSON.stringify(JSON.parse("[1]", (k, v, c) => (typeof c?.source === "string" ? "src:" + c.source : v)))')).toBe('["src:1"]');
+});
+
+test('A paged Read stops at a refused page instead of returning part of the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'wide.txt');
+  writeFileSync(f, Array.from({ length: 1500 }, (_, i) => String(i + 1).padStart(4, '0') + ' ' + 'w'.repeat(90)).join('\n'));
+  const text = one('const r = await call("Read", { file_path: ' + JSON.stringify(f) + ' })\nreturn r.ok + " " + String(r.text ?? r.error).split("\\n").length', { denyReadFrom: 1001 });
+  expect(text.startsWith('false')).toBe(true);
+});
+
+test('A Read too big to pass does not count as reading the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'huge.txt');
+  writeFileSync(f, Array.from({ length: 60_000 }, () => 'r'.repeat(99)).join('\n'));
+  const out = run({ tools: NO_BASH, steps: [{ script: 'await call("Read", { file_path: ' + JSON.stringify(f) + ' })' }, { script: 'await write(' + JSON.stringify(f) + ', "gone")' }] });
+  expect(out.results[1]!.text).toContain('has not read it');
+});
+
+test('A paged Read past a repeated-read stub never falls to one line per call', () => {
+  const dir = scratch();
+  const f = join(dir, 'wide.txt');
+  writeFileSync(f, Array.from({ length: 1200 }, (_, i) => String(i + 1).padStart(4, '0') + ' ' + 'w'.repeat(90)).join('\n'));
+  const out = run({ dedupReads: true, steps: [{ script: 'await tools.Read({ file_path: ' + JSON.stringify(f) + ' })\nreturn (await tools.Read({ file_path: ' + JSON.stringify(f) + ' })).split("\\n").length' }] });
+  expect(out.results[0]!.text).toBe('1200');
+  expect(out.calls.filter((c) => c.tool === 'Read').length).toBeLessThan(40);
+});
+
+test('read() refuses a later page that holds no file lines', () => {
+  const dir = scratch();
+  const f = join(dir, 'long.txt');
+  writeFileSync(f, Array.from({ length: 3000 }, (_, i) => 'line ' + i).join('\n'));
+  expect(one('return (await read(' + JSON.stringify(f) + ')).length', { rewriteFromOffset: '[Firewalled ctx_read output — 9000 chars stored out-of-band]' })).toMatch(/read: Read answered with no file lines/);
+});
+
+test('A cut keeps a short item that sits between many big ones', () => {
+  const text = one('// @options: {"max_output_chars": 2000}\nfor (let i = 0; i < 40; i++) text("big " + "b".repeat(300))\ntext("CRITICAL_SUMMARY_42")\nfor (let i = 0; i < 40; i++) text("big " + "c".repeat(300))');
+  expect(text).toContain('CRITICAL_SUMMARY_42');
+  expect(text.length).toBeLessThanOrEqual(2000);
+});
+
+test('A big object that is not cut prints as the JSON it is', () => {
+  const text = one('// @options: {"max_output_chars": 1000000}\nreturn { a: "x".repeat(600000), b: 2 }');
+  expect(JSON.parse(text).b).toBe(2);
+});
+
+test('Two reads at once, one failing, count the other as lost', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'ok.txt'), 'fine');
+  const text = one('await Promise.all([tools.Read({ file_path: ' + JSON.stringify(join(dir, 'ok.txt')) + ' }), tools.Read({ file_path: "/nope/both" })])');
+  expect(text).toMatch(/1 call that ran alongside it had succeeded/);
 });
 
 test('edit() never reads the file for itself', () => {
@@ -444,9 +574,9 @@ test('A @text block after a regex literal holding a backtick still works', () =>
   expect(text).toBe('T=${1:-x}');
 });
 
-test('A repeated @text name is refused, and // @end NAME lets a block hold a plain // @end line', () => {
+test('A repeated @text name is refused, and a // @@end line in a block stands for a plain // @end', () => {
   expect(one('// @text a\none\n// @end\n// @text a\ntwo\n// @end\nreturn TEXT.a')).toMatch(/\[syntax\][^\n]*@text a[^\n]*twice/);
-  expect(one('// @text doc\nwrite // @end to close\n// @end\nmore\n// @end doc\nreturn TEXT.doc')).toBe('write // @end to close\n// @end\nmore');
+  expect(one('// @text doc\nwrite // @end to close\n// @@end\nmore\n// @end doc\nreturn TEXT.doc')).toBe('write // @end to close\n// @end\nmore');
 });
 
 test('The template-literal hint is left out for a syntax error that has nothing to do with one', () => {

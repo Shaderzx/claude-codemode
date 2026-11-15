@@ -22,8 +22,10 @@ type Case = {
   deniedCommands?: string[]
   deniedMessage?: string
   readRewrite?: string
+  denyReadFrom?: number
+  rewriteFromOffset?: string
 }
-type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[] }
+type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -32,7 +34,7 @@ copyFileSync(join(root, 'codemode/hooks/register.tsx'), join(work, 'register.mts
 const mod = await import(join(work, 'register.mts'))
 
 const home = c.home ?? mkdtempSync(join(tmpdir(), 'codemode-home-'))
-const cwd = c.cwd ?? home
+let cwd = c.cwd ?? home
 const store: Record<string, unknown> = { ...(c.store ?? {}) }
 const calls: { tool: string; args: Record<string, unknown> }[] = []
 let flaky = c.mcpFlaky ?? 0
@@ -83,6 +85,8 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
   switch (tool) {
     case 'Read': {
       if (c.readRewrite !== undefined) return ok(c.readRewrite)
+      if (c.denyReadFrom !== undefined && Number(a.offset ?? 1) >= c.denyReadFrom) return { deny: 'Read of this range is denied by policy' }
+      if (c.rewriteFromOffset !== undefined && Number(a.offset ?? 1) > 1) return ok(c.rewriteFromOffset)
       const p = String(a.file_path ?? '')
       if (!p.startsWith('/') || !existsSync(p)) return err('File does not exist. Note: your current working directory is ' + cwd + '.')
       const text = readFileSync(p, 'utf8')
@@ -263,6 +267,7 @@ await startSession()
 for (const s of c.steps) {
   started = Date.now()
   if (s.setDenied) { c.denied = s.setDenied; continue }
+  if (s.setCwd) { cwd = s.setCwd; continue }
   if (s.newSession) { await startSession(); continue }
   if (s.script !== undefined) {
     const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: s.script }, engine(async () => ({})))

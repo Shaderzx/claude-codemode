@@ -1,0 +1,27 @@
+name: e2e
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Install the suite
+        working-directory: e2e
+        run: npm ci
+      - name: Typecheck the suite
+        working-directory: e2e
+        run: npx tsrs --noEmit -p .
+      - name: Run the suite
+        working-directory: e2e
+        run: npx e2e run

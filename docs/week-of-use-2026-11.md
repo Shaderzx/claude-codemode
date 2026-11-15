@@ -1,6 +1,6 @@
 # codemode: one week of real use (9 to 16 November 2026)
 
-Every Claude Code session on Shad's Mac and the five linked T3 servers (yarnball02, fm-fsn-02-registry, mmd-fsn-05-staging, fm-hel-02-dev, fm-fsn-04-ci), read from ~/.claude/projects/**/*.jsonl.
+Every Claude Code session on the owner's Mac and five linked development servers, read from ~/.claude/projects/**/*.jsonl.
 
 ## The numbers
 

@@ -18,6 +18,7 @@ type Case = {
   steps: Step[]
   abortAfterMs?: number
   mcpFlaky?: number
+  dedupReads?: boolean
 }
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean }
 
@@ -50,12 +51,20 @@ const NOTE_SCHEMA = { type: 'object', properties: { threadId: { type: 'string' }
 const err = (text: string) => ({ isError: true, text, result: text })
 const ok = (text: string, result: unknown = text) => ({ text, result })
 
-const numbered = (lines: string[], from: number) => lines.map((l, i) => String(from + i).padStart(6) + '\t' + l).join('\n')
+// Claude Code 2.1.325's Read: "N<tab>line", with a last, empty line when the file ends in a newline.
+const numbered = (lines: string[], from: number) => lines.map((l, i) => String(from + i) + '\t' + l).join('\n')
+// lean-ctx's Read hook answers a repeat of a read that worked, on a file that has not changed, with a stub.
+const seen = new Map<string, number>()
 
-const shell = (command: string) => {
-  const r = spawnSync('bash', ['-c', command], { cwd, encoding: 'utf8', env: { ...process.env, HOME: home } })
-  return { code: r.status ?? 1, out: (r.stdout ?? '') + (r.stderr ?? '') }
-}
+// Asynchronous, as Claude Code's own tools are: a run's timer and its other calls go on meanwhile.
+const shell = (command: string) =>
+  new Promise<{ code: number; out: string }>((done) => {
+    const p = spawn('bash', ['-c', command], { cwd, env: { ...process.env, HOME: home } })
+    let out = ''
+    p.stdout.setEncoding('utf8').on('data', (t: string) => { out += t })
+    p.stderr.setEncoding('utf8').on('data', (t: string) => { out += t })
+    p.on('close', (code) => done({ code: code ?? 1, out }))
+  })
 
 const fake = async (tool: string, a: Record<string, unknown>) => {
   calls.push({ tool, args: a })
@@ -67,14 +76,18 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       const p = String(a.file_path ?? '')
       if (!p.startsWith('/') || !existsSync(p)) return err('File does not exist. Note: your current working directory is ' + cwd + '.')
       const text = readFileSync(p, 'utf8')
+      if (!text) return ok('<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>')
       const lines = text.split('\n')
-      if (text.endsWith('\n')) lines.pop()
+      const key = p + ':' + String(a.offset) + ':' + String(a.limit)
+      if (c.dedupReads && seen.get(key) === statSync(p).mtimeMs)
+        return ok('1\t' + p + ' [unchanged ' + lines.length + 'L · lean-ctx read-dedup]\n2\tUnchanged since your last Read in this session — the full line-numbered content is already in this conversation above.')
       const offset = typeof a.offset === 'number' ? a.offset : 1
       const limit = typeof a.limit === 'number' ? a.limit : 2000
       const part = lines.slice(offset - 1, offset - 1 + limit)
       const tokens = Math.ceil(part.join('\n').length / 4)
       if (tokens > 25000)
         return err('File content (' + tokens + ' tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
+      seen.set(key, statSync(p).mtimeMs)
       return ok(numbered(part, offset))
     }
     case 'Write': {
@@ -93,7 +106,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       const command = String(a.command ?? '')
       if (tool !== 'Bash' && Buffer.byteLength(command) > 8192)
         return err('ERROR: Command too large (' + Buffer.byteLength(command) + ' bytes, limit 8192). If you\'re writing file content, use the native Write/Edit tool instead. ctx_shell is for reading command output only (git, cargo, npm, etc.).')
-      const r = shell(command)
+      const r = await shell(command)
       if (tool === 'Bash') return r.code ? err(r.out + '\nExit code ' + r.code) : ok(r.out)
       return r.code ? err(r.out + '\n[exit:' + r.code + ']') : ok(r.out || '(' + tool + ' completed with no output)')
     }

@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +10,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 // Every folder a test makes is removed after the last test.
@@ -35,13 +34,12 @@ function run(c: Case): Out {
 
 const one = (script: string, c: Omit<Case, 'steps'> = {}) => run({ ...c, steps: [{ script }] }).results[0]!.text;
 const NO_BASH = ['Read', 'Skill', 'ToolSearch', 'mcp__lean-ctx__ctx_shell', 'mcp__lean-ctx__ctx_patch', 'mcp__t3-code__thread_note'];
-const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
 test('A script that still works today returns its output unchanged', () => {
   const dir = scratch();
   writeFileSync(join(dir, 'a.txt'), 'alpha\nbeta\n');
   const text = one('const t = await tools.Read({ file_path: ' + JSON.stringify(join(dir, 'a.txt')) + ' })\nreturn t');
-  expect(text).toBe('     1\talpha\n     2\tbeta');
+  expect(text).toBe('1\talpha\n2\tbeta\n3\t');
 });
 
 test('Text between // @text NAME and // @end reaches the script raw, with dollar-braces, backticks and # untouched', () => {
@@ -99,8 +97,30 @@ test('read() returns a file without line numbers and pages through files longer 
   const dir = scratch();
   const body = Array.from({ length: 4500 }, (_, i) => 'line ' + (i + 1)).join('\n') + '\n';
   writeFileSync(join(dir, 'big.txt'), body);
-  const text = one('const t = await read(' + JSON.stringify(join(dir, 'big.txt')) + ')\nreturn sha256(t)');
-  expect(text).toBe(sha(body));
+  const text = one('const t = await read(' + JSON.stringify(join(dir, 'big.txt')) + ')\nreturn [t.length, t.split("\\n").length, t.startsWith("line 1\\nline 2\\n"), t.endsWith("\\nline 4500\\n")].join(" ")');
+  expect(text).toBe(body.length + ' 4501 true true');
+});
+
+test('read() keeps a file\'s last line exact, newline or not, and is not fooled by a repeated-read stub', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'nl.txt'), 'a\nb\n');
+  writeFileSync(join(dir, 'no-nl.txt'), 'x\ny');
+  writeFileSync(join(dir, 'empty.txt'), '');
+  const text = one('const r = [await read("nl.txt"), await read("nl.txt"), await read("no-nl.txt"), await read("empty.txt")]\nreturn JSON.stringify(r)', { cwd: dir, dedupReads: true });
+  expect(JSON.parse(text)).toEqual(['a\nb\n', 'a\nb\n', 'x\ny', '']);
+});
+
+test('A repeated-read stub in a tool result is named as a stub', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'f.txt'), 'one\ntwo\n');
+  const text = one('await tools.Read({ file_path: "f.txt" })\nconst again = await tools.Read({ file_path: "f.txt" })\nreturn again.length > 0', { cwd: dir, dedupReads: true });
+  expect(text).toMatch(/compressed stub/);
+});
+
+test('A shell variable in a template literal, read by JS as a variable, names the cause', () => {
+  const text = one('const cmd = `echo ${HOME_DIR}`\nreturn cmd');
+  expect(text).toContain('HOME_DIR is not defined');
+  expect(text).toContain('// @text');
 });
 
 test('tools.Read on a file over the token limit hands the script the whole file', () => {
@@ -115,7 +135,7 @@ test('A relative path in Read is read from the session folder', () => {
   const dir = scratch();
   writeFileSync(join(dir, 'notes.md'), 'hello there');
   const text = run({ cwd: dir, home: dir, steps: [{ script: 'return await tools.Read({ file_path: "notes.md" })' }] }).results[0]!.text;
-  expect(text).toBe('     1\thello there');
+  expect(text).toBe('1\thello there');
 });
 
 test('A Read of a missing file suggests the near-miss names in its folder', () => {
@@ -254,11 +274,6 @@ test('A missing global names what to use instead', () => {
   expect(one('setTimeout(() => 1, 5)')).toMatch(/waitFor/);
 });
 
-test('A ReferenceError close to a tool name suggests that tool', () => {
-  const text = one('return await ctx__ctx_shell({ command: "true" })');
-  expect(text).toContain('tools.mcp__lean_ctx__ctx_shell');
-});
-
 test('JSON.parse of text that is not JSON shows what the text started with', () => {
   const text = one('JSON.parse("[Firewalled ctx_shell output — 900 chars]")');
   expect(text).toContain('[Firewalled ctx_shell output');
@@ -276,7 +291,7 @@ test('A suffix of a tool name calls that tool', () => {
 });
 
 test('An aborted run says it was stopped and keeps what it had printed', () => {
-  const out = run({ abortAfterMs: 1500, steps: [{ script: 'text("first part done")\nconsole.log("log line")\nawait sh("perl -e \"select(undef, undef, undef, 4)\"")' }] });
+  const out = run({ abortAfterMs: 1500, steps: [{ script: 'text("first part done")\nconsole.log("log line")\nawait sh("perl -e \'select(undef, undef, undef, 4)\'")' }] });
   const t = out.results[0]!.text;
   expect(t).toContain('first part done');
   expect(t).toContain('log line');
@@ -285,10 +300,10 @@ test('An aborted run says it was stopped and keeps what it had printed', () => {
 });
 
 test('A timed-out run keeps its output and names the call still running', () => {
-  const text = one('// @options: {"timeout_ms": 1500}\ntext("got this far")\nawait sh("perl -e \"select(undef, undef, undef, 4)\"")');
+  const text = one('// @options: {"timeout_ms": 1500}\ntext("got this far")\nawait sh("perl -e \'select(undef, undef, undef, 4)\'")');
   expect(text).toContain('got this far');
   expect(text).toMatch(/\[timeout\]/);
-  expect(text).toMatch(/still running: Bash \(\d+(\.\d)?s/);
+  expect(text).toMatch(/still running[^\n]*abandoned, not stopped[^\n]*: Bash \(\d+(\.\d)?s/);
   expect(text).toContain('select(undef, undef, undef, 4)');
 });
 

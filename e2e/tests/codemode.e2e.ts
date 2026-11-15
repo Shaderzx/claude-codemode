@@ -191,7 +191,7 @@ test('A Read of a missing file suggests the near-miss names in its folder', () =
 test('write() creates and overwrites a file through the patch tool when Write is not in the session', () => {
   const dir = scratch();
   const f = join(dir, 'out.txt');
-  const text = one('await write(' + JSON.stringify(f) + ', "one")\nawait write(' + JSON.stringify(f) + ', "two ${x} `")\nreturn "ok"', { tools: NO_BASH });
+  const text = one('await write(' + JSON.stringify(f) + ', "one")\nawait write(' + JSON.stringify(f) + ', "two ${x} `", { force: true })\nreturn "ok"', { tools: NO_BASH });
   expect(text).toBe('ok');
   expect(readFileSync(f, 'utf8')).toBe('two ${x} `');
 });
@@ -202,7 +202,7 @@ test('edit() replaces one exact text through Edit, or the patch tool when Edit i
   const b = join(dir, 'b.txt');
   writeFileSync(a, 'red green blue');
   writeFileSync(b, 'red green blue');
-  expect(one('await edit(' + JSON.stringify(a) + ', "green", "GREEN")\nreturn 1')).toBe('1');
+  expect(one('await read(' + JSON.stringify(a) + ')\nawait edit(' + JSON.stringify(a) + ', "green", "GREEN")\nreturn 1')).toBe('1');
   expect(one('await edit(' + JSON.stringify(b) + ', "blue", "BLUE")\nreturn 1', { tools: NO_BASH })).toBe('1');
   expect(readFileSync(a, 'utf8')).toBe('red GREEN blue');
   expect(readFileSync(b, 'utf8')).toBe('red green BLUE');
@@ -316,8 +316,8 @@ test('A cut gives every key of a single-line object a share', () => {
 });
 
 test('waitFor() holds its timeout even while a check is still running', () => {
-  const text = one('const t0 = Date.now()\ntry { await waitFor(async () => { await sh("perl -e \'select(undef, undef, undef, 0.6)\'"); return true }, { timeout: 100 }) } catch (e) { return e.message.slice(0, 40) + " " + (Date.now() - t0 < 500) }\nreturn "no error"');
-  expect(text).toBe('waitFor timed out after 100ms while a c true');
+  const text = one('const t0 = Date.now()\ntry { await waitFor(async () => { await sh("perl -e \'select(undef, undef, undef, 0.6)\'"); return true }, { timeout: 100 }) } catch (e) { return e.message + " | " + (Date.now() - t0 < 500) }\nreturn "no error"');
+  expect(text).toMatch(/^waitFor timed out after 100ms while a check was still running[^|]* \| true$/);
 });
 
 test('waitFor() with a timeout no longer than its interval still waits out the timeout', () => {
@@ -334,6 +334,15 @@ test('write() over a file the session has not read is refused, and forcing it re
   expect(readFileSync(f, 'utf8')).toBe('original');
   expect(one('await write(' + JSON.stringify(f) + ', "new", { force: true })\nreturn 1')).toBe('1');
   expect(readFileSync(f, 'utf8')).toBe('new');
+});
+
+test('write() through the patch tool replaces a file this session has read, without force', () => {
+  const dir = scratch();
+  const f = join(dir, 'seen.txt');
+  writeFileSync(f, 'old\n');
+  const out = run({ tools: NO_BASH, steps: [{ script: 'await read(' + JSON.stringify(f) + ')' }, { script: 'await write(' + JSON.stringify(f) + ', "new\\n")\nreturn 1' }] });
+  expect(out.results[1]!.text).toBe('1');
+  expect(readFileSync(f, 'utf8')).toBe('new\n');
 });
 
 test('edit() never reads the file for itself', () => {

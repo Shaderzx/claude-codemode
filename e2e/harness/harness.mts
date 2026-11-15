@@ -19,8 +19,9 @@ type Case = {
   abortAfterMs?: number
   mcpFlaky?: number
   dedupReads?: boolean
+  deniedCommands?: string[]
 }
-type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean }
+type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[] }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -44,7 +45,10 @@ const DESCRIPTIONS: Record<string, string> = {
   'mcp__lean-ctx__ctx_shell': 'Run a shell command with compressed output.',
   'mcp__lean-ctx__ctx_patch': 'Safe file edit.',
   'mcp__t3-code__thread_note': 'Adds a note to a thread.',
+  'mcp__aaa-ssh__remote_shell': 'Runs a command on a remote host.',
 }
+// Files a Read has shown: Claude Code's Write and Edit refuse an existing file the session has not read.
+const readSet = new Set<string>()
 const names = c.tools ?? ['Read', 'Bash', 'Write', 'Edit', 'Skill', 'ToolSearch', 'mcp__lean-ctx__ctx_shell', 'mcp__lean-ctx__ctx_patch', 'mcp__t3-code__thread_note']
 const NOTE_SCHEMA = { type: 'object', properties: { threadId: { type: 'string' }, note: { type: 'string' } }, required: ['threadId', 'note'] }
 
@@ -68,6 +72,8 @@ const shell = (command: string) =>
 
 const fake = async (tool: string, a: Record<string, unknown>) => {
   calls.push({ tool, args: a })
+  if (tool === 'Bash' && (c.deniedCommands ?? []).some((d) => String(a.command ?? '').includes(d)))
+    return err('PreToolUse:Bash hook error: blocked: this command is not allowed here')
   if ((c.denied ?? []).includes(tool))
     return err('PreToolUse:' + tool + ' hook error: [DENIED] Native Shell blocked. Use: ctx_shell(command="<command>") — lean-ctx replace mode is active.')
   if (!names.includes(tool)) throw new Error('codemode: $.tool.call: no tool named "' + tool + '" in this session')
@@ -88,14 +94,17 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       if (tokens > 25000)
         return err('File content (' + tokens + ' tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
       seen.set(key, statSync(p).mtimeMs)
+      readSet.add(p)
       return ok(numbered(part, offset))
     }
     case 'Write': {
+      if (existsSync(String(a.file_path)) && !readSet.has(String(a.file_path))) return err('<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>')
       writeFileSync(String(a.file_path), String(a.content))
       return ok('File created successfully at: ' + a.file_path)
     }
     case 'Edit': {
       const p = String(a.file_path)
+      if (!readSet.has(p)) return err('<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>')
       const s = readFileSync(p, 'utf8')
       if (!s.includes(String(a.old_string))) return err('String to replace not found in file.')
       writeFileSync(p, s.replace(String(a.old_string), () => String(a.new_string)))
@@ -107,7 +116,8 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       if (tool !== 'Bash' && Buffer.byteLength(command) > 8192)
         return err('ERROR: Command too large (' + Buffer.byteLength(command) + ' bytes, limit 8192). If you\'re writing file content, use the native Write/Edit tool instead. ctx_shell is for reading command output only (git, cargo, npm, etc.).')
       const r = await shell(command)
-      if (tool === 'Bash') return r.code ? err(r.out + '\nExit code ' + r.code) : ok(r.out)
+      // Claude Code's Bash: a failed command comes back as <tool_use_error>Exit code N\n<output></tool_use_error>.
+      if (tool === 'Bash') return r.code ? err('<tool_use_error>Exit code ' + r.code + '\n' + r.out + '</tool_use_error>') : ok(r.out)
       return r.code ? err(r.out + '\n[exit:' + r.code + ']') : ok(r.out || '(' + tool + ' completed with no output)')
     }
     case 'mcp__lean-ctx__ctx_patch': {
@@ -144,6 +154,8 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
     }
     case 'Skill':
       return ok('Launching skill: ' + a.skill)
+    case 'mcp__aaa-ssh__remote_shell':
+      return err('remote_shell must never be chosen by sh()')
   }
   return err('unhandled tool ' + tool)
 }
@@ -242,6 +254,7 @@ const startSession = async () => {
 await startSession()
 for (const s of c.steps) {
   started = Date.now()
+  if (s.setDenied) { c.denied = s.setDenied; continue }
   if (s.newSession) { await startSession(); continue }
   if (s.script !== undefined) {
     const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: s.script }, engine(async () => ({})))

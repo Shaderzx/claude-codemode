@@ -9,8 +9,8 @@ import { expect, test } from 'e2e';
 // Each test hands the mod scripts the way the model does and checks what comes back.
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean };
+type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[] };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[] };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 // Every folder a test makes is removed after the last test.
@@ -88,9 +88,52 @@ test('quote() makes any value one safe shell word', () => {
   expect(text).toBe(v);
 });
 
-test('sh() runs a command longer than the shell tool allows by writing it to a file first', () => {
-  const text = one('const big = "echo " + "x".repeat(9000) + " >/dev/null; echo done"\nconst r = await sh(big)\nreturn String(r).trim() + " " + r.exitCode', { tools: NO_BASH });
-  expect(text).toBe('done 0');
+test('A command over the shell tool limit is refused with the way to run it from a file, never split up', () => {
+  const out = run({ tools: NO_BASH, steps: [{ script: 'const big = "echo " + "x".repeat(9000)\nawait sh(big)' }] });
+  const t = out.results[0]!.text;
+  expect(t).toMatch(/9005 bytes/);
+  expect(t).toContain('write(');
+  expect(t).toContain('bash');
+  expect(out.calls.filter((c) => c.tool === 'mcp__lean-ctx__ctx_shell')).toEqual([]);
+});
+
+test('A hook that denies one command does not get that command run on another shell', () => {
+  const dir = scratch();
+  const marker = join(dir, 'marker');
+  const out = run({ deniedCommands: ['DANGER'], steps: [{ script: 'await sh("echo DANGER > ' + marker + '")' }, { newSession: true }] });
+  expect(out.results[0]!.text).toContain('this command is not allowed here');
+  expect(existsSync(marker)).toBe(false);
+  expect(out.calls.filter((c) => c.tool === 'mcp__lean-ctx__ctx_shell')).toEqual([]);
+  expect(out.description).not.toMatch(/denied by a hook/);
+});
+
+test('Denial words in a command\'s own output are not a denial, and the command runs once', () => {
+  const dir = scratch();
+  const log = join(dir, 'log');
+  const out = run({ steps: [{ script: 'const r = await sh("echo run >> ' + log + '; echo \'[DENIED] user auth failed: hook blocked\'; exit 1")\nreturn r.exitCode' }, { newSession: true }] });
+  expect(out.results[0]!.text).toBe('1');
+  expect(readFileSync(log, 'utf8')).toBe('run\n');
+  expect(out.description).not.toMatch(/denied by a hook/);
+});
+
+test('A command whose output says too long is not run again', () => {
+  const dir = scratch();
+  const log = join(dir, 'log');
+  const text = one('const r = await sh("echo run >> ' + log + '; echo \'Argument list too long\'; exit 126")\nreturn r.exitCode', { tools: NO_BASH });
+  expect(text).toBe('126');
+  expect(readFileSync(log, 'utf8')).toBe('run\n');
+});
+
+test('sh() never picks a shell tool it does not know, such as a remote shell', () => {
+  const out = run({ tools: ['Read', 'mcp__aaa-ssh__remote_shell', 'mcp__lean-ctx__ctx_shell'], steps: [{ script: 'return String(await sh("echo local")).trim()' }] });
+  expect(out.results[0]!.text).toBe('local');
+  expect(out.calls.map((c) => c.tool)).not.toContain('mcp__aaa-ssh__remote_shell');
+});
+
+test('A tool that works again is no longer named as denied', () => {
+  const out = run({ denied: ['Bash'], steps: [{ script: 'await call("Bash", { command: "true" })' }, { setDenied: [] }, { script: 'await tools.Bash({ command: "true" })\nreturn "ran"' }, { newSession: true }] });
+  expect(out.results[1]!.text).toBe('ran');
+  expect(out.description).not.toMatch(/denied by a hook/);
 });
 
 test('read() returns a file without line numbers and pages through files longer than one Read', () => {
@@ -240,15 +283,122 @@ test('A Promise that was never awaited prints as such instead of {}', () => {
   expect(text).toContain('not awaited');
 });
 
-test('An Error object in the output prints its message', () => {
-  const text = one('return { e: new Error("bad thing") }');
+test('An Error object in the output prints its message and where the script made it', () => {
+  const text = one('const a = 1\nreturn { e: new Error("bad thing") }');
   expect(text).toContain('bad thing');
+  expect(text).toContain('script.js:2');
+});
+
+test('A rejected promise nobody awaited fails the run as a script error, keeping what it printed', () => {
+  const text = one('text("before")\nPromise.reject(new Error("late failure"))\nawait sh("echo x")\nreturn "after"');
+  expect(text).toContain('before');
+  expect(text).toContain('late failure');
+  expect(text).toContain('[script]');
+});
+
+test('Lines that look like // @text inside a template literal stay part of the string', () => {
+  const s = 'intro\n// @text deploy\nTAG=x\n// @end\noutro';
+  const text = one('const r = `' + s + '`\nreturn r');
+  expect(text).toBe(s);
+});
+
+test('The output stays within max_output_chars however many items a run prints', () => {
+  const many = one('for (let i = 0; i < 3000; i++) text("item " + i + " " + "z".repeat(100))\nreturn "end"');
+  expect(many.length).toBeLessThanOrEqual(20_000 + 300);
+  const errs = one('// @options: {"max_output_chars": 1000}\nfor (let i = 0; i < 100; i++) text(Array.from({ length: 50 }, (_, j) => "ERROR " + i + " " + j).join("\\n"))');
+  expect(errs.length).toBeLessThanOrEqual(1000 + 300);
+});
+
+test('A cut gives every key of a single-line object a share', () => {
+  const text = one('// @options: {"max_output_chars": 2000}\nreturn { first: "a".repeat(15000), critical: "BUILD_SUMMARY_42", last: "b".repeat(15000) }');
+  expect(text).toContain('BUILD_SUMMARY_42');
+  expect(text.length).toBeLessThanOrEqual(2300);
+});
+
+test('waitFor() holds its timeout even while a check is still running', () => {
+  const text = one('const t0 = Date.now()\ntry { await waitFor(async () => { await sh("perl -e \'select(undef, undef, undef, 0.6)\'"); return true }, { timeout: 100 }) } catch (e) { return e.message.slice(0, 40) + " " + (Date.now() - t0 < 500) }\nreturn "no error"');
+  expect(text).toBe('waitFor timed out after 100ms while a c true');
+});
+
+test('waitFor() with a timeout no longer than its interval still waits out the timeout', () => {
+  const text = one('const t0 = Date.now()\ntry { await waitFor(() => false, { every: 400, timeout: 400 }) } catch (e) { return Date.now() - t0 >= 380 }\nreturn "no error"');
+  expect(text).toBe('true');
+});
+
+test('write() over a file the session has not read is refused, and forcing it reads the file first', () => {
+  const dir = scratch();
+  const f = join(dir, 'keep.txt');
+  writeFileSync(f, 'original');
+  const refused = one('await write(' + JSON.stringify(f) + ', "new")');
+  expect(refused).toContain('read');
+  expect(readFileSync(f, 'utf8')).toBe('original');
+  expect(one('await write(' + JSON.stringify(f) + ', "new", { force: true })\nreturn 1')).toBe('1');
+  expect(readFileSync(f, 'utf8')).toBe('new');
+});
+
+test('edit() never reads the file for itself', () => {
+  const dir = scratch();
+  const f = join(dir, 'e.txt');
+  writeFileSync(f, 'red green');
+  const out = run({ steps: [{ script: 'await edit(' + JSON.stringify(f) + ', "green", "GREEN")' }, { script: 'await read(' + JSON.stringify(f) + ')\nawait edit(' + JSON.stringify(f) + ', "green", "GREEN")\nreturn 1' }] });
+  expect(out.results[0]!.text).toMatch(/read\(path\)|Read it first/);
+  expect(out.results[1]!.text).toBe('1');
+  expect(readFileSync(f, 'utf8')).toBe('red GREEN');
+});
+
+test('write() and edit() refuse a relative path', () => {
+  const text = one('await write("rel.txt", "x")');
+  expect(text).toContain('absolute');
+});
+
+test('write() says plainly when the patch tool cannot replace an existing empty file', () => {
+  const dir = scratch();
+  const f = join(dir, 'empty.txt');
+  writeFileSync(f, '');
+  const text = one('await write(' + JSON.stringify(f) + ', "x", { force: true })', { tools: NO_BASH });
+  expect(text).toContain('empty');
+});
+
+test('read() reads a file whose text mentions the repeated-read stub', () => {
+  const dir = scratch();
+  const body = 'line one\nsee [unchanged 3L · lean-ctx read-dedup] in the docs\nUnchanged since your last Read\n';
+  writeFileSync(join(dir, 'doc.md'), body);
+  const text = one('return JSON.stringify(await read(' + JSON.stringify(join(dir, 'doc.md')) + '))');
+  expect(JSON.parse(text)).toBe(body);
+});
+
+test('read() keeps working however many times the same unchanged file is read', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'five.txt'), 'a\nb\n');
+  const text = one('const r = []\nfor (let i = 0; i < 8; i++) r.push(await read(' + JSON.stringify(join(dir, 'five.txt')) + '))\nreturn r.every((x) => x === "a\\nb\\n")', { dedupReads: true });
+  expect(text).toBe('true');
+});
+
+test('tools.Read of a file over the limit pages past a repeated-read stub', () => {
+  const dir = scratch();
+  const lines = Array.from({ length: 1500 }, (_, i) => String(i + 1).padStart(4, '0') + ' ' + 'w'.repeat(90));
+  writeFileSync(join(dir, 'wide.txt'), lines.join('\n'));
+  const text = one('const f = ' + JSON.stringify(join(dir, 'wide.txt')) + '\nconst a = await tools.Read({ file_path: f })\nconst b = await tools.Read({ file_path: f })\nreturn a.split("\\n").length + " " + b.split("\\n").length', { dedupReads: true });
+  expect(text).toBe('1500 1500');
+});
+
+test('Running a failed script again names the earlier error when it differs', () => {
+  const dir = scratch();
+  const f = join(dir, 'later.txt');
+  const s = 'await tools.Read({ file_path: ' + JSON.stringify(f) + ' })\nnull.x';
+  const out = run({ steps: [{ script: s }, { script: 'await sh("touch ' + f + '")\nreturn 1' }, { script: s }] });
+  expect(out.results[2]!.text).toMatch(/same script[^\n]*with: [^\n]*File does not exist/);
 });
 
 test('A failed run says how many calls had already succeeded and how to keep them', () => {
   const text = one('await Promise.all([sh("echo a"), sh("echo b"), tools.Read({ file_path: "/nope/x" })])');
-  expect(text).toMatch(/2 other calls had succeeded/);
+  expect(text).toMatch(/2 calls that ran alongside it had succeeded/);
   expect(text).toMatch(/allSettled|call\(\)/);
+});
+
+test('Calls that finished before the failed one are not reported as lost', () => {
+  const text = one('const a = await sh("echo a")\nawait tools.Read({ file_path: "/nope/x" })');
+  expect(text).not.toMatch(/lost/);
 });
 
 test('The failure ledger shows the command or path of the call that failed', () => {

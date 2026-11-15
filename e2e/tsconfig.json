@@ -6,7 +6,13 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["e2e.config.ts", "tests/**/*.ts"]
+  "include": [
+    "e2e.config.ts",
+    "tests/**/*.ts",
+    "harness/**/*.mts"
+  ]
 }

@@ -226,7 +226,7 @@ test('edit() replaces one exact text through Edit, or the patch tool when Edit i
   writeFileSync(a, 'red green blue');
   writeFileSync(b, 'red green blue');
   expect(one('await read(' + JSON.stringify(a) + ')\nawait edit(' + JSON.stringify(a) + ', "green", "GREEN")\nreturn 1')).toBe('1');
-  expect(one('await edit(' + JSON.stringify(b) + ', "blue", "BLUE")\nreturn 1', { tools: NO_BASH })).toBe('1');
+  expect(one('await read(' + JSON.stringify(b) + ')\nawait edit(' + JSON.stringify(b) + ', "blue", "BLUE")\nreturn 1', { tools: NO_BASH })).toBe('1');
   expect(readFileSync(a, 'utf8')).toBe('red GREEN blue');
   expect(readFileSync(b, 'utf8')).toBe('red green BLUE');
 });
@@ -388,8 +388,9 @@ test('edit() through the patch tool refuses a file this session has not read', (
 test('waitFor() treats a failed call() result as not yet', () => {
   const dir = scratch();
   const f = join(dir, 'ready');
-  const text = one('await sh("(perl -e \'select(undef, undef, undef, 0.4)\'; touch ' + f + ') >/dev/null 2>&1 &")\nconst r = await waitFor(() => call("mcp__lean-ctx__ctx_shell", { command: "test -f ' + f + '" }), { every: 50, timeout: 5000 })\nreturn r.ok + " " + existsSync', { tools: NO_BASH });
-  expect(text.startsWith('true')).toBe(true);
+  const text = one('await sh("(perl -e \'select(undef, undef, undef, 0.4)\'; touch ' + f + ') >/dev/null 2>&1 &")\nconst r = await waitFor(() => call("mcp__lean-ctx__ctx_shell", { command: "test -f ' + f + '" }), { every: 50, timeout: 5000 })\nreturn r.ok', { tools: NO_BASH });
+  expect(text).toBe('true');
+  expect(existsSync(f)).toBe(true);
 });
 
 test('A rejection the script catches later does not fail the run', () => {
@@ -415,13 +416,12 @@ test('A TEXT name with no block throws and names the blocks there are', () => {
   expect(one('// @text deploy\necho hi\n// @end\nreturn TEXT.Deploy')).toMatch(/TEXT\.Deploy[^\n]*deploy/);
 });
 
-test('A remembered denial belongs to the project folder it was seen in', () => {
+test('lean-ctx\'s whole-tool block, a setting of the machine, is remembered in every project folder', () => {
   const a = scratch();
   const b = scratch();
-  const out = run({ cwd: a, denied: ['Bash'], steps: [{ script: 'await call("Bash", { command: "true" })' }, { setCwd: b }, { newSession: true }, { script: 'return 1' }] });
-  expect(out.description).not.toMatch(/denied by a hook/);
-  const back = run({ cwd: a, denied: ['Bash'], steps: [{ script: 'await call("Bash", { command: "true" })' }, { setCwd: b }, { newSession: true }, { setCwd: a }, { newSession: true }] });
-  expect(back.description).toMatch(/Bash[^\n]*denied by a hook/);
+  const out = run({ cwd: a, denied: ['Bash'], steps: [{ script: 'await call("Bash", { command: "true" })' }, { setCwd: b }, { newSession: true }, { script: 'return (await sh("echo x")).tool' }] });
+  expect(out.description).toMatch(/Bash[^\n]*denied by a hook/);
+  expect(out.results[1]!.text).toBe('mcp__lean-ctx__ctx_shell');
 });
 
 test('A denial seen through call() steers sh() in the same script', () => {

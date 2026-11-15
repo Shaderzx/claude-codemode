@@ -25,3 +25,18 @@ jobs:
       - name: Run the suite
         working-directory: e2e
         run: npx e2e run
+  mods:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.325
+      - name: Validate and test codemode
+        working-directory: codemode
+        run: claude plugin validate . && claude plugin test
+      - name: Validate and test codemode-agents
+        working-directory: codemode-agents
+        run: claude plugin validate . && claude plugin test

@@ -20,6 +20,8 @@ type Case = {
   mcpFlaky?: number
   dedupReads?: boolean
   deniedCommands?: string[]
+  deniedMessage?: string
+  readRewrite?: string
 }
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[] }
 
@@ -46,6 +48,7 @@ const DESCRIPTIONS: Record<string, string> = {
   'mcp__lean-ctx__ctx_patch': 'Safe file edit.',
   'mcp__t3-code__thread_note': 'Adds a note to a thread.',
   'mcp__aaa-ssh__remote_shell': 'Runs a command on a remote host.',
+  'mcp__other__git_patch': 'Applies a git patch.',
 }
 // Files a Read has shown: Claude Code's Write and Edit refuse an existing file the session has not read.
 const readSet = new Set<string>()
@@ -73,12 +76,13 @@ const shell = (command: string) =>
 const fake = async (tool: string, a: Record<string, unknown>) => {
   calls.push({ tool, args: a })
   if (tool === 'Bash' && (c.deniedCommands ?? []).some((d) => String(a.command ?? '').includes(d)))
-    return err('PreToolUse:Bash hook error: blocked: this command is not allowed here')
+    return err(c.deniedMessage ?? 'PreToolUse:Bash hook error: blocked: this command is not allowed here')
   if ((c.denied ?? []).includes(tool))
     return err('PreToolUse:' + tool + ' hook error: [DENIED] Native Shell blocked. Use: ctx_shell(command="<command>") — lean-ctx replace mode is active.')
   if (!names.includes(tool)) throw new Error('codemode: $.tool.call: no tool named "' + tool + '" in this session')
   switch (tool) {
     case 'Read': {
+      if (c.readRewrite !== undefined) return ok(c.readRewrite)
       const p = String(a.file_path ?? '')
       if (!p.startsWith('/') || !existsSync(p)) return err('File does not exist. Note: your current working directory is ' + cwd + '.')
       const text = readFileSync(p, 'utf8')
@@ -154,6 +158,8 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
     }
     case 'Skill':
       return ok('Launching skill: ' + a.skill)
+    case 'mcp__other__git_patch':
+      return err('git_patch must never be chosen by write() or edit()')
     case 'mcp__aaa-ssh__remote_shell':
       return err('remote_shell must never be chosen by sh()')
   }
@@ -183,7 +189,9 @@ const $ = {
   },
   env: { get: async (k: string) => ({ HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },
   fs: {
+    // Claude Code's $.fs.write refuses more than 4 MiB.
     write: async (p: string, t: string) => {
+      if (Buffer.byteLength(t) > 4 * 1024 * 1024) throw new Error('fs.write: over the 4 MiB limit')
       mkdirSync(dirname(p), { recursive: true })
       writeFileSync(p, t)
       return p

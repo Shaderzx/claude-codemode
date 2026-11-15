@@ -8,7 +8,13 @@ const RUN = 'mcp__codemode__run'
 const HOME = '/home/test'
 const MARK = '\x1eCM'
 const START = { cwd: '/tmp', surface: null, isInteractive: false } as never
-const line = (o: unknown) => ({ stream: 'stdout' as const, text: MARK + JSON.stringify(o) + '\n' })
+// The runner sends its output as it is made and ends with done; a done that holds
+// items and logs here stands for both.
+const line = (o: unknown) => {
+  const { items, logs, ...rest } = o as { done?: boolean; items?: string[]; logs?: string[] }
+  const before = rest.done ? [...(items ?? []).map((text) => ({ out: 'item', text })), ...(logs ?? []).map((text) => ({ out: 'log', text }))] : []
+  return { stream: 'stdout' as const, text: [...before, rest.done ? rest : o].map((x) => MARK + JSON.stringify(x) + '\n').join('') }
+}
 const ran = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
 type Fake = {
@@ -225,8 +231,8 @@ test('a cut output is saved whole and the cut names the file', { timeoutMs: 10_0
   expect(f.texts[spill ?? '']).toBe(big)
   expect(String(r.result).length).toBeLessThan(21_000)
   expect(String(r.result)).not.toContain('MIDDLE')
-  expect(String(r.result)).toContain(`all of it is in ${spill}`)
-  expect(String(r.result)).toContain('chars cut (lines 1-1 of 1)')
+  expect(String(r.result)).toContain(`read them back with tools.Read({ file_path: ${JSON.stringify(spill)}, offset: 1, limit: 1 })`)
+  expect(String(r.result)).toContain('chars cut (lines 1-1)')
   expect(clip('a\nb\nc\nd\ne\nf\n', 4)).toContain('(lines 2-5 of 6)')
   expect(clip('a\nb\nc\nd\ne\nf\ng\nh', 4, '/f.txt')).toBe(
     'a\n\n…11 chars cut (lines 2-7 of 8); all of it is in /f.txt, so read back only the lines you need…\n\nh',

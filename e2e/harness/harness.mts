@@ -1,8 +1,3 @@
-// Runs codemode's real mod source under Node with a stand-in for Claude Code's $:
-// real files, a real Node runner child, real shell commands, and tools that behave
-// the way the week of logs showed (Read's token limit, ctx_shell's 8 KB limit, a
-// hook that denies Bash, an MCP server that rejects bad arguments).
-// Usage: node harness.mts <case.json>   prints one JSON object.
 import { spawn, spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -52,7 +47,6 @@ const DESCRIPTIONS: Record<string, string> = {
   'mcp__aaa-ssh__remote_shell': 'Runs a command on a remote host.',
   'mcp__other__git_patch': 'Applies a git patch.',
 }
-// Files a Read has shown: Claude Code's Write and Edit refuse an existing file the session has not read.
 const readSet = new Set<string>()
 const names = c.tools ?? ['Read', 'Bash', 'Write', 'Edit', 'Skill', 'ToolSearch', 'mcp__lean-ctx__ctx_shell', 'mcp__lean-ctx__ctx_patch', 'mcp__t3-code__thread_note']
 const NOTE_SCHEMA = { type: 'object', properties: { threadId: { type: 'string' }, note: { type: 'string' } }, required: ['threadId', 'note'] }
@@ -60,12 +54,9 @@ const NOTE_SCHEMA = { type: 'object', properties: { threadId: { type: 'string' }
 const err = (text: string) => ({ isError: true, text, result: text })
 const ok = (text: string, result: unknown = text) => ({ text, result })
 
-// Claude Code 2.1.325's Read: "N<tab>line", with a last, empty line when the file ends in a newline.
 const numbered = (lines: string[], from: number) => lines.map((l, i) => String(from + i) + '\t' + l).join('\n')
-// lean-ctx's Read hook answers a repeat of a read that worked, on a file that has not changed, with a stub.
 const seen = new Map<string, number>()
 
-// Asynchronous, as Claude Code's own tools are: a run's timer and its other calls go on meanwhile.
 const shell = (command: string) =>
   new Promise<{ code: number; out: string }>((done) => {
     const p = spawn('bash', ['-c', command], { cwd, env: { ...process.env, HOME: home } })
@@ -124,7 +115,6 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       if (tool !== 'Bash' && Buffer.byteLength(command) > 8192)
         return err('ERROR: Command too large (' + Buffer.byteLength(command) + ' bytes, limit 8192). If you\'re writing file content, use the native Write/Edit tool instead. ctx_shell is for reading command output only (git, cargo, npm, etc.).')
       const r = await shell(command)
-      // Claude Code's Bash: a failed command comes back as <tool_use_error>Exit code N\n<output></tool_use_error>.
       if (tool === 'Bash') return r.code ? err('<tool_use_error>Exit code ' + r.code + '\n' + r.out + '</tool_use_error>') : ok(r.out)
       return r.code ? err(r.out + '\n[exit:' + r.code + ']') : ok(r.out || '(' + tool + ' completed with no output)')
     }
@@ -193,7 +183,6 @@ const $ = {
   },
   env: { get: async (k: string) => ({ HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },
   fs: {
-    // Claude Code's $.fs.write refuses more than 4 MiB.
     write: async (p: string, t: string) => {
       if (Buffer.byteLength(t) > 4 * 1024 * 1024) throw new Error('fs.write: over the 4 MiB limit')
       mkdirSync(dirname(p), { recursive: true })

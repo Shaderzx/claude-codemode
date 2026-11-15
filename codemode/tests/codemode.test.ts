@@ -8,8 +8,6 @@ const RUN = 'mcp__codemode__run'
 const HOME = '/home/test'
 const MARK = '\x1eCM'
 const START = { cwd: '/tmp', surface: null, isInteractive: false } as never
-// The runner sends its output as it is made and ends with done; a done that holds
-// items and logs here stands for both.
 const line = (o: unknown) => {
   const { items, logs, ...rest } = o as { done?: boolean; items?: string[]; logs?: string[] }
   const before = rest.done ? [...(items ?? []).map((text) => ({ out: 'item', text })), ...(logs ?? []).map((text) => ({ out: 'log', text }))] : []

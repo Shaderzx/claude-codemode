@@ -4,16 +4,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'e2e';
 
-// codemode's real mod source runs under Node (harness/harness.mts) with a real Node
-// runner child, real files and real shell commands; only Claude Code's $ is a stand-in.
-// Each test hands the mod scripts the way the model does and checks what comes back.
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
 type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
-// Every folder a test makes is removed after the last test.
 const made: string[] = [];
 test.afterAll(() => {
   for (const d of made) rmSync(d, { recursive: true, force: true });

@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -1445,4 +1445,15 @@ test('A read counts at once, even when the reply file is still being written', (
 
 test('A word async at the end of a line does not make the next line\'s function an expression', () => {
   expect(one('let async = 1\nconst a = async\nfunction f() {}\n/`/.test("a")\n// @text a\nhi\n// @end\nreturn TEXT.a')).toBe('hi');
+});
+
+
+test('sh() on lean-ctx\'s shell lets a command run as long as the script\'s own time allows', () => {
+  expect(one('const r = await sh("sleep 1; echo ok")\nreturn r.exitCode + " " + String(r).trim()', { tools: NO_BASH, leanTimeoutMs: 300 })).toBe('0 ok');
+});
+
+test('A lean-ctx background job whose output lean-ctx withheld says so', () => {
+  const text = one('const r = await sh("sleep 1; echo done")\nreturn r.exitCode + " " + String(r).trim()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, archiveWithheld: true });
+  expect(text).toMatch(/^0 /);
+  expect(text).toMatch(/Note: [^\n]*withheld/);
 });

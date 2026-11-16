@@ -35,6 +35,8 @@ type Case = {
   listThrows?: boolean
   detachAfterMs?: number
   slowWritesMs?: number
+  leanTimeoutMs?: number
+  archiveWithheld?: boolean
 }
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -178,9 +180,17 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
         if (!j.done) return ok(JSON.stringify({ jobId: id, state: 'running', summary: 'running' }))
         if (j.done.code) return err('[background:' + id + ' failed, exit ' + j.done.code + ']\n' + j.done.out + '\n\n[exit:' + j.done.code + ']')
         const aid = 'a' + id.slice(-15)
-        mkdirSync(dirname(archive(aid)), { recursive: true })
-        writeFileSync(archive(aid), j.done.out)
+        if (!c.archiveWithheld) {
+          mkdirSync(dirname(archive(aid)), { recursive: true })
+          writeFileSync(archive(aid), j.done.out)
+        }
         return ok(JSON.stringify({ archiveId: aid, archivedChars: j.done.out.length, exitCode: 0, jobId: id, state: 'completed', summary: j.done.out.length + ' chars archived' }))
+      }
+      if (tool !== 'Bash' && c.leanTimeoutMs !== undefined) {
+        const limit = typeof a.timeout_ms === 'number' ? a.timeout_ms : c.leanTimeoutMs
+        const raced = await Promise.race([shell(command), new Promise<undefined>((r) => setTimeout(() => r(undefined), limit))])
+        if (raced === undefined) return err('(timed out after ' + limit + 'ms)\n[exit:124]')
+        return raced.code ? err(raced.out + '\n[exit:' + raced.code + ']') : ok(raced.out || '(' + tool + ' completed with no output)')
       }
       if (tool !== 'Bash' && c.detachAfterMs !== undefined) {
         const running = shell(command)
@@ -258,6 +268,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       return ok('Launching skill: ' + a.skill)
     case 'mcp__lean-ctx__ctx_expand': {
       const id = String(a.id)
+      if (c.archiveWithheld) return ok('[lean-ctx gateway: retained output withheld by storage policy]')
       if (!existsSync(archive(id))) return err('no archive ' + id)
       const body = readFileSync(archive(id), 'utf8')
       return ok('Archive ' + id + ' (' + body.length + ' chars):\n' + body)

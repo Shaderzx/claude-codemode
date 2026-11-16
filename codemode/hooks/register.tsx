@@ -187,7 +187,7 @@ const shareKeys = (keys, budget) => {
   return out
 }
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
-const isStubText = (t) => /^\s*\[(?:Firewalled \S+ output|lean-ctx gateway: content withheld|untrusted input: tool_output overflow)/.test(String(t)) || isDedup(t)
+const isStubText = (t) => /^\s*\[(?:Firewalled \S+ output|lean-ctx gateway:[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(String(t)) || isDedup(t)
 const fileLines = (t) => String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
 const pickLimit = (limit, tried, cap, down) => {
   for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
@@ -443,7 +443,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     }
     const expand = named(/^mcp__lean[-_]ctx__(?:ctx_)?expand$/)[0]
     if (!expand) return ''
-    const r = await req('call', { tool: expand, args: { id }, handled: true })
+    const r = await req('call', { tool: expand, args: { id } })
     return r.ok ? String(r.text).replace(/^Archive [^\n]*:\n/, '') : ''
   }
   const follow = async (tool, id) => {
@@ -472,7 +472,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (stage) return viaFile(tool, cmd, extra)
       throw tooLong(cmd, tool)
     }
-    const args = LEAN_SHELL.test(tool) && !('raw' in extra) ? { raw: true, ...extra, command: cmd } : { ...extra, command: cmd }
+    const lean = LEAN_SHELL.test(tool)
+    const args = { ...(lean && !('raw' in extra) ? { raw: true } : {}), ...(lean && !('timeout_ms' in extra) ? { timeout_ms: Math.max(1000, Math.min(3600000, deadline())) } : {}), ...extra, command: cmd }
     const r = await req('call', { tool, args, foreground: true })
     if (r.denied) return r
     const job = r.ok && LEAN_SHELL.test(tool) ? runningJob(r.shellText ?? r.text) : undefined
@@ -1315,7 +1316,7 @@ const SHELL_RE = /^Bash$|(?:^|_)shell$/i
 const HOOK_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:\S+ hook (?:error|denied)/i
 const WHOLE_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:(\S+) hook error: \[DENIED\] [A-Za-z ]{1,60} blocked\. Use: ([A-Za-z0-9_-]+)\(/
 export const isStub = (t: string) =>
-  /^\s*\[(?:Firewalled \S+ output|lean-ctx gateway: content withheld|untrusted input: tool_output overflow)/.test(t) ||
+  /^\s*\[(?:Firewalled \S+ output|lean-ctx gateway:[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(t) ||
   (countLines(t) <= 2 && /^\s*1\t\S[^\n]* \[unchanged \d+L · lean-ctx read-dedup\]/.test(t))
 const short = (n: string) => n.split('__').pop() ?? n
 const escape = (s: string) => s.replace(/[.*+?^$|{}()[\]\\]/g, '\\$&')
@@ -1523,6 +1524,7 @@ export const register: Register = (on) => {
     const stubs = new Set<string>()
     let deduped = false
     let persisted = false
+    const withheld = new Set<string>()
     const defaults = toolDefaults(await $.env.get('CODEMODE_TOOL_DEFAULTS'))
     const cwd = sessionCwd ?? (await $.env.get('PWD')) ?? undefined
     // Stored types belong to one engine version: an upgrade can change a schema.
@@ -1754,7 +1756,8 @@ export const register: Register = (on) => {
               ? ({ file: normal(target), whole: true } as Receipt)
               : undefined
         if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
-        if (isStub(text) && p.handled !== true) {
+        if (isStub(text) && p.handled !== true && /^\s*\[lean-ctx gateway:[^\]\n]*withheld/.test(text)) withheld.add(tool)
+        else if (isStub(text) && p.handled !== true) {
           stubs.add(tool)
           if (/read-dedup/.test(text)) deduped = true
         }
@@ -2028,6 +2031,7 @@ export const register: Register = (on) => {
       ...(stubs.size
         ? [`Note: a result from ${[...stubs].join(', ')} was a compressed stub, not the tool's full text; ${deduped ? 'read(path) gets a whole file past a repeated-read stub, and ' : ''}call the tool with raw: true, or set CODEMODE_TOOL_DEFAULTS, to get the full text.`]
         : []),
+      ...(withheld.size ? [`Note: lean-ctx withheld a result from ${[...withheld].join(', ')} by its storage policy; that text is not available to scripts here.`] : []),
       ...(persisted ? ['Note: Bash saved a big output to a file instead of returning it (<persisted-output>), and it could not be read back here; read(path) of the file it names gets it whole where Read may open it.'] : []),
     ]
     if (notes.length) ended = { ...ended, notes }

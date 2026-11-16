@@ -25,7 +25,7 @@ function run(c: Case): Out {
   const dir = scratch();
   const file = join(dir, 'case.json');
   writeFileSync(file, JSON.stringify({ home: dir, cwd: dir, ...c }));
-  return JSON.parse(execFileSync(process.execPath, [harness, file], { encoding: 'utf8', timeout: 120_000 }));
+  return JSON.parse(execFileSync(process.execPath, [harness, file], { encoding: 'utf8', timeout: 120_000, maxBuffer: 256 * 1024 * 1024 }));
 }
 
 const one = (script: string, c: Omit<Case, 'steps'> = {}) => run({ ...c, steps: [{ script }] }).results[0]!.text;

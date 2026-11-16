@@ -187,7 +187,7 @@ const shareKeys = (keys, budget) => {
   return out
 }
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
-const withheldText = (t) => String(t).length < 600 && /^\s*(?:\[(?:lean-ctx[^\]\n]*withheld|POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway)|stored output (?:is )?withheld|archive withheld by current policy|Tool may have completed; output withheld by policy)/i.test(String(t))
+const withheldText = (t) => String(t).length < 600 && /^\s*(?:\[(?:lean-ctx[^\]\n]*withheld|POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway\])|(?:stored output (?:is )?withheld by the context gateway|archive withheld by current policy|Tool may have completed; output withheld by policy)\.?\s*$)/i.test(String(t))
 const isStubText = (t) => /^\s*\[(?:Firewalled \S+ output|lean-ctx[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(String(t)) || withheldText(t) || isDedup(t)
 const fileLines = (t) => String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
 const pickLimit = (limit, tried, cap, down) => {
@@ -377,7 +377,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const tool = resolve(name)
     const r = await req('call', { tool, args: args ?? {} })
     noteRead(tool, args, r)
-    for (const k of ['shellText', 'denied', 'alt', 'refused']) delete r[k]
+    for (const k of ['shellText', 'denied', 'alt', 'refused', 'cut']) delete r[k]
     return textual(r)
   }
   const tools = new Proxy({}, {
@@ -408,7 +408,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     return order.length || !names.has('Bash') ? order : ['Bash']
   }
   const patcher = () => named(/^mcp__lean[-_]ctx__(?:ctx_)?patch$/)[0]
-  const shResult = (text, code, tool) => Object.assign(new String(text), { exitCode: code, ok: code === 0, tool })
+  const shResult = (text, code, tool) => Object.assign(new String(text), { exitCode: code, ok: code === 0, tool }, text && text.withheld === true ? { withheld: true, truncated: true } : {})
+  const withheldOutput = (t) => Object.assign(new String(t), { withheld: true })
   const LIMIT = 7000
   const viaFile = async (tool, cmd, extra) => {
     const folder = '/tmp/codemode-' + require('node:crypto').randomBytes(12).toString('hex')
@@ -432,13 +433,24 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.denied || typeof r.exitCode !== 'number') await clear()
     return r
   }
-  const endLine = (text, bytes) => (!text.endsWith('\n') && Buffer.byteLength(text) + 1 === bytes ? text + '\n' : text)
+  const endLine = (text, bytes) => (Buffer.byteLength(text) + 1 === bytes ? text + '\n' : text)
   const refusedRead = (expand, r) => toolError('sh: the command finished, but reading its output through ' + expand + ' was refused: ' + r.error, r)
+  const outOfTime = (id) => toolError('sh: the command finished, but the run ran out of time while fetching its output from lean-ctx archive ' + id + '; fetch it in a new run with ctx_expand(id="' + id + '") in pages (start_line, end_line)')
   const expandPages = async (expand, id, total, chars) => {
     const rows = []
-    for (let s = 1; s <= total; ) {
-      const r = await req('call', { tool: expand, args: { id, start_line: s, end_line: Math.min(total, s + 499) }, handled: true })
+    for (let s = 1, page = 0; s <= total; page++) {
+      if (deadline() < 1500) throw outOfTime(id)
+      if (page === 3 && usable('Read') && home) {
+        const whole = await fromFile(id).catch(() => undefined)
+        if (whole !== undefined) return whole
+      }
+      const pageArgs = { id, start_line: s, end_line: Math.min(total, s + 499) }
+      const r = await req('call', { tool: expand, args: pageArgs, handled: true })
       if (r.refused || r.denied) throw refusedRead(expand, r)
+      if (r.ok && withheldText(r.text)) {
+        const again = await req('call', { tool: expand, args: pageArgs })
+        return withheldOutput(String(again.ok && withheldText(again.text) ? again.text : r.text))
+      }
       const got = r.ok ? String(r.text).split('\n').map((l) => /^\s*(\d+)\|([^\n]*)$/.exec(l)).filter(Boolean) : []
       if (!got.length || got.some((m, k) => Number(m[1]) !== s + k)) return undefined
       for (const m of got) rows.push(m[2])
@@ -450,10 +462,27 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   }
   const fromFile = async (id) => {
     if (!names.has('Read') || !home) throw toolError('sh: the command finished, but its output in lean-ctx archive ' + id + ' could not be fetched (no ctx_expand and no Read here)')
+    const file = home + '/.local/share/lean-ctx/archives/' + id.slice(0, 2) + '/' + id + '.txt'
     try {
-      return await read(home + '/.local/share/lean-ctx/archives/' + id.slice(0, 2) + '/' + id + '.txt')
+      return await read(file)
     } catch (e) {
-      throw toolError('sh: the command finished, but its output in lean-ctx archive ' + id + ' could not be read: ' + e.message)
+      const why = toolError('sh: the command finished, but its output in lean-ctx archive ' + id + ' could not be read: ' + e.message)
+      if (!/over Read's token cap/.test(e.message)) throw why
+      return inBytes(file, why)
+    }
+  }
+  const inBytes = async (file, why) => {
+    const order = shells()
+    if (!order.length) throw why
+    const step = LEAN_SHELL.test(order[0]) ? 300000 : 22000
+    const parts = []
+    for (let at = 0; ; at += step) {
+      if (deadline() < 1500) throw why
+      const r = await run(order[0], 'tail -c +' + (at + 1) + ' ' + quote(file) + ' | head -c ' + step + ' | base64', {})
+      if (r.denied || r.exitCode !== 0) throw why
+      const part = Buffer.from(String(r).replace(/\s+/g, ''), 'base64')
+      parts.push(part)
+      if (part.length < step) return Buffer.concat(parts).toString('utf8')
     }
   }
   const archived = async (id) => {
@@ -463,15 +492,16 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       const r = await req('call', { tool: expand, args: { id } })
       if (r.refused || r.denied) throw refusedRead(expand, r)
       const t = String(r.text ?? '')
-      if (r.ok && (isStubText(t) || withheldText(t))) return t
+      if (r.ok && withheldText(t)) return withheldOutput(t)
+      if (r.ok && isStubText(t)) return fromFile(id)
       if (r.ok && /^Background job '[^']+' finished \(exit \d+\) without output\.\s*$/.test(t)) return ''
-      const head = r.ok ? /^Archive [^\n]*?\((\d+) chars, (\d+) lines\):\n/.exec(t) : null
+      const head = r.ok ? /^Archive [^\n]*?\((\d+) chars, (\d+) lines\):(?:\n|$)/.exec(t) : null
       if (head) {
         const chars = Number(head[1])
         const total = Number(head[2])
         const shown = t.slice(head[0].length)
         const body = shown.replace(/(?:^|\n)\[… truncated at [^\n]*\](?:\n\[Original available[^\n]*\])?\s*$/, '')
-        if (body === shown && body.split('\n').length >= total) return endLine(body, chars)
+        if (body === shown && (head[0].endsWith('\n') || chars === 0) && body.split('\n').length >= total) return endLine(body, chars)
         const paged = await expandPages(expand, id, total, chars)
         if (paged !== undefined) return paged
       }
@@ -494,14 +524,19 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         if (j && j.state === 'running') continue
         if (j && j.state === 'completed') {
           const quiet = j.archiveId === undefined && (j.capturedChars === 0 || j.summary === 'no output')
-          const done = shResult(quiet ? '' : await archived(j.archiveId ?? id), Number(j.exitCode) || 0, tool)
+          const done = shResult(quiet ? '' : await archived(j.archiveId ?? id), typeof j.exitCode === 'number' ? j.exitCode : quiet ? 0 : undefined, tool)
           if (j.archiveTruncated === true) done.truncated = true
           return done
         }
         throw toolError('sh: background job ' + id + ' on ' + tool + ' answered: ' + String(s.text).slice(0, 300), s)
       }
       const failed = /^\s*\[background:[^\]\n]*failed, exit (\d+)\]\n?([\s\S]*?)\n*(?:\[exit:\d+[^\]\n]*\])?\s*$/.exec(String(s.error ?? ''))
-      if (failed) return shResult(await jobOutput(failed[2], id), Number(failed[1]), tool)
+      if (failed) {
+        const expandable = named(/^mcp__lean[-_]ctx__(?:ctx_)?expand$/).length > 0
+        const done = shResult(expandable ? await archived(id) : await jobOutput(failed[2], id), Number(failed[1]), tool)
+        if (s.cut && !expandable) done.truncated = true
+        return done
+      }
       if (typeof s.exitCode === 'number') return shResult(await jobOutput(String(s.shellText ?? '').replace(/^\s*\[background:[^\]\n]*\]\n?/, ''), id), s.exitCode, tool)
       throw toolError('sh: background job ' + id + ' on ' + tool + ': ' + s.error, s)
     }
@@ -519,7 +554,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.denied) return r
     const job = r.ok && lean && typeof r.job === 'string' ? r.job : undefined
     if (job) return follow(tool, job)
-    if (typeof r.exitCode === 'number') return shResult(r.shellText ?? r.text ?? r.error ?? '', r.exitCode, tool)
+    if (typeof r.exitCode === 'number') {
+      const done = shResult(r.shellText ?? r.text ?? r.error ?? '', r.exitCode, tool)
+      if (r.cut) done.truncated = true
+      return done
+    }
     if (r.ok) return shResult(r.shellText ?? r.text, 0, tool)
     if (/^\s*ERROR: Command too large \(\d+ bytes, limit \d+\)/.test(String(r.error))) {
       if (stage) return viaFile(tool, cmd, extra)
@@ -674,7 +713,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     for (let first = true; ; first = false) {
       const left = limit - (Date.now() - t0)
       if (left <= 0 && !first) throw new Error('waitFor timed out after ' + limit + 'ms; the check last returned ' + show(last))
-      const v = await Promise.race([Promise.resolve().then(check), sleep(Math.max(1, left)).then(() => LATE)])
+      const pending = Promise.resolve().then(check)
+      const v = await Promise.race([pending, sleep(Math.max(1, left)).then(() => LATE)])
+      if (v === LATE) pending.catch(() => {})
       if (v === LATE) throw new Error('waitFor timed out after ' + limit + 'ms while a check was still running (its tool calls may still finish)')
       if (done(v)) return v
       last = v
@@ -1357,9 +1398,10 @@ export const normal = (p: string) => {
 const SHELL_RE = /^Bash$|(?:^|_)shell$/i
 const HOOK_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:\S+ hook (?:error|denied)/i
 const WHOLE_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:(\S+) hook error: \[DENIED\] [A-Za-z ]{1,60} blocked\. Use: ([A-Za-z0-9_-]+)\(/
-const isWithheld = (t: string) =>
-  t.length < 600 &&
-  /^\s*(?:\[(?:lean-ctx[^\]\n]*withheld|POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway)|stored output (?:is )?withheld|archive withheld by current policy|Tool may have completed; output withheld by policy)/i.test(t)
+const LEAN_WITHHELD = /^\s*\[lean-ctx[^\]\n]*withheld/i
+const GATEWAY_WITHHELD = /^\s*(?:\[(?:POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway\])|(?:stored output (?:is )?withheld by the context gateway|archive withheld by current policy|Tool may have completed; output withheld by policy)\.?\s*$)/i
+const ENGINE_CUT = /\n\n\.\.\. \[\d+ characters truncated\] \.\.\.\n\n/
+const isWithheld = (t: string, tool?: string) => t.length < 600 && (LEAN_WITHHELD.test(t) || ((tool === undefined || /lean[-_]ctx/.test(tool)) && GATEWAY_WITHHELD.test(t)))
 const jobOf = (t: string): string | undefined => {
   try {
     const j = JSON.parse(t) as { jobId?: unknown; state?: unknown; summary?: unknown }
@@ -1368,9 +1410,9 @@ const jobOf = (t: string): string | undefined => {
     return undefined
   }
 }
-export const isStub = (t: string) =>
+export const isStub = (t: string, tool?: string) =>
   /^\s*\[(?:Firewalled \S+ output|lean-ctx[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(t) ||
-  isWithheld(t) ||
+  isWithheld(t, tool) ||
   (countLines(t) <= 2 && /^\s*1\t\S[^\n]* \[unchanged \d+L · lean-ctx read-dedup\]/.test(t))
 const short = (n: string) => n.split('__').pop() ?? n
 const escape = (s: string) => s.replace(/[.*+?^$|{}()[\]\\]/g, '\\$&')
@@ -1391,8 +1433,8 @@ export const absolute = (p: string, cwd?: string, home?: string) => {
 }
 
 export const exitOf = (raw: string, worked: boolean, tool = 'Bash'): { code?: number; out: string } => {
+  if (worked) return { code: 0, out: raw }
   const text = raw.replace(/^\s*<tool_use_error>/, '').replace(/<\/tool_use_error>\s*$/, '')
-  if (worked) return { code: 0, out: text }
   for (const re of tool === 'Bash' ? [/^Exit code (\d+)(?:\n|$)/] : [/\n?\[exit:(\d+)[^\]\n]*\]\s*$/]) {
     const m = re.exec(text)
     if (m) return { code: Number(m[1]), out: text.slice(0, m.index) + text.slice(m.index + m[0].length) }
@@ -1579,6 +1621,7 @@ export const register: Register = (on) => {
     let deduped = false
     let persisted = false
     const withheld = new Set<string>()
+    const cut = new Set<string>()
     const defaults = toolDefaults(await $.env.get('CODEMODE_TOOL_DEFAULTS'))
     const cwd = sessionCwd ?? (await $.env.get('PWD')) ?? undefined
     // Stored types belong to one engine version: an upgrade can change a schema.
@@ -1829,8 +1872,8 @@ export const register: Register = (on) => {
               ? ({ file: normal(target), whole: true } as Receipt)
               : undefined
         if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
-        if (isStub(text) && p.handled !== true && isWithheld(text)) withheld.add(tool)
-        else if (isStub(text) && p.handled !== true) {
+        if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
+        else if (isStub(text, tool) && p.handled !== true) {
           stubs.add(tool)
           if (/read-dedup/.test(text)) deduped = true
         }
@@ -1862,7 +1905,9 @@ export const register: Register = (on) => {
         const k = await typeKey(tool)
         if (k) await $.store.set(k, bad.type as never).catch(() => {})
       }
-      return { ok: false, error: bad.message, text: bad.message, result, ...exit }
+      const engineCut = SHELL_RE.test(tool) && ENGINE_CUT.test(text)
+      if (engineCut && p.poll !== true) cut.add(tool)
+      return { ok: false, error: bad.message, text: bad.message, result, ...exit, ...(engineCut ? { cut: true } : {}) }
     }
 
     const pageRead = async (args: Record<string, unknown>): Promise<{ text?: string; error?: string; result?: unknown } | undefined> => {
@@ -2106,6 +2151,9 @@ export const register: Register = (on) => {
     const notes = [
       ...(stubs.size
         ? [`Note: a result from ${[...stubs].join(', ')} was a compressed stub, not the tool's full text; ${deduped ? 'read(path) gets a whole file past a repeated-read stub, and ' : ''}call the tool with raw: true, or set CODEMODE_TOOL_DEFAULTS, to get the full text.`]
+        : []),
+      ...(cut.size
+        ? [`Note: Claude Code cut the middle out of a failed command's output from ${[...cut].join(', ')} (it keeps the first and last 5,000 chars of a failed result over 10,000); that sh() result is marked .truncated, and sending the output to a file (cmd > /tmp/out.txt 2>&1) and reading it with read(path) gets all of it.`]
         : []),
       ...(withheld.size ? [`Note: lean-ctx withheld a result from ${[...withheld].join(', ')} by its storage policy; that text is not available to scripts here.`] : []),
       ...(persisted ? ['Note: Bash saved a big output to a file instead of returning it (<persisted-output>), and it could not be read back here; read(path) of the file it names gets it whole where Read may open it.'] : []),

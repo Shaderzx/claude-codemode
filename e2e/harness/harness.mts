@@ -29,8 +29,9 @@ type Case = {
   pageErrorAt?: number
   truncateLimited?: boolean
   abortStyle?: string
+  engineForgets?: boolean
 }
-type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { compact?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -99,7 +100,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       if (c.readRewrite !== undefined) return ok(c.readRewrite)
       if (c.denyReadFrom !== undefined && Number(a.offset ?? 1) >= c.denyReadFrom) return { deny: 'Read of this range is denied by policy' }
       if (c.rewriteFromOffset !== undefined && Number(a.offset ?? 1) > 1) return ok(c.rewriteFromOffset)
-      const p = String(a.file_path ?? '')
+      const p = String(a.file_path ?? '').trim()
       if (!p.startsWith('/') || !existsSync(p)) return err('File does not exist. Note: your current working directory is ' + cwd + '.')
       const text = readFileSync(p, 'utf8')
       if (!text) return ok('<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>')
@@ -132,7 +133,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
     case 'Write': {
       if (c.deniedWriteMessage !== undefined) return err(c.deniedWriteMessage)
       const w = writePath(a.file_path)
-      if (existsSync(w) && readTimes.has(w) && statSync(w).mtimeMs !== readTimes.get(w)) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
+      if (!c.engineForgets && existsSync(w) && readTimes.has(w) && statSync(w).mtimeMs !== readTimes.get(w)) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
       writeFileSync(w, String(a.content))
       readTimes.set(w, statSync(w).mtimeMs)
       return ok('File created successfully at: ' + a.file_path)
@@ -140,7 +141,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
     case 'Edit': {
       const p = writePath(a.file_path)
       if (c.deniedWriteMessage !== undefined) return err(c.deniedWriteMessage)
-      if (existsSync(p) && readTimes.has(p) && statSync(p).mtimeMs !== readTimes.get(p)) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
+      if (!c.engineForgets && existsSync(p) && readTimes.has(p) && statSync(p).mtimeMs !== readTimes.get(p)) return err('<tool_use_error>File content has changed since it was last read. Read it again before attempting to edit it.</tool_use_error>')
       const s = readFileSync(p, 'utf8')
       const n = s.split(String(a.old_string)).length - 1
       if (!n) return err('String to replace not found in file.')
@@ -160,6 +161,13 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       }
       if (tool !== 'Bash' && Buffer.byteLength(command) > 8192)
         return err('ERROR: Command too large (' + Buffer.byteLength(command) + ' bytes, limit 8192). If you\'re writing file content, use the native Write/Edit tool instead. ctx_shell is for reading command output only (git, cargo, npm, etc.).')
+      if (tool === 'Bash' && typeof a.timeout === 'number') {
+        const limit = a.timeout
+        const raced = await Promise.race([shell(command, true), new Promise<undefined>((r) => setTimeout(() => r(undefined), limit))])
+        if (raced === undefined)
+          return ok('Command did not complete within its ' + Math.round(limit / 1000) + 's timeout and was moved to the background (ID: bg2). Output is being written to: /tmp/bg2.output', { backgroundTaskId: 'bg2', timedOutAfterMs: limit })
+        return raced.code ? err('<tool_use_error>Exit code ' + raced.code + '\n' + raced.out + '</tool_use_error>') : ok(raced.out)
+      }
       const r = await shell(command, tool === 'Bash')
       if (tool !== 'Bash' && c.compressShell && a.raw !== true) return ok('[Firewalled ' + tool + ' output — ' + r.out.length + ' chars, stored out-of-band]')
       if (tool === 'Bash' && c.persistBash && r.out.length > 30000) {
@@ -175,6 +183,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       const p = String(a.path)
       if (a.op === 'create' && c.deniedCreateMessage !== undefined) return err(c.deniedCreateMessage)
       if (a.op === 'create') {
+        if (existsSync(dirname(p)) && !statSync(dirname(p)).isDirectory()) return err('ERROR: parent directory does not exist for ' + p)
         if (existsSync(p)) return err('ERROR: ' + p + ' already exists — create is for new files only. Use anchored ops')
         mkdirSync(dirname(p), { recursive: true })
         writeFileSync(p, String(a.new_text ?? ''))
@@ -256,6 +265,10 @@ const $ = {
     read: async (p: string) => readFileSync(p, 'utf8'),
     list: async (p: string) => readdirSync(p).map((n) => ({ name: n, mtimeMs: statSync(join(p, n)).mtimeMs })),
     exists: async (p: string) => existsSync(p),
+    stat: async (p: string) => {
+      const s = statSync(p)
+      return { kind: s.isDirectory() ? 'dir' : s.isFile() ? 'file' : 'other', size: s.size, mtimeMs: s.mtimeMs, isLink: false }
+    },
   },
   process: {
     spawn: ({ argv, input }: { argv: string[]; input?: string }) => {
@@ -322,6 +335,7 @@ for (const s of c.steps) {
   started = Date.now()
   if (s.setDenied) { c.denied = s.setDenied; continue }
   if (s.setCwd) { cwd = s.setCwd; continue }
+  if (s.compact) { await handlers['session.compact']?.($, {}, engine(async () => ({}))); continue }
   if (s.newSession) { await startSession(); continue }
   if (s.script !== undefined) {
     const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: s.script }, engine(async () => ({})))

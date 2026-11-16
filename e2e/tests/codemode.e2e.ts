@@ -6,8 +6,8 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string };
+type Step = { compact?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -1201,4 +1201,129 @@ test('A byte-range read-back stays exact after a lone surrogate', () => {
   const head = text.slice(0, text.indexOf('…')).replace(/\n$/, '');
   expect(back.length).toBeGreaterThan(0);
   expect(original.startsWith(head + back)).toBe(true);
+});
+
+
+test('A patch edit of a file never read does not count as reading it', () => {
+  const dir = scratch();
+  const f = join(dir, 'unread.txt');
+  writeFileSync(f, 'red blue\nmore\n');
+  expect(one('await tools.mcp__lean_ctx__ctx_patch({ op: "replace_unique", path: ' + JSON.stringify(f) + ', old_text: "red", new_text: "RED" })\nreturn await call("Write", { file_path: ' + JSON.stringify(f) + ', content: "gone" }).then((r) => r.ok ? "wrote" : r.error)')).toContain('has not been read');
+  expect(one('await tools.mcp__lean_ctx__ctx_patch({ op: "replace_all", path: ' + JSON.stringify(f) + ', old_text: "blue", new_text: "BLUE" })\nreturn await write(' + JSON.stringify(f) + ', "gone").then(() => "wrote", (e) => e.message)', { tools: NO_BASH })).toContain('has not read it');
+  expect(readFileSync(f, 'utf8')).toBe('RED BLUE\nmore\n');
+});
+
+test('sh() does not report success for a command Bash moved to the background', () => {
+  const text = one('return await sh("perl -e \'select(undef, undef, undef, 1)\'; echo done", { timeout: 200 }).then((r) => "ok " + r.exitCode, (e) => e.message)');
+  expect(text).toContain('moved the command to the background');
+  expect(text).toContain('bg2');
+});
+
+test('A Write over a file changed on disk since the session read it is refused, even when Claude Code no longer remembers the read', () => {
+  const dir = scratch();
+  const f = join(dir, 'moved.txt');
+  writeFileSync(f, 'one\n');
+  const out = run({ engineForgets: true, steps: [{ script: 'await read(' + JSON.stringify(f) + ')\nawait sh("echo changed > ' + f + '")\nreturn await call("Write", { file_path: ' + JSON.stringify(f) + ', content: "mine" }).then((r) => r.ok ? "wrote" : r.error)' }, { script: 'return await write(' + JSON.stringify(f) + ', "mine\\n", { force: true })' }] });
+  expect(out.results[0]!.text).toContain('modified since read');
+  expect(out.results[1]!.text).toBe('wrote ' + f);
+  expect(readFileSync(f, 'utf8')).toBe('mine\n');
+});
+
+test('A compaction clears what the session had read', () => {
+  const dir = scratch();
+  const f = join(dir, 'a.txt');
+  writeFileSync(f, 'red\n');
+  const out = run({ tools: NO_BASH, steps: [{ script: 'await read(' + JSON.stringify(f) + ')' }, { compact: true }, { script: 'return await edit(' + JSON.stringify(f) + ', "red", "RED").then(() => "edited", (e) => e.message)' }] });
+  expect(out.results[1]!.text).toContain('has not been read');
+});
+
+test('edit() after an outside change says the file changed, and force edits it', () => {
+  const dir = scratch();
+  const f = join(dir, 'e.txt');
+  writeFileSync(f, 'red blue\n');
+  const out = run({ steps: [{ script: 'await read(' + JSON.stringify(f) + ')\nawait sh("echo red green > ' + f + '")\nreturn await edit(' + JSON.stringify(f) + ', "red", "RED").then(() => "edited", (e) => e.message)' }, { script: 'return await edit(' + JSON.stringify(f) + ', "red", "RED", { force: true })' }] });
+  expect(out.results[0]!.text).toContain('changed since');
+  expect(out.results[1]!.text).toBe('edited ' + f);
+  expect(readFileSync(f, 'utf8')).toBe('RED green\n');
+});
+
+test('A Read path with stray spaces reads the file and counts as read', () => {
+  const dir = scratch();
+  const f = join(dir, 'a.txt');
+  writeFileSync(f, 'red\n');
+  expect(one('await tools.Read({ file_path: ' + JSON.stringify(' ' + f + ' ') + ' })\nreturn await edit(' + JSON.stringify(f) + ', "red", "RED")', { tools: NO_BASH })).toBe('edited ' + f);
+});
+
+test('write() through the patch tool reports a failed create as it is', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'afile'), 'x');
+  const text = one('return await write(' + JSON.stringify(join(dir, 'afile', 'x.txt')) + ', "hi").then(() => "wrote", (e) => e.message)', { tools: NO_BASH });
+  expect(text).toContain('parent directory does not exist');
+  expect(text).not.toContain('has not read it');
+});
+
+test('A short page without file fields does not count as reading the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'many.txt');
+  writeFileSync(f, 'first\nsecond\nthird\n');
+  const out = run({ tools: NO_BASH, readRewrite: '1\tfirst', steps: [{ script: 'await read(' + JSON.stringify(f) + ')\nreturn await write(' + JSON.stringify(f) + ', "x").then(() => "wrote", (e) => e.message)' }] });
+  expect(out.results[0]!.text).toContain('has not read it');
+  expect(readFileSync(f, 'utf8')).toBe('first\nsecond\nthird\n');
+});
+
+test('Pages read across a change to the file do not count as reading it', () => {
+  const dir = scratch();
+  const f = join(dir, 'p.txt');
+  writeFileSync(f, 'one\ntwo\nthree\n');
+  const text = one('await tools.Read({ file_path: ' + JSON.stringify(f) + ', offset: 1, limit: 1 })\nawait sh("printf \'ONE\\\\ntwo\\\\nthree\\\\n\' > ' + f + '")\nawait tools.Read({ file_path: ' + JSON.stringify(f) + ', offset: 2, limit: 100 })\nreturn await edit(' + JSON.stringify(f) + ', "three", "X").then(() => "edited", (e) => e.message)', { tools: NO_BASH });
+  expect(text).toContain('has not been read');
+});
+
+test('A folder the mod cannot list still gets the changed-since-read check', () => {
+  const dir = scratch();
+  const sub = join(dir, 'locked');
+  execFileSync('mkdir', [sub]);
+  const f = join(sub, 'f.txt');
+  writeFileSync(f, 'one\n');
+  execFileSync('chmod', ['311', sub]);
+  try {
+    const text = one('await read(' + JSON.stringify(f) + ')\nawait sh("echo changed > ' + f + '")\nreturn await write(' + JSON.stringify(f) + ', "mine\\n").then(() => "wrote", (e) => e.message)', { tools: NO_BASH });
+    expect(text).toContain('changed since');
+    expect(readFileSync(f, 'utf8')).toBe('changed\n');
+  } finally {
+    execFileSync('chmod', ['755', sub]);
+  }
+});
+
+test('A division after a function expression keeps the template whole', () => {
+  expect(one('const n = function () {} / 2; const t = `\n// @text KEEP\nx\n`\nreturn t')).toBe('\n// @text KEEP\nx\n');
+});
+
+test('read() of a line over the token cap fails with a clear reason', () => {
+  const dir = scratch();
+  const f = join(dir, 'oneline.txt');
+  writeFileSync(f, 'z'.repeat(200000));
+  const text = one('return await read(' + JSON.stringify(f) + ').then(() => "read", (e) => e.message)', { truncateLimited: true });
+  expect(text).toContain('token cap');
+  expect(text).not.toContain('undefined');
+});
+
+test('write() takes a path with stray spaces as the absolute path', () => {
+  const dir = scratch();
+  const f = join(dir, 'new.txt');
+  expect(one('return await write(' + JSON.stringify(' ' + f) + ', "hi")', { tools: NO_BASH })).toBe('wrote ' + f);
+  expect(readFileSync(f, 'utf8')).toBe('hi');
+});
+
+test('A big object of many-line values keeps its cut note and the end of the big value', () => {
+  const text = one('// @options: {"max_output_chars": 1000000}\nreturn { a: Array.from({ length: 300000 }, (_, i) => i), b: "KEEP_B" }');
+  expect(text).toContain('chars cut past the 1000000-char cap');
+  expect(text).toContain('299999');
+  expect(text).toContain('"b": "KEEP_B"');
+});
+
+test('A tight cut of very long lines still names how to read them back', () => {
+  const text = one('// @options: {"max_output_chars": 9000}\nfor (let i = 0; i < 30; i++) text(String(i).repeat(60000))');
+  expect(text).toContain('tail -c +');
+  expect(text.length).toBeLessThanOrEqual(9000);
 });

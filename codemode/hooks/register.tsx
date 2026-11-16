@@ -438,12 +438,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const outOfTime = (id) => toolError('sh: the command finished, but the run ran out of time while fetching its output from lean-ctx archive ' + id + '; fetch it in a new run with ctx_expand(id="' + id + '") in pages (start_line, end_line)')
   const expandPages = async (expand, id, total, chars) => {
     const rows = []
-    for (let s = 1, page = 0; s <= total; page++) {
+    for (let s = 1; s <= total; ) {
       if (deadline() < 1500) throw outOfTime(id)
-      if (page === 3 && usable('Read') && home) {
-        const whole = await fromFile(id).catch(() => undefined)
-        if (whole !== undefined) return whole
-      }
       const pageArgs = { id, start_line: s, end_line: Math.min(total, s + 499) }
       const r = await req('call', { tool: expand, args: pageArgs, handled: true })
       if (r.refused || r.denied) throw refusedRead(expand, r)
@@ -658,7 +654,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (!got.length && !NOTICE.test(t))
         throw toolError('read: Read answered with no file lines (a picture, a binary file, or a hook rewrote the answer): ' + t.slice(0, 200), r)
       rows.push(...got)
-      if (got.length < limit || r.whole === true) break
+      const total = r.result && r.result.file && typeof r.result.file.totalLines === 'number' ? r.result.file.totalLines : undefined
+      const more = total !== undefined && offset + got.length - 1 < total
+      if ((got.length < limit && !more) || r.whole === true) break
       offset += got.length
       tried = new Set()
       cap = 2000
@@ -2078,7 +2076,7 @@ export const register: Register = (on) => {
         if (rows.length) pages.push(rows.join('\n'))
         const info = infoOf(r.result)
         if (typeof info?.totalLines === 'number') total = info.totalLines
-        if (rows.length < limit) break
+        if (rows.length < limit && !(total !== undefined && offset + rows.length - 1 < total)) break
         offset += rows.length
         tried = new Set()
         cap = 2000

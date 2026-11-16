@@ -148,6 +148,7 @@ const shell = (command: string, keepCwd = false) => {
     let out = ''
     p.stdout.setEncoding('utf8').on('data', (t: string) => { out += t })
     p.stderr.setEncoding('utf8').on('data', (t: string) => { out += t })
+    p.on('error', (e) => finish({ code: 127, out: String(e.message) }))
     p.on('close', (code) => {
       if (p.pid !== undefined) live.delete(p.pid)
       finish({ code: code ?? 1, out })
@@ -227,7 +228,10 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       if (tool !== 'Bash' && (c.deniedShellCommands ?? []).some((d) => command.includes(d)))
         return err('PreToolUse:' + tool + ' hook error: blocked: this command is not allowed here')
       if (tool === 'Bash' && a.run_in_background === true) {
-        spawn('bash', ['-c', command], { cwd, detached: true, stdio: 'ignore' }).unref()
+        const bg = spawn('bash', ['-c', command], { cwd, detached: true, stdio: 'ignore' })
+        bg.on('error', () => {})
+        if (bg.pid !== undefined) live.add(bg.pid)
+        bg.unref()
         return ok('Command running in background with ID: bg1. Output is being written to: /tmp/bg1.output')
       }
       if (tool !== 'Bash' && Buffer.byteLength(command) > 8192)
@@ -466,6 +470,7 @@ const $ = {
       child.stdout.setEncoding('utf8').on('data', (t: string) => { queue.push({ stream: 'stdout', text: t }); wake?.() })
       child.stderr.setEncoding('utf8').on('data', (t: string) => { queue.push({ stream: 'stderr', text: t }); wake?.() })
       child.on('close', () => { ended = true; wake?.() })
+      child.on('error', (e) => { queue.push({ stream: 'stderr', text: String(e.message) }); ended = true; wake?.() })
       const abortAt = c.abortAfterMs === undefined ? undefined : started + c.abortAfterMs
       return (async function* () {
         while (true) {

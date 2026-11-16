@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { clip, describeRun, inputType, ledger, parseOptions, similar, skillTurn, tidy } from '../hooks/register'
+import { describeRun, inputType, ledger, parseOptions, similar, skillTurn, tidy } from '../hooks/register'
 
 // The runner is a Node child; these tests stand in for it with a fake
 // `process.spawn` that writes chosen lines, and check what the mod does with them.
@@ -8,7 +8,11 @@ const RUN = 'mcp__codemode__run'
 const HOME = '/home/test'
 const MARK = '\x1eCM'
 const START = { cwd: '/tmp', surface: null, isInteractive: false } as never
-const line = (o: unknown) => ({ stream: 'stdout' as const, text: MARK + JSON.stringify(o) + '\n' })
+const line = (o: unknown) => {
+  const { items, logs, ...rest } = o as { done?: boolean; items?: string[]; logs?: string[] }
+  const before = rest.done ? [...(items ?? []).map((text) => ({ out: 'item', text })), ...(logs ?? []).map((text) => ({ out: 'log', text }))] : []
+  return { stream: 'stdout' as const, text: [...before, rest.done ? rest : o].map((x) => MARK + JSON.stringify(x) + '\n').join('') }
+}
 const ran = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
 type Fake = {
@@ -225,12 +229,8 @@ test('a cut output is saved whole and the cut names the file', { timeoutMs: 10_0
   expect(f.texts[spill ?? '']).toBe(big)
   expect(String(r.result).length).toBeLessThan(21_000)
   expect(String(r.result)).not.toContain('MIDDLE')
-  expect(String(r.result)).toContain(`all of it is in ${spill}`)
-  expect(String(r.result)).toContain('chars cut (lines 1-1 of 1)')
-  expect(clip('a\nb\nc\nd\ne\nf\n', 4)).toContain('(lines 2-5 of 6)')
-  expect(clip('a\nb\nc\nd\ne\nf\ng\nh', 4, '/f.txt')).toBe(
-    'a\n\n…11 chars cut (lines 2-7 of 8); all of it is in /f.txt, so read back only the lines you need…\n\nh',
-  )
+  expect(String(r.result)).toContain(`read them back with tools.Read({ file_path: ${JSON.stringify(spill)}, offset: 1, limit: 1 })`)
+  expect(String(r.result)).toContain('chars cut (lines 1-1)')
 })
 
 test('bad arguments come back as one TypeScript type, without the ToolSearch advice', { timeoutMs: 10_000 }, async ($, on) => {

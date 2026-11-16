@@ -18,6 +18,8 @@ const MAX_PICTURES = 10
 // delete a file another session's cut still points to.
 const KEEP_SPILLS = 200
 const SPILL_AGE_MS = 86_400_000
+const DENIED_MS = 86_400_000
+const MAX_REPLY = 3_800_000
 
 // Argument lines for the built-in tools scripts call most. The description
 // names only the ones this session has, so it never offers a tool that a
@@ -32,24 +34,26 @@ const COMMON: [string, string][] = [
   ['AskUserQuestion', 'AskUserQuestion({ questions: [{ question, header, multiSelect, options: [{ label, description }] }] })'],
 ]
 
-// The run tool's description for a session whose tools are `names`; an empty
-// set (the engine had no list yet) describes every common tool.
-export const describeRun = (names: ReadonlySet<string>): string => {
-  const has = (n: string) => names.size === 0 || names.has(n)
+export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<string, string | undefined> = new Map()): string => {
+  const has = (n: string) => (names.size === 0 || names.has(n)) && !denied.has(n)
   const common = COMMON.filter(([n]) => has(n)).map(([, l]) => `- ${l}`)
   // Built-ins a model reaches for by habit; a missing one is named, with the
   // session's likeliest replacement, so the first call goes to a tool that exists.
   const missing = [...COMMON.map(([n]) => n), 'Grep', 'Glob']
-    .filter((n) => !has(n))
+    .filter((n) => !has(n) && !denied.has(n))
     .map((n) => {
       const alt = ALIKE[n.toLowerCase()] ? similar(n, [...names])[0] : undefined
       // In its script form: named bare, a model loads it with ToolSearch and calls it directly (refused).
       return alt ? `${n} (use tools.${ident(alt)})` : n
     })
-  const example = has('Read')
-    ? 'const [a, b] = await Promise.all([\n  tools.Read({ file_path: "/repo/src/a.ts" }),\n  tools.Read({ file_path: "/repo/src/b.ts" }),\n])\nconst imports = a.split("\\n").filter((l) => l.includes("import"))\nreturn { imports: imports.join("\\n"), b: b.slice(0, 2000) }'
-    : has('Bash')
-      ? 'const [log, st] = await Promise.all([\n  tools.Bash({ command: "git -C /repo log --oneline -5" }),\n  tools.Bash({ command: "git -C /repo status --short" }),\n])\nreturn { log, st }'
+  const refused = [...denied].map(([n, alt]) => (alt ? `${n} (use tools.${ident(alt)})` : n))
+  const shell = has('Bash') || names.size === 0 || [...names].some((n) => /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(n))
+  const example = has('Read') && shell
+    ? 'const [a, b] = await Promise.all([\n  read("/repo/src/a.ts"),\n  sh("git -C /repo log --oneline -5"),\n])\nconst imports = a.split("\\n").filter((l) => l.includes("import"))\nreturn { imports: imports.join("\\n"), log: b }'
+    : has('Read')
+      ? 'const [a, b] = await Promise.all([\n  read("/repo/src/a.ts"),\n  read("/repo/src/b.ts"),\n])\nreturn { a, b: b.slice(0, 2000) }'
+    : shell
+      ? 'const [log, st] = await Promise.all([\n  sh("git -C /repo log --oneline -5"),\n  sh("git -C /repo status --short"),\n])\nreturn { log, st }'
       : 'const [a, b] = await Promise.all([tools.X({ ... }), tools.Y({ ... })])\nreturn { a, b: b.slice(0, 2000) }'
   return [
     'Run a JavaScript script that calls tools. It is the only tool that does work: every other tool is called from inside a script, and a direct call is refused. Only what the script outputs reaches you.',
@@ -58,22 +62,27 @@ export const describeRun = (names: ReadonlySet<string>): string => {
     '',
     '`script` is the body of an async function: top-level await and return work. An optional first line sets limits:',
     '// @options: {"timeout_ms": 600000, "max_output_chars": 20000}',
-    'Longer output is cut in the middle, and the cut names a file that holds all of it.',
+    'Longer output is cut, each item keeping a share, and the cut names a file that holds all of it.',
+    'Text holding ${, backticks or # (shell, Python, HTML) goes in a raw block, never in a template literal: a line // @text NAME, the text, then a line // @end; the script reads it as TEXT.NAME.',
     '',
     'Globals:',
-    '- tools.<Name>(args): call a tool by its exact name (characters invalid in identifiers become _: tools.mcp__lean_ctx__ctx_read for mcp__lean-ctx__ctx_read). Resolves to the result text; rejects on a denied or failed call. Promise.allSettled keeps partial results.',
-    '- call(name, args): the same, but never throws: { ok, text, result, error }, result being the structured output.',
+    '- sh(cmd) runs a command on the session\'s shell (Bash or what replaces it) and resolves to its text, with .exitCode and .ok; a non-zero exit does not throw. quote(s) makes s one safe shell word.',
+    '- read(path) is a file\'s whole text without line numbers (a relative path starts at the session folder); write(path, text, { force }?) and edit(path, old, new, { all, force }?) take absolute paths and go through Write/Edit or the session\'s patch tool, which keep their read-before-write check: changing a file not yet read takes { force: true }, which reads it first. read() gives line endings back as \\n.',
+    '- waitFor(check, { every = 1000, timeout }) calls check until it returns something truthy, and returns that; deadline() is the ms left before the run times out.',
+    '- tools.<Name>(args): call a tool by its exact name (characters invalid in identifiers become _: tools.mcp__lean_ctx__ctx_read for mcp__lean-ctx__ctx_read; a unique suffix such as tools.ctx_read works too). Resolves to the result text; rejects on a denied or failed call.',
+    '- call(name, args): the same, but never throws: { ok, text, result, error, exitCode? }, result being the structured output; String(r) is its text. Promise.allSettled also keeps partial results.',
     '- A returned value and text(value) add output items (an object holding multi-line strings prints them raw, one heading per key); console.log/warn/error add lines to a <console_output> block.',
     '- describeTool(name): async { name, description, input }, input being the arguments as a TypeScript type when known. A built-in tool called with bad arguments answers with its type.',
     '- ask(prompt, { model = "haiku", system, maxTokens = 1024 }?): one completion by another model, without tools; boil large data down with it so only the answer reaches you.',
     '- Images and PDFs arrive as markers like [image #1 image/png 12KB]; a marker in the output attaches the picture for you to see.',
     '- ALL_TOOLS: [{ name, description }] (first sentences); searchTools(query, { limit = 8 }?) ranks them.',
-    '- store(key, value) / load(key): small JSON values kept across runs. exit(): stop successfully.',
+    '- store(key, value) / load(key): small JSON values kept across runs. exit(): stop successfully. btoa, atob, TextEncoder, TextDecoder and Buffer work.',
     'No fetch, timers, process, require or import: only tools reach the outside world.',
     '',
     'Common arguments:',
     ...common,
     ...(missing.length ? [`Not in this session: ${missing.join(', ')}. searchTools() finds other tools.`] : []),
+    ...(refused.length ? [`${refused.join(', ')}: denied by a hook here.`] : []),
     '',
     'Tool calls are real: a later failure undoes nothing, and calls still running when the script ends or times out are abandoned, not stopped.',
     '',
@@ -82,13 +91,6 @@ export const describeRun = (names: ReadonlySet<string>): string => {
   ].join('\n')
 }
 
-// The mod runtime refuses code generation, so scripts run in a Node child
-// under the permission model (no network, no subprocesses, file access only to
-// its run directory). The child asks for tool calls on stdout, one marked JSON
-// line each, and the mod answers by writing `<run dir>/<id>.json`.
-// `vm` is not a boundary: a script can reach the child's `process` through
-// any host function it is given. The permission model is the boundary, so the
-// child drops its environment and reports its pid before the script starts.
 const RUNNER = String.raw`
 // Before Node 25 the permission model does not block the network.
 const fs = require('node:fs')
@@ -103,8 +105,25 @@ const send = (o, cb) => process.stdout.write(MARK + JSON.stringify(o) + '\n', cb
 for (const k of Object.keys(process.env)) delete process.env[k]
 send({ pid: process.pid })
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const thenable = (v) => {
+  try { return v !== null && (typeof v === 'object' || typeof v === 'function') && typeof v.then === 'function' } catch { return false }
+}
+const NOT_AWAITED = '[Promise: not awaited; put await before the call]'
+const tag = (v) => { try { return Object.prototype.toString.call(v) } catch { return '' } }
+const frames = (e) => {
+  try { return String(e.stack || '').split('\n').filter((l) => /^\s+at /.test(l) && l.includes('script.js')).slice(0, 5).map((l) => l.trim()) } catch { return [] }
+}
+const errText = (e) => {
+  try { const f = frames(e); return (e.name || 'Error') + ': ' + e.message + (f.length ? ' (' + f.join(', ') + ')' : '') } catch { return 'Error' }
+}
+const replacer = (k, v) => {
+  if (thenable(v)) return NOT_AWAITED
+  if (tag(v) === '[object Error]') return errText(v)
+  if (typeof v === 'bigint') return String(v)
+  return v
+}
 const json = (v) => {
-  try { const s = JSON.stringify(v, null, 2); return s === undefined ? String(v) : s } catch { return String(v) }
+  try { const s = JSON.stringify(v, replacer, 2); return s === undefined ? String(v) : s } catch { try { return String(v) } catch { return '[a value that cannot be printed]' } }
 }
 // The script's objects come from the vm context's realm, so plainness is read
 // from the prototype chain, not compared with this realm's Object.prototype.
@@ -120,47 +139,170 @@ const plain = (v) => {
 // as JSON full of \n and \" escapes; other values stay JSON.
 const show = (v) => {
   if (typeof v === 'string') return v
+  if (tag(v) === '[object String]') return String(v)
   if (v === undefined) return 'undefined'
+  if (thenable(v)) return NOT_AWAITED
+  if (tag(v) === '[object Error]') return errText(v)
   if (plain(v)) {
     let entries
     try { entries = Object.entries(v) } catch { return json(v) }
-    if (entries.length && entries.length <= 100 && entries.some(([, x]) => typeof x === 'string' && x.includes('\n')))
-      return entries.map(([k, x]) => '== ' + k.replace(/\s+/g, ' ') + ' ==\n' + (typeof x === 'string' ? x : json(x))).join('\n')
+    if (entries.length && entries.length <= 100 && entries.some(([, x]) => (typeof x === 'string' || tag(x) === '[object String]') && String(x).includes('\n')))
+      return entries.map(([k, x]) => '== ' + k.replace(/\s+/g, ' ') + ' ==\n' + (typeof x === 'string' || tag(x) === '[object String]' ? String(x) : json(x))).join('\n')
   }
   return json(v)
 }
+const keysOf = (v) => {
+  if (!plain(v) || Array.isArray(v)) return undefined
+  let entries
+  try {
+    if (typeof v.toJSON === 'function') return undefined
+    entries = Object.entries(v)
+  } catch { return undefined }
+  const str = (x) => typeof x === 'string' || tag(x) === '[object String]'
+  const multi = entries.length <= 100 && entries.some(([, x]) => str(x) && String(x).includes('\n'))
+  if (!multi) entries = entries.filter(([, x]) => { try { return JSON.stringify(x, replacer) !== undefined } catch { return true } })
+  if (entries.length < 2) return undefined
+  return entries.map(([k, x]) => (multi ? '== ' + k.replace(/\s+/g, ' ') + ' ==\n' + (str(x) ? String(x) : json(x)) : JSON.stringify(k) + ': ' + json(x)))
+}
+const lowAt = (s, i) => { const c = s.charCodeAt(i); return c >= 0xdc00 && c < 0xe000 }
+const highAt = (s, i) => { const c = s.charCodeAt(i); return c >= 0xd800 && c < 0xdc00 }
+const safeEnd = (s, i) => (i > 0 && i < s.length && lowAt(s, i) && highAt(s, i - 1) ? i - 1 : i)
+const safeStart = (s, i) => (i > 0 && i < s.length && lowAt(s, i) && highAt(s, i - 1) ? i + 1 : i)
+const shareKeys = (keys, budget) => {
+  const out = keys.slice()
+  let left = Math.max(0, budget)
+  const order = keys.map((k, i) => [k.length, i]).sort((a, b) => a[0] - b[0])
+  order.forEach(([len, i], n) => {
+    const share = Math.max(0, Math.floor(left / (order.length - n)))
+    if (len > share) {
+      const note = '…' + (len - share) + ' chars cut past the 1000000-char cap…'
+      const k = keys[i]
+      if (share > note.length + 20) {
+        const half = Math.floor((share - note.length) / 2)
+        out[i] = k.slice(0, safeEnd(k, half)) + note + k.slice(safeStart(k, len - half))
+      } else out[i] = k.slice(0, safeEnd(k, share))
+    }
+    left = Math.max(0, left - out[i].length)
+  })
+  return out
+}
+const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
+const withheldText = (t) => String(t).length < 600 && /^\s*(?:\[(?:lean-ctx[^\]\n]*withheld|POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway\])|(?:stored output (?:is )?withheld by the context gateway|archive withheld by current policy|Tool may have completed; output withheld by policy)\.?\s*$)/i.test(String(t))
+const isStubText = (t) => /^\s*\[(?:Firewalled \S+ output|lean-ctx[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(String(t)) || withheldText(t) || isDedup(t)
+const fileLines = (t) => String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
+const pickLimit = (limit, tried, cap, down) => {
+  for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
+  for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
+  return 0
+}
+const ENDINGS = ' (read() and Read give a file\'s line endings back as \\n, so text taken from a file with CRLF line endings does not match it; for such a file use sh() with sed or perl, or replace the whole file with write())'
+const endings = (e) => (/not found/i.test(String(e)) ? ENDINGS : '')
 const ident = (n) => n.replace(/[^A-Za-z0-9_$]/g, '_')
 class Exit extends Error {}
-// Frames of the runner and of Node say nothing about the script; keep its own.
-const clean = (err) => {
-  const stack = err && typeof err.stack === 'string' ? err.stack : ''
-  if (!stack) return (err && err.message) || show(err)
-  return stack.split('\n').filter((l) => !/^\s+at /.test(l) || l.includes('script.js')).join('\n')
+const TIMERS = 'is not available: use waitFor(check, { every, timeout }) to wait for something, and deadline() for the time left'
+const MISSING = {
+  fetch: 'fetch is not available in codemode scripts (they have no network): call a tool instead, such as a shell tool or tools.WebFetch',
+  XMLHttpRequest: 'XMLHttpRequest is not available in codemode scripts (they have no network): call a tool instead',
+  require: 'require is not available: scripts have no modules; use the globals the run tool lists and tools.<Name>()',
+  process: 'process is not available: scripts see no environment; ask a shell tool for environment variables',
+  setTimeout: 'setTimeout ' + TIMERS,
+  setInterval: 'setInterval ' + TIMERS,
+  setImmediate: 'setImmediate ' + TIMERS,
+  ToolSearch: 'ToolSearch is not a script global: the model calls ToolSearch directly to load a schema; inside a script use describeTool(name) or searchTools(query)',
 }
-async function main({ script, tools: all, dir, timeout }) {
+const BT = String.fromCharCode(96)
+const DB = '$' + '{'
+const TEMPLATE = 'Hint: text from a shell, Python or HTML file inside a template literal breaks it: there ' + DB + ' starts a JS expression and a backtick ends the string. Put such text in a raw block (a line // @text NAME, the text, then a line // @end; the script reads it as TEXT.NAME), or escape them as \\' + DB + ' and \\' + BT + '.'
+// Frames of the runner and of Node say nothing about the script; keep its own.
+const clean = (err, script) => {
+  const stack = err && typeof err.stack === 'string' ? err.stack : ''
+  let msg = (err && err.message) || show(err)
+  const missing = err && err.name === 'ReferenceError' && /^(\S+) is not defined/.exec(String(err.message))
+  const hint = missing && Object.prototype.hasOwnProperty.call(MISSING, missing[1]) ? MISSING[missing[1]] : undefined
+  if (!stack) return hint ? 'ReferenceError: ' + hint : msg
+  const lines = stack.split('\n').filter((l) => !/^\s+at /.test(l) || l.includes('script.js'))
+  if (hint) {
+    const at = lines.findIndex((l) => l.startsWith('ReferenceError:'))
+    if (at >= 0) lines[at] = 'ReferenceError: ' + hint
+  } else if (missing && typeof script === 'string' && script.includes(DB + missing[1])) lines.push(TEMPLATE)
+  return lines.join('\n')
+}
+const syntax = (err, script) => {
+  const m = /script\.js:(\d+)/.exec(String(err && err.stack))
+  const lines = script.split('\n')
+  const n = m ? Math.min(+m[1], lines.length) : 0
+  const out = [errText(err) + (n ? ' (script line ' + n + ')' : '')]
+  if (n) for (let i = Math.max(1, n - 2); i <= Math.min(lines.length, n + 2); i++) out.push((i === n ? '> ' : '  ') + String(i).padStart(4) + ' | ' + String(lines[i - 1]).slice(0, 300))
+  const msg = String(err && err.message)
+  const inTemplate = n > 0 && (lines.slice(0, n - 1).join('\n').split(BT).length % 2 === 0 || String(lines[n - 1]).includes(BT) || String(lines[n - 1]).includes(DB))
+  if (inTemplate) out.push(TEMPLATE)
+  if (/Private field '#/.test(msg)) out.push('Hint: a line starting with # (a shell or Python comment) reached JS code; JS comments start with //, and other languages belong in a // @text block.')
+  if (/import statement|Cannot use import/.test(msg)) out.push('Hint: scripts have no modules; use the globals the run tool lists and tools.<Name>().')
+  return out.join('\n')
+}
+const quote = (s) => "'" + String(s).split("'").join("'\\''") + "'"
+const isDedup = (t) => {
+  const rows = String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
+  return rows.length <= 2 && /^\s*1\t\S[^\n]* \[unchanged \d+L · lean-ctx read-dedup\]\s*$/.test(rows[0] || '')
+}
+async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied: deniedList, shell: shellPref, seen: seenList }) {
   fs.mkdirSync(dir, { recursive: true })
-  const items = [], logs = []
+  const started = Date.now()
   let room = 1000000
-  const keep = (list, s) => {
+  const keep = (out, s, v) => {
     if (room <= 0) return
-    if (s.length > room) s = s.slice(0, room) + '\n…output cut at 1000000 chars…'
+    const had = room
+    const over = s.length > room ? keysOf(v) : undefined
+    if (over) {
+      const asJson = !String(over[0]).startsWith('== ')
+      const lines = (k) => k.split('\n').length - 1
+      const frameOf = (ks) => (asJson ? 4 + ks.reduce((n, k) => n + 4 + 2 * lines(k), 0) : ks.length)
+      let budget = room - (asJson ? 4 + 4 * over.length : over.length)
+      let fitted = shareKeys(over, budget)
+      for (let excess = fitted.reduce((n, k) => n + k.length, 0) + frameOf(fitted) - room, guard = 0; excess > 0 && guard < 30; guard++) {
+        budget -= excess + 64
+        fitted = shareKeys(over, budget)
+        excess = fitted.reduce((n, x) => n + x.length, 0) + frameOf(fitted) - room
+      }
+      room -= fitted.reduce((n, k) => n + k.length, 0) + frameOf(fitted)
+      send({ out, keys: fitted, json: asJson })
+      return
+    }
+    if (s.length > room) s = s.slice(0, safeEnd(s, room)) + '\n…output cut at 1000000 chars…'
     room -= s.length
-    list.push(s)
+    const keys = s.length > 1000 && s.length <= had ? keysOf(v) : undefined
+    const json = keys && !String(keys[0]).startsWith('== ')
+    send(keys ? (s.length * 2 <= had ? { out, text: s, keys } : { out, keys, json }) : { out, text: s })
   }
   let finished = false
-  const finish = (failure) => {
+  const finish = (failure, kind, failedId) => {
     if (finished) return
     finished = true
     try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
-    if (failure && failure.length > 100000) failure = failure.slice(0, 100000) + '…'
-    send({ done: true, items, logs, failure }, () => process.exit(0))
+    if (failure && failure.length > 100000) failure = failure.slice(0, safeEnd(failure, 100000)) + '…'
+    send({ done: true, failure, kind, failedId, alongside: failedId ? alongsideOf(failedId) : 0 }, () => process.exit(0))
   }
-  setTimeout(() => finish('timed out after ' + timeout + 'ms'), timeout)
+  setTimeout(() => finish('timed out after ' + timeout + 'ms', 'timeout'), timeout)
+  const unhandled = new Map()
+  process.on('unhandledRejection', (err, p) => { unhandled.set(p, err) })
+  process.on('rejectionHandled', (p) => { unhandled.delete(p) })
+  const leftover = () => (unhandled.size ? { reason: unhandled.values().next().value } : undefined)
   let seq = 0
+  let tick = 0
+  const timing = new Map()
+  const alongsideOf = (id) => {
+    const f = timing.get(id)
+    if (!f) return 0
+    let n = 0
+    for (const [k, t] of timing) if (k !== id && (t.ok || t.answered === undefined) && t.sent < (f.answered ?? Infinity) && (t.answered ?? Infinity) > f.sent) n++
+    return n
+  }
   const req = async (kind, payload) => {
     const id = ++seq
     // The mod drops a line this long, which would leave the call waiting forever.
-    if (JSON.stringify(payload).length > 7000000) return { ok: false, error: 'The request is too large to pass to the mod.' }
+    if (JSON.stringify(payload).length > 7000000) return { ok: false, error: 'The request is too large to pass to the mod.', id }
+    const t = { sent: ++tick }
+    if (kind === 'call') timing.set(id, t)
     send({ id, kind, payload })
     const file = dir + '/' + id + '.json'
     for (let wait = 1; ; wait = Math.min(wait * 2, 25)) {
@@ -168,19 +310,84 @@ async function main({ script, tools: all, dir, timeout }) {
       let res
       try { res = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { continue }
       try { fs.unlinkSync(file) } catch {}
+      t.answered = ++tick
+      t.ok = !!(res && res.ok)
+      if (res && typeof res === 'object') {
+        if (res.resultIsText) res.result = res.text
+        if (res.droppedResult) res.resultDropped = true
+        delete res.resultIsText
+        delete res.droppedResult
+        Object.defineProperty(res, 'id', { value: id, enumerable: false })
+      }
       return res
     }
   }
   const byIdent = new Map(all.map((t) => [ident(t.name), t.name]))
   const names = new Set(all.map((t) => t.name))
-  const resolve = (name) => names.has(String(name)) ? String(name) : byIdent.get(ident(String(name))) ?? String(name)
-  const call = (name, args) => req('call', { tool: resolve(name), args: args ?? {} })
+  const denied = new Set(deniedList || [])
+  const seen = new Set(seenList || [])
+  const resolve = (name) => {
+    const n = String(name)
+    if (names.has(n)) return n
+    const byId = byIdent.get(ident(n))
+    if (byId) return byId
+    const tail = all.filter((t) => t.name.endsWith('__' + n) || ident(t.name).endsWith('__' + ident(n)))
+    return tail.length === 1 ? tail[0].name : n
+  }
+  const toolError = (message, r) => {
+    const e = new Error(message)
+    e.codemodeTool = true
+    if (r && r.id) e.codemodeId = r.id
+    return e
+  }
+  const textual = (r) => {
+    const s = () => (r.ok ? String(r.text ?? '') : 'Error: ' + r.error)
+    try {
+      Object.defineProperty(r, 'toString', { value: s, enumerable: false })
+      Object.defineProperty(r, Symbol.toPrimitive, { value: (hint) => (hint === 'number' ? NaN : s()), enumerable: false })
+    } catch {}
+    return r
+  }
+  const norm = (s) => {
+    if (!s.startsWith('/')) return s
+    const out = []
+    for (const seg of s.split('/')) {
+      if (seg === '' || seg === '.') continue
+      if (seg === '..') out.pop()
+      else out.push(seg)
+    }
+    return '/' + out.join('/')
+  }
+  const abs = (p) => {
+    const s = String(p).trim()
+    if (s.startsWith('/')) return norm(s)
+    if (s === '~' || s.startsWith('~/')) return home ? norm(home + s.slice(1)) : s
+    return cwd ? norm(cwd.replace(/\/$/, '') + '/' + s.replace(/^\.\//, '')) : s
+  }
+  const noteRead = (tool, args, r) => {
+    const target = args && (typeof args.file_path === 'string' ? args.file_path : args.path)
+    if (r.ok && r.whole === true && typeof target === 'string') seen.add(abs(target))
+    if (r.ok && Array.isArray(r.readNow)) for (const f of r.readNow) seen.add(f)
+    delete r.whole
+    delete r.readNow
+    if (r.denied && r.alt) denied.add(tool)
+    else if (r.ok) denied.delete(tool)
+  }
+  const call = async (name, args) => {
+    const tool = resolve(name)
+    const r = await req('call', { tool, args: args ?? {} })
+    noteRead(tool, args, r)
+    for (const k of ['shellText', 'denied', 'alt', 'refused', 'cut']) delete r[k]
+    return textual(r)
+  }
   const tools = new Proxy({}, {
     get: (_, key) => {
       if (typeof key !== 'string' || key === 'then' || key === 'toJSON') return undefined
       return async (args) => {
-        const r = await call(key, args)
-        if (!r.ok) throw new Error(key + ': ' + r.error)
+        const tool = resolve(key)
+        const r = await req('call', { tool, args: args ?? {} })
+        noteRead(tool, args, r)
+        if (!r.ok) throw toolError(key + ': ' + r.error, r)
         return r.text
       }
     },
@@ -188,6 +395,379 @@ async function main({ script, tools: all, dir, timeout }) {
     ownKeys: () => [...byIdent.keys()],
     getOwnPropertyDescriptor: (_, key) => typeof key === 'string' && byIdent.has(key) ? { enumerable: true, configurable: true } : undefined,
   })
+  const absOnly = (p, who) => {
+    const s = String(p).trim()
+    if (s.startsWith('/') || s === '~' || s.startsWith('~/')) return abs(s)
+    throw toolError(who + ': give an absolute path; ' + s + ' is relative, and the session folder may not be where it started')
+  }
+  const usable = (n) => names.has(n) && !denied.has(n)
+  const named = (re) => all.map((t) => t.name).filter((n) => re.test(n) && !denied.has(n))
+  const LEAN_SHELL = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/
+  const shells = () => {
+    const order = [...new Set([...(shellPref && usable(shellPref) ? [shellPref] : []), ...(usable('Bash') ? ['Bash'] : []), ...named(LEAN_SHELL)])]
+    return order.length || !names.has('Bash') ? order : ['Bash']
+  }
+  const patcher = () => named(/^mcp__lean[-_]ctx__(?:ctx_)?patch$/)[0]
+  const shResult = (text, code, tool) => Object.assign(new String(text), { exitCode: code, ok: code === 0, tool }, text && text.withheld === true ? { withheld: true, truncated: true } : {})
+  const withheldOutput = (t) => Object.assign(new String(t), { withheld: true })
+  const LIMIT = 7000
+  const viaFile = async (tool, cmd, extra) => {
+    const folder = '/tmp/codemode-' + require('node:crypto').randomBytes(12).toString('hex')
+    const clear = () => run(tool, 'rm -rf ' + folder, extra).catch(() => {})
+    const made = await run(tool, 'mkdir -m 700 ' + folder, extra)
+    if (made.denied || made.exitCode !== 0) throw toolError('sh: the command is ' + Buffer.byteLength(cmd) + ' bytes, over what ' + tool + ' takes, and a private folder for it could not be made: ' + (made.error || String(made)))
+    const file = folder + '/command.sh'
+    try {
+      await write(file, cmd)
+    } catch (e) {
+      await clear()
+      throw toolError('sh: the command is ' + Buffer.byteLength(cmd) + ' bytes, over what ' + tool + ' takes, and writing it to ' + file + ' failed (' + e.message + '); write it to a file yourself and run sh("bash <file>")', { id: e && e.codemodeId })
+    }
+    let r
+    try {
+      r = await run(tool, 'bash ' + file + '; rc=$?; rm -rf ' + folder + '; exit $rc', extra)
+    } catch (e) {
+      await clear()
+      throw e
+    }
+    if (r.denied || typeof r.exitCode !== 'number') await clear()
+    return r
+  }
+  const endLine = (text, bytes) => (Buffer.byteLength(text) + 1 === bytes ? text + '\n' : text)
+  const refusedRead = (expand, r) => toolError('sh: the command finished, but reading its output through ' + expand + ' was refused: ' + r.error, r)
+  const outOfTime = (id) => toolError('sh: the command finished, but the run ran out of time while fetching its output from lean-ctx archive ' + id + '; fetch it in a new run with ctx_expand(id="' + id + '") in pages (start_line, end_line)')
+  const expandPages = async (expand, id, total, chars) => {
+    const rows = []
+    for (let s = 1, page = 0; s <= total; page++) {
+      if (deadline() < 1500) throw outOfTime(id)
+      if (page === 3 && usable('Read') && home) {
+        const whole = await fromFile(id).catch(() => undefined)
+        if (whole !== undefined) return whole
+      }
+      const pageArgs = { id, start_line: s, end_line: Math.min(total, s + 499) }
+      const r = await req('call', { tool: expand, args: pageArgs, handled: true })
+      if (r.refused || r.denied) throw refusedRead(expand, r)
+      if (withheldText(said(r))) {
+        const again = await req('call', { tool: expand, args: pageArgs })
+        return withheldOutput(withheldText(said(again)) ? said(again) : said(r))
+      }
+      const got = r.ok ? String(r.text).split('\n').map((l) => /^\s*(\d+)\|([^\n]*)$/.exec(l)).filter(Boolean) : []
+      if (!got.length || got.some((m, k) => Number(m[1]) !== s + k)) return undefined
+      for (const m of got) rows.push(m[2])
+      const next = Number(got[got.length - 1][1]) + 1
+      if (next <= s) return undefined
+      s = next
+    }
+    return endLine(rows.join('\n'), chars)
+  }
+  const fromFile = async (id) => {
+    if (!names.has('Read') || !home) throw toolError('sh: the command finished, but its output in lean-ctx archive ' + id + ' could not be fetched (no ctx_expand and no Read here)')
+    const file = home + '/.local/share/lean-ctx/archives/' + id.slice(0, 2) + '/' + id + '.txt'
+    try {
+      return await read(file)
+    } catch (e) {
+      const why = toolError('sh: the command finished, but its output in lean-ctx archive ' + id + ' could not be read: ' + e.message)
+      if (!/over Read's token cap/.test(e.message)) throw why
+      return inBytes(file, why)
+    }
+  }
+  const BYTE_STEP = 21000
+  const inBytes = async (file, why) => {
+    const order = shells()
+    if (!order.length) throw why
+    const extra = LEAN_SHELL.test(order[0]) ? { raw: true } : {}
+    const sized = await run(order[0], 'wc -c < ' + quote(file), extra)
+    const size = Number(String(sized).trim())
+    if (sized.denied || sized.exitCode !== 0 || !/^\d+$/.test(String(sized).trim())) throw why
+    const parts = []
+    for (let at = 0; at < size; at += BYTE_STEP) {
+      if (deadline() < 1500) throw why
+      const r = await run(order[0], 'tail -c +' + (at + 1) + ' ' + quote(file) + ' | head -c ' + BYTE_STEP + ' | base64', extra)
+      const text = String(r).replace(/\s+/g, '')
+      if (r.denied || r.exitCode !== 0 || r.truncated || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) throw why
+      const part = Buffer.from(text, 'base64')
+      if (part.length !== Math.min(BYTE_STEP, size - at)) throw why
+      parts.push(part)
+    }
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(parts))
+    } catch {
+      throw why
+    }
+  }
+  const archived = async (id) => {
+    if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) return ''
+    const expand = named(/^mcp__lean[-_]ctx__(?:ctx_)?expand$/)[0]
+    if (expand) {
+      const r = await req('call', { tool: expand, args: { id } })
+      if (r.refused || r.denied) throw refusedRead(expand, r)
+      const t = String(r.text ?? '')
+      if (withheldText(said(r))) return withheldOutput(said(r))
+      if (r.ok && isStubText(t)) return fromFile(namedArchive(t) ?? id)
+      if (r.ok && /^Background job '[^']+' finished \(exit \d+\) without output\.\s*$/.test(t)) return ''
+      const head = r.ok ? /^Archive ([A-Za-z0-9_-]+) [^\n]*?\((\d+) chars, (\d+) lines\):(?:\n|$)/.exec(t) : null
+      if (head) {
+        const aid = head[1]
+        const chars = Number(head[2])
+        const total = Number(head[3])
+        const shown = t.slice(head[0].length)
+        const body = shown.replace(/(?:^|\n)\[… truncated at [^\n]*\](?:\n\[Original available[^\n]*\])?\s*$/, '')
+        const fits = Math.abs(Buffer.byteLength(body) - chars) <= 1
+        if (body === shown && fits && (head[0].endsWith('\n') || chars === 0) && body.split('\n').length >= total) return endLine(body, chars)
+        const paged = await expandPages(expand, aid, total, chars)
+        if (paged !== undefined) return paged
+        return fromFile(aid)
+      }
+    }
+    return fromFile(id)
+  }
+  const said = (r) => String((r.ok ? r.text : r.error) ?? '')
+  const namedArchive = (t) => /ctx_expand\(id="?([A-Za-z0-9_-]+)"?\)|ctx_expand id=([A-Za-z0-9_-]+)/.exec(String(t))?.slice(1).find(Boolean)
+  const jobOutput = async (body, id) => {
+    if (withheldText(body)) return withheldOutput(body)
+    if (!isStubText(body) && !/^\s*\[Firewalled /.test(body)) return body
+    return archived(namedArchive(body) ?? id)
+  }
+  const EXIT_TAIL = /\n\[exit:(\d+)\]\n?$/
+  const exitless = (text, code) => {
+    const m = EXIT_TAIL.exec(String(text))
+    if (!m || (code !== undefined && Number(m[1]) !== code)) return { text, code }
+    return { text: Object.assign(new String(String(text).slice(0, m.index)), text && text.withheld === true ? { withheld: true } : {}), code: Number(m[1]) }
+  }
+  const LEAN_CUT = /\n?\[… truncated at ~\d+ of \d+ tokens — the full output is archived — see the next line\]\n\[Original available via ctx_expand id=([A-Za-z0-9_-]+)\]\s*$/
+  const ADVICE = /\n\[ctx_shell: [^\n]*\]\s*$/
+  const follow = async (tool, id) => {
+    for (let wait = 200; ; wait = Math.min(wait * 2, 2000)) {
+      if (deadline() < wait + 500)
+        throw toolError('sh: ' + tool + ' moved the command to background job ' + id + ', still running as the run ends; check it with tools.' + ident(tool) + '({ background_action: "status", job_id: "' + id + '" })')
+      await sleep(wait)
+      const s = await req('call', { tool, args: { background_action: 'status', job_id: id }, handled: true, poll: true })
+      if (s.ok) {
+        let j
+        try { j = JSON.parse(String(s.shellText ?? s.text)) } catch { j = undefined }
+        if (j && j.state === 'running') continue
+        if (j && j.state === 'completed') {
+          const quiet = j.archiveId === undefined && (j.capturedChars === 0 || j.summary === 'no output')
+          const done = shResult(quiet ? '' : await archived(j.archiveId ?? id), typeof j.exitCode === 'number' ? j.exitCode : quiet ? 0 : undefined, tool)
+          if (j.archiveTruncated === true) done.truncated = true
+          return done
+        }
+        throw toolError('sh: background job ' + id + ' on ' + tool + ' answered: ' + String(s.text).slice(0, 300), s)
+      }
+      const err = String(s.error ?? '')
+      const failed = /^\s*\[background:[^\]\n]*failed, exit (\d+)\]\n([\s\S]*?)\n\n\[exit:\d+[^\]\n]*\]\s*$/.exec(err) ?? /^\s*\[background:[^\]\n]*failed, exit (\d+)\]\n?([\s\S]*?)\n*(?:\[exit:\d+[^\]\n]*\])?\s*$/.exec(err)
+      if (failed) {
+        const inline = failed[2]
+        const whole = !s.cut && !isStubText(inline) && !/^\s*\[Firewalled /.test(inline)
+        const expandable = named(/^mcp__lean[-_]ctx__(?:ctx_)?expand$/).length > 0
+        const fetched = expandable ? await archived(namedArchive(inline) ?? id).then((t) => exitless(t, Number(failed[1])).text, (e) => (whole ? inline : Promise.reject(e))) : await jobOutput(inline, id)
+        const out = expandable ? fetched : exitless(fetched, Number(failed[1])).text
+        const done = shResult(out, Number(failed[1]), tool)
+        if (s.cut && !expandable) {
+          done.truncated = true
+          await req('cut', { tool })
+        }
+        return done
+      }
+      if (typeof s.exitCode === 'number') return shResult(await jobOutput(String(s.shellText ?? '').replace(/^\s*\[background:[^\]\n]*\]\n?/, ''), id), s.exitCode, tool)
+      throw toolError('sh: background job ' + id + ' on ' + tool + ': ' + s.error, s)
+    }
+  }
+  const tooLong = (cmd, tool) =>
+    toolError('sh: the command is ' + Buffer.byteLength(cmd) + ' bytes, over the ' + LIMIT + '-byte limit of ' + tool + '; pass { stage: true } to run it from a private file written through write(), and know that the shell tool\'s hooks then only see "bash <file>" (the write tool\'s hooks see the whole command), or write it yourself and run sh("bash <file>")')
+  const run = async (tool, cmd, extra, stage = false) => {
+    if (LEAN_SHELL.test(tool) && Buffer.byteLength(cmd) > LIMIT) {
+      if (stage) return viaFile(tool, cmd, extra)
+      throw tooLong(cmd, tool)
+    }
+    const lean = LEAN_SHELL.test(tool)
+    const fill = lean ? { fill: { raw: true, timeout_ms: Math.max(1000, Math.min(3600000, deadline())) } } : {}
+    const r = await req('call', { tool, args: { ...extra, command: cmd }, foreground: true, ...fill })
+    if (r.denied) return r
+    const job = r.ok && lean && typeof r.job === 'string' ? r.job : undefined
+    if (job) return follow(tool, job)
+    if (lean && !r.denied) {
+      const out = String(r.shellText ?? r.text ?? r.error ?? '').replace(ADVICE, '')
+      const kept = LEAN_CUT.exec(out)
+      if (kept) {
+        const whole = await archived(kept[1])
+        if (r.ok) return shResult(whole, typeof r.exitCode === 'number' ? r.exitCode : 0, tool)
+        const back = exitless(whole, typeof r.exitCode === 'number' ? r.exitCode : undefined)
+        return shResult(back.text, back.code, tool)
+      }
+      if (withheldText(out)) return shResult(withheldOutput(out), typeof r.exitCode === 'number' ? r.exitCode : r.ok ? 0 : undefined, tool)
+      if (r.shellText !== undefined) r.shellText = out
+    }
+    if (typeof r.exitCode === 'number') {
+      const done = shResult(r.shellText ?? r.text ?? r.error ?? '', r.exitCode, tool)
+      if (r.cut) done.truncated = true
+      return done
+    }
+    if (r.ok) return shResult(r.shellText ?? r.text, 0, tool)
+    if (/^\s*ERROR: Command too large \(\d+ bytes, limit \d+\)/.test(String(r.error))) {
+      if (stage) return viaFile(tool, cmd, extra)
+      throw tooLong(cmd, tool)
+    }
+    throw toolError('sh: ' + tool + ': ' + r.error, r)
+  }
+  const sh = async (command, opts) => {
+    const extra = opts && typeof opts === 'object' ? { ...opts } : {}
+    const stage = extra.stage === true
+    delete extra.stage
+    for (const k of Object.keys(extra)) if (/background/i.test(k) && !extra[k]) delete extra[k]
+    if (Object.keys(extra).some((k) => /background/i.test(k))) throw toolError('sh() waits for its command and gives its exit code, so it starts no background job; call the shell tool directly for that')
+    const order = shells()
+    if (!order.length) throw toolError('sh: this session has no shell tool (no Bash, and no lean-ctx shell; CODEMODE_SHELL can name one)')
+    const r = await run(order[0], String(command), extra, stage)
+    if (!r.denied) return r
+    if (r.alt) denied.add(order[0])
+    throw toolError('sh: ' + r.error, r)
+  }
+  const read = async (path) => {
+    if (!names.has('Read')) throw toolError('read: this session has no Read tool')
+    const file = abs(path)
+    const rows = []
+    let offset = 1
+    let limit = 2000
+    let stubbed = 0
+    let tried = new Set()
+    let cap = 2000
+    let whole = false
+    for (;;) {
+      const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true })
+      const cutAtCap = r.ok && r.result && r.result.file && r.result.file.truncatedByTokenCap === true
+      if (!r.ok || cutAtCap) {
+        if (cutAtCap || /exceeds maximum allowed/i.test(String(r.error))) {
+          tried.add(limit)
+          cap = Math.min(cap, limit - 1)
+          limit = pickLimit(limit, tried, cap, Math.floor(limit / 2))
+          if (limit) continue
+          throw toolError('read: ' + file + ' has a line over Read\'s token cap at line ' + offset + ', so it cannot be read in pages; read part of it with sh() and head -c', r)
+        }
+        throw toolError('read: ' + r.error, r)
+      }
+      if (r.whole === true) whole = true
+      const t = String(r.text)
+      if (isDedup(t)) {
+        tried.add(limit)
+        limit = ++stubbed > 6 ? 0 : pickLimit(limit, tried, cap, Math.max(1, Math.min(limit, 2000) - 1 - Math.floor(Math.random() * Math.min(400, Math.floor(limit / 2)))))
+        if (!limit) throw toolError('read: Read keeps answering with a stub, not the file: ' + t.slice(0, 200), r)
+        continue
+      }
+      const got = fileLines(t).map((l) => l.replace(/^\s*\d+\t/, ''))
+      if (!got.length && !NOTICE.test(t))
+        throw toolError('read: Read answered with no file lines (a picture, a binary file, or a hook rewrote the answer): ' + t.slice(0, 200), r)
+      rows.push(...got)
+      if (got.length < limit || r.whole === true) break
+      offset += got.length
+      tried = new Set()
+      cap = 2000
+      limit = Math.min(2000, limit * 2)
+      stubbed = 0
+    }
+    if (whole) seen.add(file)
+    return rows.join('\n')
+  }
+  const UNREAD = /read it first|has not been read|modified since read|changed since (?:it was )?last read/i
+  const MOVED = /modified since read|changed since (?:it was )?last read/i
+  const wrote = (file, verb = 'wrote') => {
+    seen.add(file)
+    return verb + ' ' + file
+  }
+  const unreadWrite = (r) => !r.ok && !r.refused && !r.denied && UNREAD.test(String(r.error))
+  const write = async (path, content, opts) => {
+    const file = absOnly(path, 'write')
+    const body = String(content)
+    const force = !!(opts && typeof opts === 'object' && opts.force)
+    if (usable('Write')) {
+      let r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
+      if (unreadWrite(r)) {
+        if (!force && MOVED.test(String(r.error))) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
+        if (!force) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace it unread', r)
+        await read(file)
+        r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
+      }
+      if (r.ok) return wrote(file)
+      if (r.denied && r.alt) denied.add('Write')
+      throw toolError('write: ' + r.error, r)
+    }
+    const patch = patcher()
+    if (!patch) throw toolError('write: this session has no Write tool and no patch tool')
+    let r = await req('call', { tool: patch, args: { op: 'create', path: file, new_text: body } })
+    if (r.ok) return wrote(file)
+    if (r.refused || r.denied || !/already exists/i.test(String(r.error))) throw toolError('write: ' + r.error, r)
+    if (!force && !seen.has(file)) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
+    if (!force && (await req('fresh', { path: file })).fresh === false) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it')
+    const now = await read(file)
+    if (!now) throw toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
+    r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now, new_text: body } })
+    if (r.ok) return wrote(file)
+    if (!r.refused && !r.denied && /not found/i.test(String(r.error)) && !now.includes('\r')) {
+      r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now.split('\n').join('\r\n'), new_text: body } })
+      if (r.ok) return wrote(file)
+    }
+    throw toolError('write: ' + r.error + endings(r.error), r)
+  }
+  const edit = async (path, from, to, opts) => {
+    const file = absOnly(path, 'edit')
+    const o = opts && typeof opts === 'object' ? opts : {}
+    const force = !!o.force
+    const all = !!o.all
+    const unread = (r) => toolError('edit: ' + file + ' has not been read in this session: read(path) it first, or pass { force: true } to read it and edit it', r)
+    if (usable('Edit')) {
+      const args = { file_path: file, old_string: String(from), new_string: String(to), ...(all ? { replace_all: true } : {}) }
+      let r = await req('call', { tool: 'Edit', args })
+      if (unreadWrite(r)) {
+        if (!force && MOVED.test(String(r.error))) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
+        if (!force) throw unread(r)
+        await read(file)
+        r = await req('call', { tool: 'Edit', args })
+      }
+      if (r.ok) return wrote(file, 'edited')
+      if (r.denied && r.alt) denied.add('Edit')
+      throw toolError('edit: ' + r.error + endings(r.error), r)
+    }
+    const patch = patcher()
+    if (!patch) throw toolError('edit: this session has no Edit tool and no patch tool')
+    if (!seen.has(file)) {
+      if (!force) throw unread()
+      await read(file)
+    } else if ((await req('fresh', { path: file })).fresh === false) {
+      if (!force) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }')
+      await read(file)
+    }
+    const r = await req('call', { tool: patch, args: { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) } })
+    if (r.ok) return wrote(file, 'edited')
+    throw toolError('edit: ' + r.error + endings(r.error), r)
+  }
+  const deadline = () => Math.max(0, started + timeout - Date.now())
+  const waitFor = async (check, opts) => {
+    if (typeof check !== 'function') throw new Error('waitFor: check must be a function, such as () => sh("test -f /tmp/ready")')
+    const o = opts && typeof opts === 'object' ? opts : {}
+    const every = Math.max(10, o.every === undefined || !Number.isFinite(Number(o.every)) ? 1000 : Number(o.every))
+    const asked = o.timeout === undefined || o.timeout === null || o.timeout === '' ? NaN : Number(o.timeout)
+    const limit = Math.max(0, Math.min(Number.isFinite(asked) ? asked : deadline() - 1000, deadline()))
+    const t0 = Date.now()
+    const LATE = {}
+    const done = (v) => {
+      if (!v) return false
+      try { return v.ok !== false } catch { return true }
+    }
+    let last
+    for (let first = true; ; first = false) {
+      const left = limit - (Date.now() - t0)
+      if (left <= 0 && !first) throw new Error('waitFor timed out after ' + limit + 'ms; the check last returned ' + show(last))
+      const pending = Promise.resolve().then(check)
+      const v = await Promise.race([pending, sleep(Math.max(1, left)).then(() => LATE)])
+      if (v === LATE) pending.catch(() => {})
+      if (v === LATE) throw new Error('waitFor timed out after ' + limit + 'ms while a check was still running (its tool calls may still finish)')
+      if (done(v)) return v
+      last = v
+      const rest = limit - (Date.now() - t0)
+      if (rest <= 0) throw new Error('waitFor timed out after ' + limit + 'ms; the check last returned ' + show(last))
+      await sleep(Math.min(every, rest))
+    }
+  }
   // A listing carries each tool's first sentence; describeTool has the rest.
   const brief = (d) => {
     // The first line with words (some start with a blank line or a heading), up to
@@ -215,10 +795,18 @@ async function main({ script, tools: all, dir, timeout }) {
       return { t: listed[i], score }
     }).filter((x) => x.score > 0).sort((a, b) => b.score - a.score).slice(0, (opts && opts.limit) || 8).map((x) => x.t)
   }
-  const log = (...a) => { keep(logs, a.map(show).join(' ')) }
+  const log = (...a) => { keep('log', a.map(show).join(' ')) }
   const ctx = vm.createContext({
     tools, call, ALL_TOOLS: listed, searchTools,
-    text: (v) => { keep(items, show(v)) },
+    TEXT: new Proxy(Object.freeze(Object.assign(Object.create(null), texts || {})), {
+      get: (t, k) => {
+        if (typeof k !== 'string' || k in t || k === 'then' || k === 'toJSON') return t[k]
+        throw new ReferenceError('TEXT.' + k + ' is no // @text block; the blocks here are: ' + (Object.keys(t).join(', ') || 'none'))
+      },
+    }),
+    sh, quote, read, write, edit, waitFor, deadline,
+    btoa, atob, TextEncoder, TextDecoder, Buffer,
+    text: (v) => { keep('item', show(v), v) },
     console: { log, info: log, warn: log, error: log, debug: log },
     describeTool: async (name) => (await req('describe', { tool: resolve(name) })).value,
     ask: async (prompt, opts) => {
@@ -231,16 +819,33 @@ async function main({ script, tools: all, dir, timeout }) {
     load: async (key) => (await req('load', { key: String(key) })).value,
     exit: () => { throw new Exit() },
   })
-  let failure
+  vm.runInContext('(() => { const parse = JSON.parse; JSON.parse = function (text, reviver) { let tried = false; const watch = typeof reviver === "function" ? function (...a) { tried = true; return reviver.apply(this, a) } : reviver; try { return parse.call(JSON, text, watch) } catch (e) { if (tried || !(e instanceof SyntaxError)) throw e; let s; try { s = String(text) } catch { s = typeof text }; throw new SyntaxError(e.message + " (the text starts: " + JSON.stringify(s.slice(0, 60)) + (s.length > 60 ? "…" : "") + ")") } } })()', ctx, { filename: 'codemode-prelude.js' })
+  let fn
   try {
-    const fn = vm.runInContext('(async () => {"use strict";\n' + script + '\n})', ctx, { filename: 'script.js', lineOffset: -1 })
-    const value = await fn()
-    if (value !== undefined) keep(items, show(value))
+    fn = vm.runInContext('(async () => {"use strict";\n' + script + '\n})', ctx, { filename: 'script.js', lineOffset: -1 })
   } catch (err) {
-    if (!(err instanceof Exit)) failure = clean(err)
+    finish(syntax(err, script), 'syntax')
+    return
   }
-  finish(failure)
+  let failure
+  let kind
+  let failedId
+  try {
+    const value = await fn()
+    if (value !== undefined) keep('item', show(value), value)
+    await sleep(0)
+    const late = leftover()
+    if (late) throw late.reason === undefined ? new Error('a promise was rejected with no reason (undefined), and nothing handled it') : late.reason
+  } catch (err) {
+    if (!(err instanceof Exit)) {
+      failure = clean(err, script)
+      kind = err && err.codemodeTool ? 'tool' : 'script'
+      failedId = err && err.codemodeId
+    }
+  }
+  finish(failure, kind, failedId)
 }
+
 `
 
 type Options = { timeout_ms?: number; max_output_chars?: number }
@@ -259,31 +864,360 @@ export const parseOptions = (script: string): { options: Options; error?: string
   }
 }
 
-// Keeps the head and the tail; `file`, when given, holds the whole output.
-export const clip = (out: string, max: number, file?: string) => {
-  if (out.length <= max) return out
-  const half = Math.floor(max / 2)
-  const end = out.length - half
-  // The cut's line numbers let the next run read back only the part it needs.
-  const line = (at: number) => {
-    let n = 1
-    for (let i = out.indexOf('\n'); i >= 0 && i < at; i = out.indexOf('\n', i + 1)) n++
-    return n
+export const extractText = (script: string): { script: string; texts: Record<string, string>; error?: string } => {
+  const lines = script.split('\n')
+  const texts: Record<string, string> = Object.create(null)
+  const opened: Record<string, number> = Object.create(null)
+  const stack: ('tpl' | number)[] = []
+  let comment = false
+  let prev = ''
+  let word = ''
+  const KEYWORDS = new Set(['return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'new', 'delete', 'void', 'throw', 'await', 'yield', 'instanceof', 'debugger', 'break', 'continue'])
+  const parens: string[] = []
+  const braces: boolean[] = []
+  let fn: { expression: boolean; depth: number } | undefined
+  let asyncOpens = false
+  const keyword = (w: string) => KEYWORDS.has(w) && (w !== 'of' || parens[parens.length - 1] === 'for')
+  let lead = false
+  let caseAt = -1
+  let before = ''
+  const closeQuote = (l: string, from: number, q: string) => {
+    for (let i = from; i < l.length; i++) {
+      if (l[i] === '\\') i++
+      else if (l[i] === q) return i
+    }
+    return -1
   }
-  // A trailing newline ends the last line; it does not start another.
-  const where = `lines ${line(half)}-${line(end - 1)} of ${line(out.endsWith('\n') ? out.length - 1 : out.length)}`
-  const note = file ? `; all of it is in ${file}, so read back only the lines you need` : ''
-  return `${out.slice(0, half)}\n…${out.length - max} chars cut (${where})${note}…\n${out.slice(end)}`
+  const continues = (l: string) => (/\\+$/.exec(l)?.[0].length ?? 0) % 2 === 1
+  let quote = ''
+  let lineNo = 0
+  let asyncLine = -1
+  const scan = (l: string) => {
+    lineNo++
+    let start = 0
+    if (quote) {
+      const end = closeQuote(l, 0, quote)
+      if (end < 0) {
+        if (!continues(l)) quote = ''
+        return
+      }
+      quote = ''
+      prev = '"'
+      word = ''
+      start = end + 1
+    }
+    for (let i = start; i < l.length; i++) {
+      const ch = l[i] as string
+      const top = stack[stack.length - 1]
+      if (comment) {
+        if (ch === '*' && l[i + 1] === '/') {
+          comment = false
+          i++
+        }
+        continue
+      }
+      if (top === 'tpl') {
+        if (ch === '\\') i++
+        else if (ch === '`') {
+          stack.pop()
+          prev = '"'
+          word = ''
+        } else if (ch === '$' && l[i + 1] === '{') {
+          stack.push(0)
+          i++
+          prev = '{'
+        }
+        continue
+      }
+      if (/\s/.test(ch)) continue
+      if (ch === '/' && l[i + 1] === '/') return
+      if (ch === '/' && l[i + 1] === '*') {
+        comment = true
+        i++
+        continue
+      }
+      if (ch === '/' && (prev === '' || '(,=:[!&|?{};+-*%<>~^}A'.includes(prev) || keyword(word))) {
+        let cls = false
+        for (i++; i < l.length; i++) {
+          const c = l[i]
+          if (c === '\\') i++
+          else if (c === '[') cls = true
+          else if (c === ']') cls = false
+          else if (c === '/' && !cls) break
+        }
+        while (i + 1 < l.length && /[a-z]/i.test(l[i + 1] as string)) i++
+        prev = '"'
+        word = ''
+        continue
+      }
+      if (ch === '"' || ch === "'") {
+        const end = closeQuote(l, i + 1, ch)
+        if (end < 0) {
+          if (continues(l)) quote = ch
+          return
+        }
+        i = end
+        prev = '"'
+        word = ''
+        continue
+      }
+      if (/[\w$]/.test(ch)) {
+        let j = i
+        while (j < l.length && /[\w$]/.test(l[j] as string)) j++
+        before = word
+        word = prev === '.' ? '' : l.slice(i, j)
+        lead = word !== '' && typeof top !== 'number' && (prev === '' || prev === ';' || prev === '}' || (prev === '{' && braces[braces.length - 1] === false))
+        if (lead && (word === 'case' || word === 'default')) caseAt = parens.length + braces.length
+        const opens = (prev !== '' && '(,=:[!&|?+-*%<>~^A'.includes(prev)) || (prev === 'a' && keyword(before))
+        if (word === 'async') {
+          asyncOpens = opens
+          asyncLine = lineNo
+        }
+        if (word === 'function' || word === 'class') fn = { expression: before === 'async' && prev === 'a' && asyncLine === lineNo ? asyncOpens : opens, depth: parens.length }
+        prev = 'a'
+        i = j - 1
+        continue
+      }
+      if ((ch === '+' || ch === '-') && l[i + 1] === ch && (prev === 'a' || prev === ')' || prev === ']')) {
+        i++
+        prev = ')'
+        word = ''
+        continue
+      }
+      if (ch === '(') parens.push(['if', 'while', 'for', 'with'].includes(word) ? word : word === 'await' && before === 'for' ? 'for' : '')
+      if (ch === ')') {
+        prev = parens.pop() ? ';' : ')'
+        word = ''
+        continue
+      }
+      if (ch === '>' && prev === '=') {
+        prev = 'A'
+        word = ''
+        continue
+      }
+      if (ch === '{') {
+        if (fn && parens.length === fn.depth) {
+          braces.push(fn.expression)
+          fn = undefined
+        } else braces.push(prev !== '' && prev !== 'A' && '(,=:[!&|?+-*%<>~^'.includes(prev) || (prev === 'a' && keyword(word) && word !== 'else' && word !== 'do'))
+      }
+      if (ch === '}' && !(typeof top === 'number' && top === 0)) {
+        const expression = braces.pop()
+        if (typeof top === 'number') stack[stack.length - 1] = top - 1
+        prev = expression ? ')' : '}'
+        word = ''
+        continue
+      }
+      if (fn && parens.length === fn.depth && (ch === ':' || ch === ',' || ch === ';')) fn = undefined
+      if (ch === ':' && (caseAt === parens.length + braces.length || (prev === 'a' && lead))) {
+        caseAt = -1
+        lead = false
+        prev = ';'
+        word = ''
+        continue
+      }
+      prev = ch
+      word = ''
+      if (ch === '`') {
+        stack.push('tpl')
+        continue
+      }
+      if (typeof top === 'number') {
+        if (ch === '{') stack[stack.length - 1] = top + 1
+        else if (ch === '}') {
+          stack.pop()
+          prev = '"'
+        }
+      }
+    }
+  }
+  const OPEN = /^\s*\/\/\s*@text\s+([A-Za-z_$][\w$]*)\s*$/
+  const END = /^\s*\/\/\s*@end(?:\s+([A-Za-z_$][\w$]*))?\s*$/
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i] as string
+    const inText = comment || quote !== '' || stack[stack.length - 1] === 'tpl'
+    const m = inText ? null : OPEN.exec(l)
+    if (!m) {
+      scan(l)
+      continue
+    }
+    const name = m[1] as string
+    if (name in opened) return { script, texts: {}, error: 'the // @text ' + name + ' block on line ' + (i + 1) + ' uses a name used twice (first on line ' + opened[name] + '); give each block its own name' }
+    opened[name] = i + 1
+    let end = -1
+    for (let j = i + 1; j < lines.length; j++) {
+      const e = END.exec(lines[j] as string)
+      if (e && (e[1] === undefined || e[1] === name)) {
+        end = j
+        break
+      }
+    }
+    if (end < 0) return { script, texts: {}, error: 'the // @text ' + name + ' block that starts on line ' + (i + 1) + ' has no // @end line' }
+    texts[name] = lines
+      .slice(i + 1, end)
+      .map((x) => x.replace(/^(\s*\/\/\s*)@@(?=(?:text|end)\b)/, '$1@'))
+      .join('\n')
+    for (let j = i; j <= end; j++) lines[j] = ''
+    i = end
+  }
+  return { script: lines.join('\n'), texts }
 }
 
-// A run that worked says nothing about itself: only its output reaches the model.
-export const format = (ms: number, d: { items: string[]; logs: string[]; failure?: string }) => {
+export type Ended = { items: string[]; keys?: (string[] | undefined)[]; logs: string[]; failure?: string; kind?: string; notes?: string[] }
+
+export const sections = (ms: number, d: Ended, split = false): string[] => {
   const parts: string[] = []
-  if (d.items.length > 1) d.items.forEach((t, i) => parts.push(`==> text ${i + 1}/${d.items.length} <==\n${t}`))
-  else parts.push(...d.items)
+  d.items.forEach((t, i) => {
+    const head = d.items.length > 1 ? `==> text ${i + 1}/${d.items.length} <==\n` : ''
+    const keys = (split && d.keys?.[i]) || [t]
+    keys.forEach((k, j) => parts.push(j === 0 ? head + k : k))
+  })
   if (d.logs.length) parts.push(`<console_output>\n${d.logs.join('\n')}\n</console_output>`)
-  if (d.failure) parts.push(`Script failed after ${ms}ms: ${d.failure}`)
-  return parts.join('\n') || '(no output)'
+  parts.push(...(d.notes ?? []))
+  if (d.failure)
+    parts.push(
+      d.kind === 'aborted' ? `Script stopped after ${ms}ms [aborted]: ${d.failure}` : `Script failed after ${ms}ms [${d.kind ?? 'script'}]: ${d.failure}`,
+    )
+  return parts.length ? parts : ['(no output)']
+}
+
+export const format = (ms: number, d: Ended) => sections(ms, d).join('\n')
+
+const ERRORISH = /\b(?:error|errors|fatal|failed|failure|exception|traceback|panic|denied|refused)\b/i
+const countLines = (s: string) => {
+  let n = 0
+  for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) n++
+  return n
+}
+
+const utf8 = (s: string) => {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c < 0x80) n += 1
+    else if (c < 0x800) n += 2
+    else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length && isLow(s.charCodeAt(i + 1))) {
+      n += 4
+      i++
+    } else n += 3
+  }
+  return n
+}
+const LONG_LINE = 50_000
+const longest = (s: string) => {
+  let most = 0
+  for (let at = 0; at < s.length; ) {
+    const nl = s.indexOf('\n', at)
+    const end = nl < 0 ? s.length : nl
+    most = Math.max(most, end - at)
+    at = end + 1
+  }
+  return most
+}
+const shellWord = (s: string) => `'${s.split("'").join("'\\''")}'`
+
+export const cutPart = (s: string, budget: number, firstLine: number, file?: string, firstByte = 0) => {
+  const noteRoom = 70 + (file ? file.length + 80 : 0)
+  const keptRoom = Math.min(1200, Math.floor(budget / 4))
+  const room = Math.max(0, budget - noteRoom - keptRoom)
+  const half = Math.floor(room / 2)
+  let a = half
+  const ha = s.lastIndexOf('\n', half - 1) + 1
+  if (half > 0 && ha > half / 2) a = ha
+  let b = s.length - half
+  const tb = s.indexOf('\n', b - 1) + 1
+  if (half > 0 && tb > 0 && tb - b < half / 2) b = tb
+  a = safeEnd(s, a)
+  b = safeStart(s, b)
+  if (b <= a) return s
+  const gone = s.slice(a, b)
+  const from = firstLine + countLines(s.slice(0, a))
+  const to = Math.max(from, firstLine + countLines(s.slice(0, b)) - (s[b - 1] === '\n' ? 1 : 0))
+  const byRange = file !== undefined && longest(gone) > LONG_LINE
+  const range = byRange ? `tail -c +${firstByte + utf8(s.slice(0, a)) + 1} ${shellWord(file)} | head -c ${utf8(gone)}` : ''
+  const back = !file ? '' : byRange ? `; read them back with sh(${JSON.stringify(range)})` : `; read them back with tools.Read({ file_path: ${JSON.stringify(file)}, offset: ${from}, limit: ${to - from + 1} })`
+  const errs: string[] = []
+  let used = 0
+  for (const l of gone.split('\n')) {
+    if (errs.length >= 8 || !ERRORISH.test(l)) continue
+    const line = l.length > 200 ? `${l.slice(0, 200)}…` : l
+    if (used + line.length + 1 > keptRoom - 30) break
+    errs.push(line)
+    used += line.length + 1
+  }
+  const kept = errs.length ? `\n…lines kept from the cut:\n${errs.join('\n')}` : ''
+  const glue = a > 0 && s[a - 1] !== '\n' ? '\n' : ''
+  const full = `${s.slice(0, a)}${glue}…${gone.length} chars cut (lines ${from}-${to})${back}…${kept}${b < s.length ? `\n${s.slice(b)}` : ''}`
+  if (full.length <= budget) return full
+  const note = `\n…${gone.length} chars cut (lines ${from}-${to})…\n`
+  const side = Math.floor((budget - note.length) / 2)
+  if (side <= 0) return s.slice(0, safeEnd(s, Math.max(0, budget)))
+  return s.slice(0, safeEnd(s, side)) + note + s.slice(safeStart(s, s.length - side))
+}
+
+export const fit = (all: string[], max: number, file?: string, tailCount = 0): string => {
+  const full = all.join('\n')
+  if (full.length <= max) return full
+  const keep = Math.min(tailCount, all.length)
+  const body = all.slice(0, all.length - keep)
+  const bodyText = body.join('\n')
+  let tail = all.slice(all.length - keep).join('\n')
+  const tailLine = body.length ? countLines(bodyText) + 2 : 1
+  if (tail.length > max / 2) tail = cutPart(tail, Math.floor(max / 2), tailLine, file, body.length ? utf8(bodyText) + 1 : 0)
+  const room = Math.max(0, max - tail.length - (tail && body.length ? 1 : 0))
+  const groups = Math.max(1, Math.min(40, Math.floor(room / 400)))
+  const smallMax = Math.floor(room / (2 * groups))
+  const units: { small: boolean; parts: string[] }[] = []
+  for (const p of body) {
+    const small = p.length <= smallMax
+    const u = units[units.length - 1]
+    if (u && u.small === small) u.parts.push(p)
+    else units.push({ small, parts: [p] })
+  }
+  const length = (u: { parts: string[] }) => u.parts.reduce((n, p) => n + p.length + 1, 0)
+  while (units.length > groups) {
+    let best = 0
+    for (let k = 1; k + 1 < units.length; k++) if (length(units[k] as never) + length(units[k + 1] as never) < length(units[best] as never) + length(units[best + 1] as never)) best = k
+    units.splice(best, 2, { small: false, parts: [...(units[best] as { parts: string[] }).parts, ...(units[best + 1] as { parts: string[] }).parts] })
+  }
+  const spare = groups - units.length
+  const bigLength = units.filter((u) => !u.small).reduce((n, u) => n + length(u), 0)
+  const parts: string[] = []
+  for (const u of units) {
+    if (u.small) {
+      parts.push(u.parts.join('\n'))
+      continue
+    }
+    const share = 1 + (bigLength ? Math.floor((spare * length(u)) / bigLength) : 0)
+    const per = Math.ceil(u.parts.length / share)
+    for (let g = 0; g < u.parts.length; g += per) parts.push(u.parts.slice(g, g + per).join('\n'))
+  }
+  const budget = parts.map(() => 0)
+  let left = Math.max(0, room - Math.max(0, parts.length - 1))
+  const order = parts.map((p, i) => [p.length, i] as const).sort((x, y) => x[0] - y[0])
+  order.forEach(([len, i], k) => {
+    const share = Math.floor(left / (order.length - k))
+    budget[i] = Math.min(len, share)
+    left -= budget[i] as number
+  })
+  let line = 1
+  let byte = 0
+  let out = parts
+    .map((p, i) => {
+      const at = line
+      const from = byte
+      line += countLines(p) + 1
+      byte += utf8(p) + 1
+      const b = budget[i] as number
+      return p.length <= b ? p : cutPart(p, b, at, file, from)
+    })
+    .join('\n')
+  if (out.length > room) {
+    const note = file ? '\n…output cut at ' + max + ' chars; all of it is in ' + file + '…' : '\n…output cut at ' + max + ' chars…'
+    out = out.slice(0, safeEnd(out, Math.max(0, room - note.length))) + note
+  }
+  if (!tail) return out
+  return body.length ? out + '\n' + tail : tail
 }
 
 // A tool's arguments as one TypeScript type, from a JSON schema.
@@ -430,14 +1364,14 @@ export const similar = (name: string, names: string[]): string[] => {
     .map((x) => x.n)
 }
 
-type Tally = { ok: number; failed: number; open: number }
+type Tally = { ok: number; failed: number; open: number; arg?: string }
 
 // What a run had called by the time it failed: those side effects stand, and
 // the next run should not repeat them blind.
 export const ledger = (calls: Map<string, Tally>): string =>
   [...calls]
     .map(([n, t]) => {
-      const parts = [t.ok ? `${t.ok} ok` : '', t.failed ? `${t.failed} failed` : '', t.open ? `${t.open} still running (may still finish)` : '']
+      const parts = [t.ok ? `${t.ok} ok` : '', t.failed ? `${t.failed} failed${t.arg ? ` (${t.arg})` : ''}` : '', t.open ? `${t.open} still running (may still finish)` : '']
       return `${n} ${parts.filter(Boolean).join(', ')}`
     })
     .slice(0, 12)
@@ -452,9 +1386,9 @@ const show = (v: unknown): string => {
   }
 }
 
-type Request = { id: number; kind: 'call' | 'describe' | 'store' | 'load' | 'ask'; payload: Record<string, unknown> }
-type Done = { done: true; items: string[]; logs: string[]; failure?: string }
-const KINDS = new Set(['call', 'describe', 'store', 'load', 'ask'])
+type Request = { id: number; kind: 'call' | 'describe' | 'store' | 'load' | 'ask' | 'fresh'; payload: Record<string, unknown> }
+type Done = { done: true; failure?: string; kind?: string; failedId?: number; alongside?: number }
+const KINDS = new Set(['call', 'describe', 'store', 'load', 'ask', 'fresh', 'cut'])
 
 // Keys `$.tool.call` reads beside a tool's arguments. `consent` would stand in
 // for the user's own approval, so a script never gets to set any of them.
@@ -464,6 +1398,171 @@ const num = (v: unknown, fallback: number, min: number, max: number) =>
   typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(v, min), max) : fallback
 
 let runs = 0
+let sessionCwd: string | undefined
+const readPaths = new Set<string>()
+const deniedTools = new Map<string, { alt?: string; at: number }>()
+const failedScripts = new Map<string, { first: string; at: number }>()
+
+const READ = Symbol('read')
+const readProgress = new Map<string, { next: number; version?: string }>()
+const readVersions = new Map<string, string>()
+const pageStart = new Map<string, string | undefined>()
+const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
+const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number) => {
+  for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
+  for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
+  return 0
+}
+type Receipt = { file: string; whole: boolean; next?: number; version?: string }
+type FileInfo = { startLine?: unknown; numLines?: unknown; totalLines?: unknown; truncatedByTokenCap?: unknown }
+const infoOf = (result: unknown): FileInfo | undefined => {
+  const f = result && typeof result === 'object' ? (result as { file?: unknown }).file : undefined
+  return f && typeof f === 'object' ? (f as FileInfo) : undefined
+}
+const reachesEnd = (info: FileInfo | undefined) =>
+  !!info && typeof info.startLine === 'number' && typeof info.numLines === 'number' && typeof info.totalLines === 'number' && info.startLine + info.numLines - 1 >= info.totalLines
+const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, version: string | undefined): Receipt | undefined => {
+  if (version === undefined) return undefined
+  if (isStub(text)) return undefined
+  const info = infoOf(result)
+  if (info?.truncatedByTokenCap === true) return undefined
+  const rows = text.split('\n').filter((l) => /^\s*\d+\t/.test(l)).length
+  if (!rows && !NOTICE.test(text)) return undefined
+  const from = typeof offset === 'number' ? offset : 1
+  const chain = readProgress.get(file)
+  if (from !== 1 && (!chain || chain.next !== from || chain.version !== version)) return undefined
+  if (!rows) return { file, whole: true, version }
+  if (!info || rows !== info.numLines) return undefined
+  return reachesEnd(info) ? { file, whole: true, version } : { file, whole: false, next: from + rows, version }
+}
+const PERSISTED = /^(\s*(?:<tool_use_error>)?(?:Exit code \d+\n)?)<persisted-output>\n(?:[^\n]*\n){0,5}?Output too large \([^)\n]*\)\. Full output saved to: ([^\n]+)\n\nPreview \([^)\n]*\):\n([\s\S]*?)\n?<\/persisted-output>(\s*(?:<\/tool_use_error>)?\s*)$/
+const isLow = (c: number) => c >= 0xdc00 && c < 0xe000
+const isHigh = (c: number) => c >= 0xd800 && c < 0xdc00
+const safeEnd = (s: string, i: number) => (i > 0 && i < s.length && isLow(s.charCodeAt(i)) && isHigh(s.charCodeAt(i - 1)) ? i - 1 : i)
+const safeStart = (s: string, i: number) => (i > 0 && i < s.length && isLow(s.charCodeAt(i)) && isHigh(s.charCodeAt(i - 1)) ? i + 1 : i)
+export const normal = (p: string) => {
+  if (!p.startsWith('/')) return p
+  const out: string[] = []
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') out.pop()
+    else out.push(seg)
+  }
+  return '/' + out.join('/')
+}
+const SHELL_RE = /^Bash$|(?:^|_)shell$/i
+const HOOK_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:\S+ hook (?:error|denied)/i
+const WHOLE_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:(\S+) hook error: \[DENIED\] [A-Za-z ]{1,60} blocked\. Use: ([A-Za-z0-9_-]+)\(/
+const LEAN_WITHHELD = /^\s*\[lean-ctx[^\]\n]*withheld/i
+const GATEWAY_WITHHELD = /^\s*(?:\[(?:POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway\])|(?:stored output (?:is )?withheld by the context gateway|archive withheld by current policy|Tool may have completed; output withheld by policy)\.?\s*$)/i
+const ENGINE_CUT = /\n\n\.\.\. \[\d+ characters truncated\] \.\.\.\n\n/
+const LEAN_ARCHIVED = /\[Original available via ctx_expand id=[A-Za-z0-9_-]+\]\s*$/
+const SAVED = /^Error: result \(([\d,]+) characters across [\d,]+ lines\) exceeds maximum allowed tokens\. Output has been saved to (\/[^\n]+?\.txt)\.\nFormat: [^\n]+\n/
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+const shellQuote = (s: string) => "'" + s.split("'").join("'\\''") + "'"
+export const bytesOf = (s: string): number[] | undefined => {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length % 4 !== 0) return undefined
+  const out: number[] = []
+  let acc = 0
+  let bits = 0
+  for (const ch of s.replace(/=+$/, '')) {
+    acc = ((acc << 6) | B64.indexOf(ch)) & 0xffffff
+    bits += 6
+    if (bits >= 8) {
+      bits -= 8
+      out.push((acc >> bits) & 255)
+    }
+  }
+  return out
+}
+export const fromUtf8 = (bytes: number[]): string | undefined => {
+  const hex: string[] = []
+  for (const b of bytes) hex.push('%' + b.toString(16).padStart(2, '0'))
+  try {
+    return decodeURIComponent(hex.join(''))
+  } catch {
+    return undefined
+  }
+}
+const isWithheld = (t: string, tool?: string) => t.length < 600 && (LEAN_WITHHELD.test(t) || ((tool === undefined || /lean[-_]ctx/.test(tool)) && GATEWAY_WITHHELD.test(t)))
+const jobOf = (t: string): string | undefined => {
+  try {
+    const j = JSON.parse(t) as { jobId?: unknown; state?: unknown; summary?: unknown }
+    return typeof j?.jobId === 'string' && /^shell_[0-9a-f]{16}$/.test(j.jobId) && j.state === 'running' && typeof j.summary === 'string' ? j.jobId : undefined
+  } catch {
+    return undefined
+  }
+}
+export const isStub = (t: string, tool?: string) =>
+  /^\s*\[(?:Firewalled \S+ output|lean-ctx[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(t) ||
+  isWithheld(t, tool) ||
+  (countLines(t) <= 2 && /^\s*1\t\S[^\n]* \[unchanged \d+L · lean-ctx read-dedup\]/.test(t))
+const short = (n: string) => n.split('__').pop() ?? n
+const escape = (s: string) => s.replace(/[.*+?^$|{}()[\]\\]/g, '\\$&')
+
+export const firstArg = (args: Record<string, unknown>): string | undefined => {
+  const keys = ['command', 'file_path', 'path', 'query', 'url', 'pattern', 'skill', 'prompt']
+  const key = keys.find((k) => typeof args[k] === 'string')
+  const v = key ? (args[key] as string) : Object.values(args).find((x) => typeof x === 'string')
+  if (typeof v !== 'string') return undefined
+  if (v.length <= 80) return JSON.stringify(v)
+  return JSON.stringify(key === 'file_path' || key === 'path' ? `…${v.slice(-79)}` : `${v.slice(0, 79)}…`)
+}
+
+export const absolute = (p: string, cwd?: string, home?: string) => {
+  if (p.startsWith('/')) return normal(p)
+  if ((p === '~' || p.startsWith('~/')) && home) return normal(home + p.slice(1))
+  return cwd ? normal(`${cwd.replace(/\/$/, '')}/${p.replace(/^\.\//, '')}`) : p
+}
+
+export const exitOf = (raw: string, worked: boolean, tool = 'Bash'): { code?: number; out: string } => {
+  if (worked) return { code: 0, out: raw }
+  const text = raw.replace(/^\s*<tool_use_error>/, '').replace(/<\/tool_use_error>\s*$/, '')
+  for (const re of tool === 'Bash' ? [/^Exit code (\d+)(?:\n|$)/] : [/\n?\[exit:(\d+)[^\]\n]*\]\s*$/]) {
+    const m = re.exec(text)
+    if (m) return { code: Number(m[1]), out: text.slice(0, m.index) + text.slice(m.index + m[0].length) }
+  }
+  return worked ? { code: 0, out: text } : { out: text }
+}
+
+export const toolDefaults = (raw: string | undefined): Record<string, Record<string, unknown>> => {
+  if (!raw) return {}
+  try {
+    const v: unknown = JSON.parse(raw)
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return {}
+    const out: Record<string, Record<string, unknown>> = Object.create(null)
+    for (const [t, d] of Object.entries(v as Record<string, unknown>))
+      if (d && typeof d === 'object' && !Array.isArray(d)) out[t] = Object.fromEntries(Object.entries(d as Record<string, unknown>).filter(([k]) => !RESERVED.has(k)))
+    return out
+  } catch {
+    return {}
+  }
+}
+
+const distance = (a: string, b: string) => {
+  const row = Array.from({ length: b.length + 1 }, (_, j) => j)
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0] as number
+    row[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const here = row[j] as number
+      row[j] = Math.min(here + 1, (row[j - 1] as number) + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1))
+      prev = here
+    }
+  }
+  return row[b.length] as number
+}
+
+export const nearNames = (want: string, have: string[]): string[] => {
+  const w = want.toLowerCase()
+  const stem = (s: string) => s.replace(/\.[^.]*$/, '')
+  return have
+    .map((n) => ({ n, d: distance(n.toLowerCase(), w) }))
+    .filter(({ n, d }) => d <= Math.max(2, Math.floor(w.length / 4)) || (stem(w).length >= 3 && stem(n.toLowerCase()) === stem(w)))
+    .sort((x, y) => x.d - y.d)
+    .slice(0, 3)
+    .map((x) => x.n)
+}
 
 // Tool input types: the generated `.d.ts` files, read once, then the schemas
 // that calls with bad arguments brought back.
@@ -505,9 +1604,20 @@ export const register: Register = (on) => {
     // The session's own tools pick the description's argument lines; a list the
     // engine cannot give yet leaves the full description.
     const names = new Set(await $.tool.list().then((l) => l.map((t) => t.name), () => [] as string[]))
+    const cwd = (e as { cwd?: unknown }).cwd
+    sessionCwd = typeof cwd === 'string' && cwd ? cwd : undefined
+    const kept = (await $.store.get('denied').catch(() => undefined)) as Record<string, { alt?: string; at?: number }> | undefined
+    deniedTools.clear()
+    readPaths.clear()
+    readProgress.clear()
+    readVersions.clear()
+    pageStart.clear()
+    failedScripts.clear()
+    for (const [n, v] of Object.entries(kept && typeof kept === 'object' ? kept : {}))
+      if (v && Date.now() - Number(v.at ?? 0) < DENIED_MS && (names.size === 0 || (typeof v.alt === 'string' && names.has(v.alt)))) deniedTools.set(n, { alt: v.alt, at: Number(v.at) })
     await $.tool.register({
       name: NAME,
-      description: describeRun(names),
+      description: describeRun(names, new Map([...deniedTools].map(([n, v]) => [n, v.alt]))),
       isDeferred: false,
       inputSchema: {
         type: 'object',
@@ -517,6 +1627,18 @@ export const register: Register = (on) => {
     })
     return next(e)
   })
+
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    const skipped = !!r && typeof r === 'object' && 'skip' in r && (r as { skip?: unknown }).skip !== undefined
+    if (!e.agentId && e.trigger !== 'precompute' && !skipped) {
+      readPaths.clear()
+      readProgress.clear()
+      readVersions.clear()
+      pageStart.clear()
+    }
+    return r
+  }).catch(($, e, next) => next(e))
 
   on('skill.prompt', async ($, e, next) => {
     const r = await next(e)
@@ -563,9 +1685,12 @@ export const register: Register = (on) => {
       return next(e)
     }
 
-    const script = String((e as unknown as { script?: unknown }).script ?? '')
-    const { options, error } = parseOptions(script)
-    if (error) return { result: format(0, { items: [], logs: [], failure: error }) }
+    const raw = String((e as unknown as { script?: unknown }).script ?? '')
+    const { options, error } = parseOptions(raw)
+    if (error) return { result: format(0, { items: [], logs: [], failure: error, kind: 'syntax' }) }
+    const pre = extractText(raw)
+    if (pre.error) return { result: format(0, { items: [], logs: [], failure: pre.error, kind: 'syntax' }) }
+    const script = pre.script
     const timeout = num(options.timeout_ms, DEFAULT_TIMEOUT_MS, 1_000, 3_600_000)
     const maxChars = num(options.max_output_chars, DEFAULT_MAX_CHARS, 1_000, 1_000_000)
 
@@ -574,6 +1699,15 @@ export const register: Register = (on) => {
     const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
     // Every tool call this run made, so a failure can say what already ran.
     const calls = new Map<string, Tally>()
+    const open = new Map<number, { tool: string; arg?: string; at: number }>()
+    const stubs = new Set<string>()
+    let deduped = false
+    let persisted = false
+    const withheld = new Set<string>()
+    const cut = new Set<string>()
+    const savedAway = new Set<string>()
+    const defaults = toolDefaults(await $.env.get('CODEMODE_TOOL_DEFAULTS'))
+    const cwd = sessionCwd ?? (await $.env.get('PWD')) ?? undefined
     // Stored types belong to one engine version: an upgrade can change a schema.
     // No version known: nothing is stored or read, rather than a key every version shares.
     let version: Promise<string> | undefined
@@ -584,11 +1718,18 @@ export const register: Register = (on) => {
       const v = await version
       return v ? `type:${v}:${tool}` : undefined
     }
-    const home = (await $.env.get('HOME')) ?? '/tmp'
+    const home = (await $.env.get('HOME')) || '/tmp'
+    const configDir = normal((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`)
     // A host whose own node is older than 25 points this at a newer one.
     const node = (await $.env.get('CODEMODE_NODE')) || 'node'
     const root = `${home}/.claude/codemode/runs`
     const dir = `${root}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${++runs}`
+
+    const versionOf = (path: string): Promise<string | undefined> =>
+      $.fs.stat(path, { resolve: true }).then(
+        (s) => (typeof s?.mtimeMs === 'number' ? `${s.mtimeMs}:${s.size}` : undefined),
+        () => undefined,
+      )
 
     const handle = async (m: Request): Promise<Record<string, unknown>> => {
       const p = m.payload
@@ -598,7 +1739,17 @@ export const register: Register = (on) => {
         else await $.store.set(key, p.value as never)
         return { ok: true }
       }
+      if (m.kind === 'fresh') {
+        const path = normal(String(p.path))
+        const was = readVersions.get(path)
+        const now = was === undefined ? undefined : await versionOf(path)
+        return { ok: true, fresh: was !== undefined && now !== undefined && now === was }
+      }
       if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
+      if (m.kind === 'cut') {
+        if (typeof p.tool === 'string' && SHELL_RE.test(p.tool)) cut.add(p.tool)
+        return { ok: true }
+      }
       if (m.kind === 'describe') {
         const t = all.find((x) => x.name === p.tool)
         if (!t) {
@@ -643,9 +1794,30 @@ export const register: Register = (on) => {
       if (tool === FULL) return { ok: false, error: 'A script cannot run another script.' }
       // Agents a Workflow starts inside this call would skip codemode's hooks.
       if (tool === 'Workflow') return { ok: false, error: 'Workflow cannot run from a codemode script.' }
-      const args = Object.fromEntries(
+      const given = Object.fromEntries(
         Object.entries((p.args as Record<string, unknown> | null) ?? {}).filter(([k]) => !RESERVED.has(k)),
       )
+      const args: Record<string, unknown> = { ...(defaults[tool] ?? {}), ...given }
+      if (p.foreground === true) for (const k of Object.keys(args)) if (/background/i.test(k)) delete args[k]
+      const fill = p.fill && typeof p.fill === 'object' && /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? (p.fill as Record<string, unknown>) : undefined
+      if (fill && typeof fill.raw === 'boolean' && !('raw' in args)) args.raw = fill.raw
+      if (fill && typeof fill.timeout_ms === 'number' && Number.isFinite(fill.timeout_ms) && !('timeout_ms' in args)) args.timeout_ms = fill.timeout_ms
+      if ((tool === 'Write' || tool === 'Edit') && args.file_path !== undefined) {
+        const given = String(args.file_path).trim()
+        const expanded = given === '~' || given.startsWith('~/') ? home + given.slice(1) : given
+        if (!expanded.startsWith('/')) return { ok: false, error: `${tool} takes an absolute path from a script: ${given} is relative, and a shell cd can move where it lands` }
+        const path = normal(expanded)
+        args.file_path = path
+        const exists = await $.fs.exists(path).catch(() => true)
+        if (!readPaths.has(path) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
+        if (exists) {
+          const was = readVersions.get(path)
+          const now = await versionOf(path)
+          if (was === undefined || now === undefined || now !== was)
+            return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+        }
+      }
+      if (tool === 'Read' && typeof args.file_path === 'string') args.file_path = absolute(args.file_path.trim(), cwd, home)
       // Plugins cannot run the Agent tool; codemode-agents spawns instead.
       const target = tool === 'Agent' || tool === 'Task' ? AGENTS_TOOL : tool
       const key = skillKey(String(args.skill ?? ''))
@@ -658,12 +1830,26 @@ export const register: Register = (on) => {
       if (tool === 'Skill' && !release)
         return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
       const since = skillSeq
-      const tally = calls.get(tool) ?? { ok: 0, failed: 0, open: 0 }
-      calls.set(tool, tally)
+      const counted = p.poll !== true
+      const tally = (counted ? calls.get(tool) : undefined) ?? { ok: 0, failed: 0, open: 0 }
+      if (counted) calls.set(tool, tally)
       tally.open++
-      const r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
+      if (counted) open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
+      const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+      const patchPath = (v: unknown) => (typeof v === 'string' && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
+      const patchOps = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+        ? (Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : [args])
+            .map((o) => ({ op: String(o?.op ?? ''), path: patchPath(o?.path ?? args.path) }))
+            .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))
+        : []
+      const patchFresh = new Map<string, boolean>()
+      for (const o of patchOps)
+        if (o.op !== 'create' && !patchFresh.has(o.path))
+          patchFresh.set(o.path, readPaths.has(o.path) && readVersions.get(o.path) !== undefined && readVersions.get(o.path) === (await versionOf(o.path)))
+      let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
         tally.open--
         tally.failed++
+        tally.arg ??= firstArg(args)
         release?.()
         const msg = (err as Error)?.message ?? String(err)
         // A tool a setting or another mod removed: name what may replace it.
@@ -672,10 +1858,42 @@ export const register: Register = (on) => {
       })
       const body = release ? skillTexts.get(key) : undefined
       release?.()
+      const capped =
+        tool === 'Read' &&
+        !r.isError &&
+        args.limit === undefined &&
+        (infoOf(r.result)?.truncatedByTokenCap === true || ((args.offset === undefined || args.offset === 1) && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
+      if (tool === 'Read' && args.limit === undefined && (capped || (r.isError && /exceeds maximum allowed (?:tokens|size)/i.test(String(r.text ?? show(r.result)))))) {
+        const paged = await pageRead(args)
+        if (paged?.text !== undefined) r = { text: paged.text, result: paged.result } as typeof r
+        else if (paged?.error !== undefined) r = { isError: true, text: paged.error } as typeof r
+        else if (capped)
+          r = { isError: true, text: `${String(args.file_path)} is over Read's token cap and could not be read in pages (a single line may be over the cap); read part of it with sh() and head -c, or with offset and limit` } as typeof r
+      }
       tally.open--
-      if (r.deny !== undefined || r.isError) tally.failed++
-      else tally.ok++
-      if (r.deny !== undefined) return { ok: false, error: r.deny }
+      const failed = r.deny !== undefined || r.isError === true
+      if (failed) {
+        tally.failed++
+        tally.arg ??= firstArg(args)
+      } else tally.ok++
+      const saveDenied = () =>
+        $.store.set('denied', Object.fromEntries([...deniedTools].map(([n, v]) => [n, { alt: v.alt, at: v.at }])) as never).catch(() => {})
+      if (!failed && deniedTools.delete(tool)) await saveDenied()
+      const said = String(r.deny ?? (r.isError ? (r.text ?? show(r.result)) : ''))
+      const refused = r.deny !== undefined || (r.isError === true && HOOK_RE.test(said) && !(SHELL_RE.test(tool) && exitOf(said, false, tool).code !== undefined))
+      if (refused) {
+        const plain = said.replace(/^\s*<tool_use_error>/, '').replace(/<\/tool_use_error>\s*$/, '')
+        const whole = WHOLE_RE.exec(plain)
+        const wants = whole && whole[1] === tool ? all.map((x) => x.name).filter((n) => n !== tool && (n === whole[2] || short(n) === whole[2])) : []
+        const fits = (n: string) => (tool === 'Bash' ? /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(n) : /^(?:Write|Edit)$/.test(tool) && /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(n))
+        const alt = wants.length === 1 && fits(wants[0] as string) ? wants[0] : undefined
+        if (!alt) return { ok: false, error: plain, refused: true }
+        if (!deniedTools.has(tool)) {
+          deniedTools.set(tool, { alt, at: Date.now() })
+          await saveDenied()
+        }
+        return { ok: false, error: `${plain}\n${tool} is denied by a hook in this session; use tools.${ident(alt)}({...}) instead.`, denied: true, alt }
+      }
       const markers: string[] = []
       const result = strip(r.result, pictures, markers)
       let text = r.text ?? show(result)
@@ -683,8 +1901,106 @@ export const register: Register = (on) => {
         if (body && body.seq > since) text = `${text}\n\n${body.text}`
       }
       if (markers.length) text = [text.trim(), ...markers].filter(Boolean).join('\n')
-      if (!r.isError) return { ok: true, text, result }
+      const toolResult = (path: string) => path.startsWith(`${configDir}/projects/`) && /\/tool-results\/[^/]+\.txt$/.test(path)
+      const readBack = async (path: string, shell?: string) => {
+        const paged = await pageRead({ file_path: path })
+        if (paged?.text !== undefined) return paged.text.split('\n').map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
+        if (shell && (paged === undefined || /over Read's token cap/.test(paged.error ?? ''))) return viaBytes(shell, path)
+        return undefined
+      }
+      const saved = tool === 'Bash' ? PERSISTED.exec(text) : null
+      if (saved) {
+        const path = normal((saved[2] as string).trim())
+        const head = (saved[3] as string).replace(/\r/g, '').slice(0, 1000)
+        const whole = toolResult(path) ? await readBack(path, 'Bash') : undefined
+        if (whole !== undefined && head && whole.replace(/\r/g, '').startsWith(head)) text = (saved[1] as string) + whole + (saved[4] as string)
+        else persisted = true
+      }
+      const swapped = !r.isError && isMcp.has(tool) ? SAVED.exec(text) : null
+      if (swapped) {
+        const path = normal((swapped[2] as string).trim())
+        const size = Number((swapped[1] as string).replace(/,/g, ''))
+        const lean = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? tool : undefined
+        const back = toolResult(path) ? await readBack(path, lean) : undefined
+        const whole = back !== undefined && back.length + 1 === size ? back + '\n' : back
+        if (whole !== undefined && whole.length === size) text = whole
+        else savedAway.add(tool)
+      }
+      const shell = SHELL_RE.test(tool) ? exitOf(text, !r.isError, tool) : undefined
+      const exit = shell ? { ...(shell.code === undefined ? {} : { exitCode: shell.code }), shellText: shell.out } : {}
+      if (!r.isError) {
+        if (text.length > MAX_REPLY) {
+          tally.ok--
+          tally.failed++
+          tally.arg ??= firstArg(args)
+          return { ok: false, error: `The result of ${tool} is ${text.length} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
+        }
+        const target = typeof args.file_path === 'string' ? args.file_path : undefined
+        const wrote = tool === 'Write' || tool === 'Edit'
+        const moved = p.foreground === true && tool === 'Bash' ? (r.result as { backgroundTaskId?: unknown } | undefined)?.backgroundTaskId : undefined
+        if (moved !== undefined) {
+          tally.ok--
+          tally.failed++
+          tally.arg ??= firstArg(args)
+          return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
+        }
+        const readNow: string[] = []
+        const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => o.path))
+        for (const o of patchOps) {
+          if (created.has(o.path) || patchFresh.get(o.path) === true) {
+            const version = await versionOf(o.path)
+            readPaths.add(o.path)
+            if (version === undefined) readVersions.delete(o.path)
+            else readVersions.set(o.path, version)
+            readNow.push(o.path)
+          } else {
+            readPaths.delete(o.path)
+            readVersions.delete(o.path)
+          }
+        }
+        const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+        if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
+          const from = typeof args.offset === 'number' ? args.offset : 1
+          const first = pageStart.get(args.file_path)
+          if (from === 1) pageStart.set(args.file_path, readBefore)
+          else if (first !== undefined && (readBefore !== first || readAfter !== first)) {
+            tally.ok--
+            tally.failed++
+            return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
+          }
+          if (pageStart.size > 200) pageStart.delete(pageStart.keys().next().value as string)
+        }
+        const receipt =
+          tool === 'Read' && typeof args.file_path === 'string'
+            ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined)
+            : wrote && typeof target === 'string' && target.startsWith('/')
+              ? ({ file: normal(target), whole: true } as Receipt)
+              : undefined
+        if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
+        if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
+        else if (isStub(text, tool) && p.handled !== true) {
+          stubs.add(tool)
+          if (/read-dedup/.test(text)) deduped = true
+        }
+        const job = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
+        return { ok: true, text, result, ...exit, ...(job ? { job } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}) }
+      }
       const bad = tidy(tool, text)
+      if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
+        const at = args.file_path.lastIndexOf('/')
+        const folder = args.file_path.slice(0, at) || '/'
+        const root = cwd ? normal(cwd) : undefined
+        const inside = root !== undefined && (folder === root || folder.startsWith(root === '/' ? '/' : `${root}/`))
+        const listed = inside ? ((await $.fs.list(folder).catch(() => [])) ?? []).map((x) => x.name) : []
+        const near: string[] = []
+        for (const n of nearNames(args.file_path.slice(at + 1), listed)) {
+          const path = `${folder === '/' ? '' : folder}/${n}`
+          const probe = await $.tool.call({ file_path: path, limit: 1, tool: 'Read' } as never).catch(() => undefined)
+          const said = String(probe?.text ?? '')
+          if (probe && probe.deny === undefined && (probe.isError !== true || /exceeds maximum allowed/i.test(said))) near.push(path)
+        }
+        if (near.length) bad.message = `${bad.message} Similar files: ${near.join(', ')}`
+      }
       // Learned from built-ins only: an MCP server writes its own error text.
       if (bad.type && !isMcp.has(tool)) {
         if (learned.size >= 200) learned.delete(learned.keys().next().value as string)
@@ -694,11 +2010,103 @@ export const register: Register = (on) => {
         const k = await typeKey(tool)
         if (k) await $.store.set(k, bad.type as never).catch(() => {})
       }
-      return { ok: false, error: bad.message, text: bad.message, result }
+      const engineCut = SHELL_RE.test(tool) && ENGINE_CUT.test(text) && !LEAN_ARCHIVED.test(text)
+      if (engineCut && p.poll !== true) cut.add(tool)
+      return { ok: false, error: bad.message, text: bad.message, result, ...exit, ...(engineCut ? { cut: true } : {}) }
+    }
+
+    const viaBytes = async (shell: string, path: string): Promise<string | undefined> => {
+      const step = 21000
+      const extra = shell === 'Bash' ? {} : { raw: true }
+      const ask = (command: string) => $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined)
+      const sized = await ask('wc -c < ' + shellQuote(path))
+      const size = Number(String(sized?.text ?? '').trim())
+      if (!sized || sized.isError || sized.deny !== undefined || !Number.isInteger(size)) return undefined
+      const bytes: number[] = []
+      for (let at = 0; at < size; at += step) {
+        if (over) return undefined
+        const r = await ask('tail -c +' + (at + 1) + ' ' + shellQuote(path) + ' | head -c ' + step + ' | base64')
+        if (!r || r.isError || r.deny !== undefined) return undefined
+        const part = bytesOf(String(r.text ?? '').replace(/\s+/g, ''))
+        if (!part || part.length !== Math.min(step, size - at)) return undefined
+        for (const b of part) bytes.push(b)
+      }
+      return bytes.length === size ? fromUtf8(bytes) : undefined
+    }
+    const pageRead = async (args: Record<string, unknown>): Promise<{ text?: string; error?: string; result?: unknown } | undefined> => {
+      const pages: string[] = []
+      let size = 0
+      let offset = typeof args.offset === 'number' && args.offset > 1 ? args.offset : 1
+      let limit = 2000
+      let stubbed = 0
+      let tried = new Set<number>()
+      let cap = 2000
+      let total: number | undefined
+      const start = offset
+      const file = String(args.file_path)
+      const version = await versionOf(file)
+      const moved = async () => version === undefined || (await versionOf(file)) !== version
+      for (let guard = 0; guard < 10_000; guard++) {
+        if (over) return undefined
+        const r = await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
+        if (r && !r.isError && r.deny === undefined && (await moved())) return { error: `${file} changed while it was read in pages; read it again` }
+        if (!r) return undefined
+        if (r.deny !== undefined) return { error: `Reading ${file} in pages stopped at line ${offset}: ${r.deny}` }
+        const t = String(r.text ?? show(r.result))
+        const cutAtCap = !r.isError && infoOf(r.result)?.truncatedByTokenCap === true
+        if (r.isError || cutAtCap) {
+          if (cutAtCap || /exceeds maximum allowed/i.test(t)) {
+            tried.add(limit)
+            cap = Math.min(cap, limit - 1)
+            limit = pickLimit(limit, tried, cap, Math.floor(limit / 2))
+            if (limit) continue
+            if (offset === 1) return undefined
+            return { error: `${file} has a line over Read's token cap at line ${offset}, so it cannot be read in pages; read part of it with sh() and head -c` }
+          }
+          return { error: offset > 1 ? `Reading ${file} in pages stopped at line ${offset}: ${t.slice(0, 300)}` : t.slice(0, 2000) }
+        }
+        if (isStub(t) && /read-dedup/.test(t)) {
+          tried.add(limit)
+          limit = ++stubbed > 6 ? 0 : pickLimit(limit, tried, cap, Math.max(1, Math.min(limit, 2000) - 1 - Math.floor(Math.random() * Math.min(400, Math.floor(limit / 2)))))
+          if (!limit) return { error: `Reading ${file} in pages: Read keeps answering with a stub, not the file` }
+          continue
+        }
+        const rows = t.split('\n').filter((l) => /^\s*\d+\t/.test(l))
+        if (!rows.length && !NOTICE.test(t)) return { error: `Reading ${file} in pages stopped at line ${offset}: Read answered with no file lines: ${t.slice(0, 200)}` }
+        size += t.length
+        if (size > MAX_REPLY) return { error: `${file} is too large to pass to the script whole (over ${MAX_REPLY} chars); read it with read(path), which reads in pages, or with offset and limit` }
+        if (rows.length) pages.push(rows.join('\n'))
+        const info = infoOf(r.result)
+        if (typeof info?.totalLines === 'number') total = info.totalLines
+        if (rows.length < limit) break
+        offset += rows.length
+        tried = new Set()
+        cap = 2000
+        limit = Math.min(2000, limit * 2)
+        stubbed = 0
+        if (guard === 9_999) return { error: `Reading ${file} in pages stopped after 10000 pages` }
+      }
+      const text = pages.join('\n')
+      const lines = text ? text.split('\n') : []
+      const content = lines.map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
+      return { text, result: { type: 'text', file: { filePath: file, content, numLines: lines.length, startLine: start, totalLines: total ?? start + lines.length - 1 } } }
     }
 
     let over = false
     const writes = new Set<Promise<unknown>>()
+    const replies = new Set<Promise<unknown>>()
+    const items: string[] = []
+    const keys: (string[] | undefined)[] = []
+    const logs: string[] = []
+    let aborted = false
+    let printed = 0
+    const take = (s: string): string | undefined => {
+      const left = 1_000_000 - printed
+      if (left <= 0) return undefined
+      const kept = s.length > left ? `${s.slice(0, safeEnd(s, left))}\n…output cut at 1000000 chars…` : s
+      printed += Math.min(s.length, left)
+      return kept
+    }
     const pictures: Picture[] = []
     const respond = async (m: Request) => {
       let out: Record<string, unknown>
@@ -707,22 +2115,60 @@ export const register: Register = (on) => {
       } catch (err) {
         out = { ok: false, error: (err as Error)?.message ?? String(err) }
       }
+      open.delete(m.id)
       // The child is gone after a timeout; writing would recreate its run dir.
       if (over) return
       const file = `${dir}/${m.id}.json`
-      // Tracked whole, fallbacks included, so the run dir is removed only after it.
-      const reply = (async () => {
-        try {
-          await $.fs.write(file, JSON.stringify(out))
-        } catch {
-          // Over the 4 MiB write limit, or a result that is not JSON: keep the text.
-          const slim = { ok: out.ok, error: out.error, text: typeof out.text === 'string' ? clip(out.text, 1_000_000) : undefined }
-          await $.fs.write(file, JSON.stringify(slim)).catch(() =>
-            $.fs.write(file, JSON.stringify({ ok: false, error: 'The tool result was too large to pass to the script.' })).catch(() => {}),
-          )
+      const receipt = out[READ as never] as Receipt | undefined
+      let undo: (() => void) | undefined
+      if (receipt) {
+        const had = readPaths.has(receipt.file)
+        const version = readVersions.get(receipt.file)
+        const progress = readProgress.get(receipt.file)
+        undo = () => {
+          if (readVersions.get(receipt.file) !== receipt.version || readProgress.get(receipt.file)?.next !== (receipt.whole ? undefined : receipt.next)) return
+          if (!had) readPaths.delete(receipt.file)
+          if (version === undefined) readVersions.delete(receipt.file)
+          else readVersions.set(receipt.file, version)
+          if (progress === undefined) readProgress.delete(receipt.file)
+          else readProgress.set(receipt.file, progress)
         }
+        if (receipt.whole) {
+          readProgress.delete(receipt.file)
+          readPaths.add(receipt.file)
+          if (receipt.version !== undefined) readVersions.set(receipt.file, receipt.version)
+          if (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
+          if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
+        } else if (receipt.next !== undefined) {
+          readProgress.set(receipt.file, { next: receipt.next, version: receipt.version })
+          if (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
+        }
+      }
+      // Tracked whole, fallbacks included, so the run dir is removed only after it.
+      const delivered = (async () => {
+        if (await $.fs.write(file, JSON.stringify(out)).then(() => true, () => false)) return true
+        const size = typeof out.text === 'string' ? out.text.length : 0
+        const tool = String((m.payload as { tool?: unknown }).tool ?? 'the tool')
+        const sameText = out.result === out.text
+        const base = { ok: out.ok, error: out.error, text: out.shellText ?? out.text, exitCode: out.exitCode, whole: out.whole }
+        const slim = sameText ? { ...base, resultIsText: true } : { ...base, result: out.result }
+        if (await $.fs.write(file, JSON.stringify(slim)).then(() => true, () => false)) return true
+        if (!sameText && (await $.fs.write(file, JSON.stringify({ ...base, droppedResult: true })).then(() => true, () => false))) return true
+        const failed = { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
+        const t = calls.get(tool)
+        if (t && out.ok) {
+          t.ok--
+          t.failed++
+          t.arg ??= firstArg(((m.payload as { args?: unknown }).args ?? {}) as Record<string, unknown>)
+        }
+        await $.fs.write(file, JSON.stringify(failed)).catch(() => {})
+        return false
       })()
+      const reply = delivered.then((ok) => {
+        if (!ok) undo?.()
+      })
       writes.add(reply)
+      void reply.finally(() => writes.delete(reply))
       await reply
     }
 
@@ -744,7 +2190,7 @@ export const register: Register = (on) => {
     try {
       const child = $.process.spawn({
         argv: [node, '--permission', `--allow-fs-read=${dir}`, `--allow-fs-write=${dir}`, '-e', RUNNER],
-        input: JSON.stringify({ script, tools: all, dir, timeout }),
+        input: JSON.stringify({ script, tools: all, dir, timeout, texts: pre.texts, cwd, home, denied: [...deniedTools.keys()], shell: await $.env.get('CODEMODE_SHELL'), seen: [...readPaths] }),
       })
       for await (const piece of child) {
         if (piece.stream === 'stderr') {
@@ -756,7 +2202,7 @@ export const register: Register = (on) => {
           const line = buf.slice(0, nl)
           buf = buf.slice(nl + 1)
           if (!line.startsWith('\x1eCM')) continue
-          let m: Partial<Request & Done & { pid: number }>
+          let m: Partial<Request & Done & { pid: number; out: string; text: string; keys: unknown }>
           try {
             m = JSON.parse(line.slice(3))
           } catch {
@@ -769,26 +2215,76 @@ export const register: Register = (on) => {
             continue
           }
           if (m.done === true) {
-            done = { done: true, items: m.items ?? [], logs: m.logs ?? [], failure: m.failure }
+            done = { done: true, failure: m.failure, kind: m.kind, failedId: (m as { failedId?: number }).failedId, alongside: Number((m as { alongside?: unknown }).alongside) || 0 }
             over = true
-          } else if (Number.isSafeInteger(m.id) && (m.id as number) > 0 && KINDS.has(m.kind as string) && m.payload && typeof m.payload === 'object')
-            void respond(m as Request)
+          } else if (m.out === 'log' && typeof m.text === 'string') {
+            const t = take(m.text)
+            if (t !== undefined) logs.push(t)
+          } else if (m.out === 'item' && (typeof m.text === 'string' || Array.isArray(m.keys))) {
+            const parts = Array.isArray(m.keys) && m.keys.every((k) => typeof k === 'string') ? (m.keys as string[]) : undefined
+            const whole =
+              typeof m.text === 'string'
+                ? m.text
+                : (m as { json?: unknown }).json === true
+                  ? `{\n${(parts ?? []).map((k) => `  ${k.split('\n').join('\n  ')}`).join(',\n')}\n}`
+                  : (parts ?? []).join('\n')
+            const t = take(whole)
+            if (t !== undefined) {
+              items.push(t)
+              keys.push(t === whole ? parts : undefined)
+            }
+          }
+          else if (!done && Number.isSafeInteger(m.id) && (m.id as number) > 0 && KINDS.has(m.kind as string) && m.payload && typeof m.payload === 'object') {
+            const reply = respond(m as Request)
+            replies.add(reply)
+            void reply.finally(() => replies.delete(reply))
+          }
         }
         if (buf.length > 8_000_000) buf = ''
       }
     } catch (err) {
-      stderr += `\n${(err as Error)?.message ?? String(err)}`
+      const msg = (err as Error)?.message ?? String(err)
+      if ((err as Error)?.name === 'AbortError' || /\$\.process\.spawn\([^)]*\) aborted|AbortError/.test(msg)) aborted = true
+      else stderr += `\n${msg}`
+    }
+    if (done?.failure && done.kind !== 'timeout' && open.size)
+    {
+      const grace: { handle?: { cancel: () => unknown } } = {}
+      await Promise.race([Promise.allSettled([...replies]), new Promise((r) => (grace.handle = $.clock.after(1_500, () => r(undefined))))])
+      grace.handle?.cancel()
     }
     over = true
     watchdog.cancel()
     // A reply already being written could recreate the dir after it is removed.
     await Promise.allSettled([...writes])
     await $.process.run(['rm', '-rf', dir]).catch(() => {})
-    let ended: { items: string[]; logs: string[]; failure?: string } =
-      done ??
-      (killed
-        ? { items: [], logs: [], failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
-        : { items: [], logs: [], failure: `script runner exited without a result.\n${stderr.trim()}` })
+    let ended: Ended = done
+      ? { items, keys, logs, failure: done.failure, kind: done.kind }
+      : aborted
+        ? { items, keys, logs, kind: 'aborted', failure: 'the run was interrupted before it finished (the session stopped it); what it printed is above, and its tool calls may have run.' }
+        : killed
+          ? { items, keys, logs, kind: 'timeout', failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
+          : { items, keys, logs, kind: 'runner', failure: `script runner exited without a result.\n${stderr.trim()}` }
+    const first = ended.failure?.split('\n')[0] ?? ''
+    if (ended.failure && ended.kind === 'timeout' && open.size) {
+      const now = Date.now()
+      const still = [...open.values()].map((o) => `${o.tool} (${((now - o.at) / 1000).toFixed(1)}s${o.arg ? `, ${o.arg}` : ''})`)
+      ended = { ...ended, failure: `${ended.failure}\nstill running when it timed out (abandoned, not stopped: they may still finish, so do not repeat them blind): ${still.join('; ')}` }
+    }
+    const notes = [
+      ...(stubs.size
+        ? [`Note: a result from ${[...stubs].join(', ')} was a compressed stub, not the tool's full text; ${deduped ? 'read(path) gets a whole file past a repeated-read stub, and ' : ''}call the tool with raw: true, or set CODEMODE_TOOL_DEFAULTS, to get the full text.`]
+        : []),
+      ...(cut.size
+        ? [`Note: Claude Code cut the middle out of a failed command's output from ${[...cut].join(', ')} (it keeps the first and last 5,000 chars of a failed result over 10,000); that sh() result is marked .truncated, and sending the output to a file (cmd > /tmp/out.txt 2>&1) and reading it with read(path) gets all of it.`]
+        : []),
+      ...(savedAway.size
+        ? [`Note: Claude Code saved a result from ${[...savedAway].join(', ')} to a file instead of returning it (it was over its token limit), and it could not be read back here; read(path) of the file the result names gets it where Read may open it.`]
+        : []),
+      ...(withheld.size ? [`Note: lean-ctx withheld a result from ${[...withheld].join(', ')} by its storage policy; that text is not available to scripts here.`] : []),
+      ...(persisted ? ['Note: Bash saved a big output to a file instead of returning it (<persisted-output>), and it could not be read back here; read(path) of the file it names gets it whole where Read may open it.'] : []),
+    ]
+    if (notes.length) ended = { ...ended, notes }
     // A failed call can have changed things too (a command that wrote, then exited non-zero).
     const only = calls.size === 1 ? [...calls][0] : undefined
     // One failed call whose own error ended the run says nothing the error does not.
@@ -799,7 +2295,33 @@ export const register: Register = (on) => {
       [only[0], ident(only[0])].some((n) => ended.failure?.includes(`Error: ${n}: `) === true)
     const ran = echo ? '' : ledger(calls)
     if (ended.failure && ran) ended = { ...ended, failure: `${ended.failure}\nTool calls before the failure: ${ran}` }
-    const full = format(Date.now() - started, ended)
+    const now = Date.now()
+    const alongside = done?.failedId ? (done.alongside ?? 0) : 0
+    if (ended.failure && ended.kind === 'tool' && alongside > 0)
+      ended = {
+        ...ended,
+        failure: `${ended.failure}\n${alongside} call${alongside === 1 ? '' : 's'} that ran alongside it had succeeded or were still running; their results are lost with this failure: use call(), which never throws, or Promise.allSettled to keep them.`,
+      }
+    const before = failedScripts.get(raw)
+    if (ended.failure && ended.kind !== 'aborted') {
+      if (before)
+        ended = {
+          ...ended,
+          failure:
+            before.first === first
+              ? `${ended.failure}\nThis is the same script as a run that failed ${Math.round((now - before.at) / 1000)}s ago with the same error: change the script, not just run it again.`
+              : `${ended.failure}\nThis is the same script as a run that failed ${Math.round((now - before.at) / 1000)}s ago with: ${before.first.slice(0, 200)}`,
+        }
+      failedScripts.delete(raw)
+      failedScripts.set(raw, { first, at: now })
+      if (failedScripts.size > 20) failedScripts.delete(failedScripts.keys().next().value as string)
+    } else if (!ended.failure) failedScripts.delete(raw)
+    let parts = sections(now - started, ended)
+    let full = parts.join('\n')
+    if (full.length > maxChars) {
+      parts = sections(now - started, ended, true)
+      full = parts.join('\n')
+    }
     // A cut output is kept whole on disk, so nothing in it needs a second run.
     let file: string | undefined
     if (full.length > maxChars) {
@@ -812,9 +2334,13 @@ export const register: Register = (on) => {
         .filter((x, i) => i >= KEEP_SPILLS || Date.now() - x.mtimeMs > SPILL_AGE_MS)
       if (old.length) await $.process.run(['rm', '-f', ...old.map((x) => `${spills}/${x.name}`)]).catch(() => {})
     }
-    const out = clip(full, maxChars, file)
+    const out = fit(parts, maxChars, file, (ended.notes?.length ?? 0) + (ended.failure ? 1 : 0))
     // A marker the cut removed still counts: the script chose to show it.
     const blocks = attach(full, pictures)
     return { result: blocks.length ? ([{ type: 'text', text: out }, ...blocks] as never) : out }
+  }).catch(($, e, next) => {
+    const why = next.error?.message ?? next.error?.kind ?? 'unknown failure'
+    if ((e.tool as string) === FULL) return { result: format(0, { items: [], logs: [], failure: `codemode's own hook failed: ${why}`, kind: 'runner' }) }
+    return next.called ? next(e) : { deny: `codemode could not check this call (${why}), so it is refused; call ${e.tool} from a ${FULL} script.` }
   })
 }

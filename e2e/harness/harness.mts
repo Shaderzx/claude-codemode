@@ -52,6 +52,7 @@ type Case = {
   bytesShort?: boolean
   swapFormat?: string
   archiveBytes?: string
+  shortPages?: number
 }
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -184,7 +185,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       if (a.limit === undefined && statSync(p).size > 256 * 1024)
         return err('File content (' + Math.round(statSync(p).size / 1024) + 'KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
       if (c.hugePageAt === offset) return ok(numbered(['\\'.repeat(1_200_000), '\\'.repeat(1_200_000)], offset))
-      let part = lines.slice(offset - 1, offset - 1 + limit)
+      let part = lines.slice(offset - 1, offset - 1 + Math.min(limit, c.shortPages ?? limit))
       const tokens = tokensOf(part)
       let cut = false
       if (tokens > 25000) {

@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[] };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -175,7 +175,7 @@ test('read() keeps a file\'s last line exact, newline or not, and is not fooled 
 test('A repeated-read stub in a tool result is named as a stub', () => {
   const dir = scratch();
   writeFileSync(join(dir, 'f.txt'), 'one\ntwo\n');
-  const text = one('await tools.Read({ file_path: "f.txt" })\nconst again = await tools.Read({ file_path: "f.txt" })\nreturn again.length > 0', { cwd: dir, dedupReads: true });
+  const text = one('await tools.Read({ file_path: "f.txt", offset: 1, limit: 5 })\nconst again = await tools.Read({ file_path: "f.txt", offset: 1, limit: 5 })\nreturn again.length > 0', { cwd: dir, dedupReads: true });
   expect(text).toMatch(/compressed stub/);
 });
 
@@ -203,7 +203,7 @@ test('A relative path in Read is read from the session folder', () => {
 test('A Read of a missing file suggests the near-miss names in its folder', () => {
   const dir = scratch();
   writeFileSync(join(dir, 'register.tsx'), 'x');
-  const text = one('return await tools.Read({ file_path: ' + JSON.stringify(join(dir, 'register.ts')) + ' })');
+  const text = one('return await tools.Read({ file_path: ' + JSON.stringify(join(dir, 'register.ts')) + ' })', { cwd: dir });
   expect(text).toContain(join(dir, 'register.tsx'));
 });
 
@@ -788,8 +788,16 @@ test('Near names for a missing file never include one Read may not open', () => 
   const dir = scratch();
   writeFileSync(join(dir, '.env'), 'SECRET=1\n');
   const script = 'await tools.Read({ file_path: ' + JSON.stringify(join(dir, '.envv')) + ' })';
-  expect(one(script)).toContain('Similar files: ' + join(dir, '.env'));
-  expect(one(script, { denyReadPaths: ['/.env'] })).not.toContain('Similar files');
+  expect(one(script, { cwd: dir })).toContain('Similar files: ' + join(dir, '.env'));
+  expect(one(script, { cwd: dir, denyReadPaths: ['/.env'] })).not.toContain('Similar files');
+});
+
+test('Near names are only offered inside the session folder, and never a folder', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'notes.txt'), 'x\n');
+  execFileSync('mkdir', [join(dir, 'src')]);
+  expect(one('await tools.Read({ file_path: ' + JSON.stringify(join(dir, 'notes.tx')) + ' })', { cwd: scratch() })).not.toContain('Similar files');
+  expect(one('await tools.Read({ file_path: ' + JSON.stringify(join(dir, 'srcc')) + ' })', { cwd: dir })).not.toContain('Similar files');
 });
 
 test('edit() with { all: true } replaces every occurrence through Edit and through the patch tool', () => {
@@ -897,4 +905,94 @@ test('A second read() of a file that fits one or two lines per page never repeat
   writeFileSync(f, Array.from({ length: 4 }, (_, i) => String(i).repeat(49000)).join('\n'));
   const out = run({ tools: NO_BASH, dedupReads: true, steps: [{ script: 'const a = await read(' + JSON.stringify(f) + ')\nconst b = await read(' + JSON.stringify(f) + ')\nreturn String(a === b && a.length === 196003)' }] });
   expect(out.results[0]!.text).toBe('true');
+});
+
+
+test('tools.Read of a file over the token cap with no limit hands the script every line', () => {
+  const dir = scratch();
+  const f = join(dir, 'big.txt');
+  writeFileSync(f, Array.from({ length: 3000 }, (_, i) => 'line ' + i + ' ' + 'x'.repeat(60)).join('\n') + '\n');
+  expect(one('const t = await tools.Read({ file_path: ' + JSON.stringify(f) + ' })\nreturn t.split("\\n").filter((l) => /^\\s*\\d+\\t/.test(l)).length')).toBe('3001');
+});
+
+test('write() through Write refuses an existing file this session has not read', () => {
+  const dir = scratch();
+  const f = join(dir, 'keep.txt');
+  writeFileSync(f, 'keep\n');
+  expect(one('await write(' + JSON.stringify(f) + ', "clobbered")')).toContain('has not read it');
+  expect(readFileSync(f, 'utf8')).toBe('keep\n');
+});
+
+test('edit() through Edit refuses a file read only in part', () => {
+  const dir = scratch();
+  const f = join(dir, 'three.txt');
+  writeFileSync(f, 'one\ntwo\nthree\n');
+  expect(one('await tools.Read({ file_path: ' + JSON.stringify(f) + ', limit: 1 })\nawait edit(' + JSON.stringify(f) + ', "three", "X")')).toContain('has not been read');
+  expect(readFileSync(f, 'utf8')).toBe('one\ntwo\nthree\n');
+});
+
+test('sh() on Bash returns the whole output when Bash saved it to a file', () => {
+  expect(one('return String(await sh("printf %40000s x | tr \' \' y")).length', { persistBash: true })).toBe('40000');
+});
+
+test('Pages read in order with tools.Read count as reading the file within the same script', () => {
+  const dir = scratch();
+  const f = join(dir, 'three.txt');
+  writeFileSync(f, 'one\ntwo\nthree\n');
+  const text = one('await tools.Read({ file_path: ' + JSON.stringify(f) + ', offset: 1, limit: 2 })\nawait tools.Read({ file_path: ' + JSON.stringify(f) + ', offset: 3, limit: 5 })\nreturn await edit(' + JSON.stringify(f) + ', "three", "X")', { tools: NO_BASH });
+  expect(text).toBe('edited ' + f);
+  expect(readFileSync(f, 'utf8')).toBe('one\ntwo\nX\n');
+});
+
+test('A Read limit from the tool defaults does not count as reading the whole file', () => {
+  const dir = scratch();
+  const f = join(dir, 'three.txt');
+  writeFileSync(f, 'one\ntwo\nthree\n');
+  const text = one('await tools.Read({ file_path: ' + JSON.stringify(f) + ' })\nawait edit(' + JSON.stringify(f) + ', "three", "X")', { tools: NO_BASH, env: { CODEMODE_TOOL_DEFAULTS: JSON.stringify({ Read: { limit: 1 } }) } });
+  expect(text).toContain('has not been read');
+});
+
+test('A page whose reply could not be delivered breaks the chain of pages', () => {
+  const dir = scratch();
+  const f = join(dir, 'huge.txt');
+  writeFileSync(f, 'one\ntwo\nthree\n');
+  const out = run({ tools: NO_BASH, hugePageAt: 1, steps: [{ script: 'const a = await call("Read", { file_path: ' + JSON.stringify(f) + ', offset: 1, limit: 2 })\nawait tools.Read({ file_path: ' + JSON.stringify(f) + ', offset: 3, limit: 5 })\nawait tools.Read({ file_path: "/nope" })' }, { script: 'await edit(' + JSON.stringify(f) + ', "three", "X")' }] });
+  expect(out.results[0]!.text).toMatch(/Read 1 ok, 2 failed \("[^"]*huge\.txt"\)/);
+  expect(out.results[1]!.text).toContain('has not been read');
+});
+
+test('read() refuses an empty reply that is not one of Read\'s notices', () => {
+  const dir = scratch();
+  const f = join(dir, 'x.txt');
+  writeFileSync(f, 'body\n');
+  expect(one('return await read(' + JSON.stringify(f) + ').then(() => "read", (e) => e.message)', { readRewrite: '' })).toContain('no file lines');
+});
+
+test('A property named like a keyword before a division keeps the template whole', () => {
+  expect(one('const o = { of: 4 }\nconst n = o.of / 2; const t = `\n// @text KEEP\nx\n`\nreturn t')).toBe('\n// @text KEEP\nx\n');
+});
+
+test('A returned object over the cap keeps a small key that sits between two big ones', () => {
+  expect(one('return { a: "x".repeat(600000), critical: "KEEP_MIDDLE", b: "y".repeat(600000) }')).toContain('"critical": "KEEP_MIDDLE"');
+});
+
+test('Paths with . and .. segments name the same file for the read check', () => {
+  const dir = scratch();
+  const f = join(dir, 'a.txt');
+  writeFileSync(f, 'red\n');
+  const text = one('await read(' + JSON.stringify(dir + '/sub/../a.txt') + ')\nreturn await edit(' + JSON.stringify(dir + '//./a.txt') + ', "red", "RED")', { tools: NO_BASH });
+  expect(text).toBe('edited ' + f);
+});
+
+test('A request sent after the script said it was done is never run', () => {
+  const dir = scratch();
+  const f = join(dir, 'late');
+  const text = one('const p = Buffer.constructor("return process")()\np.stdout.write("\\x1eCM" + JSON.stringify({ done: true }) + "\\n")\np.stdout.write("\\x1eCM" + JSON.stringify({ id: 999, kind: "call", payload: { tool: "Bash", args: { command: "touch ' + f + '" } } }) + "\\n")\nreturn 1');
+  expect(text).not.toContain('runner exited');
+  expect(existsSync(f)).toBe(false);
+});
+
+test('A cut through a line of emoji never splits one in half', () => {
+  const text = one('return "\\u{1F600}".repeat(200000)');
+  expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)).toBe(false);
 });

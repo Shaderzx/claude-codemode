@@ -22,6 +22,8 @@ type Case = {
   compressShell?: boolean
   denyReadPaths?: string[]
   deniedShellCommands?: string[]
+  hugePageAt?: number
+  persistBash?: boolean
 }
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -51,7 +53,6 @@ const DESCRIPTIONS: Record<string, string> = {
   'mcp__other__git_patch': 'Applies a git patch.',
   'mcp__t3-code__big_report': 'Returns a big report.',
 }
-const readSet = new Set<string>()
 const names = c.tools ?? ['Read', 'Bash', 'Write', 'Edit', 'Skill', 'ToolSearch', 'mcp__lean-ctx__ctx_shell', 'mcp__lean-ctx__ctx_patch', 'mcp__t3-code__thread_note']
 const NOTE_SCHEMA = { type: 'object', properties: { threadId: { type: 'string' }, note: { type: 'string' } }, required: ['threadId', 'note'] }
 
@@ -94,22 +95,28 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       const offset = typeof a.offset === 'number' ? a.offset : 1
       const limit = typeof a.limit === 'number' ? a.limit : 2000
       if (offset > lines.length) return ok('<system-reminder>Warning: the file exists but is shorter than the provided offset (' + offset + '). The file has ' + lines.length + ' lines.</system-reminder>')
-      const part = lines.slice(offset - 1, offset - 1 + limit)
+      if (c.hugePageAt === offset) return ok(numbered(['\\'.repeat(1_200_000), '\\'.repeat(1_200_000)], offset))
+      let part = lines.slice(offset - 1, offset - 1 + limit)
       const tokens = Math.ceil(part.join('\n').length / 4)
-      if (tokens > 25000)
-        return err('File content (' + tokens + ' tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
+      let cut = false
+      if (tokens > 25000) {
+        if (typeof a.limit === 'number')
+          return err('File content (' + tokens + ' tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
+        let n = 0
+        for (let size = 0; n < part.length && Math.ceil((size + (part[n] as string).length + 1) / 4) <= 25000; n++) size += (part[n] as string).length + 1
+        if (!n) return err('File content (' + tokens + ' tokens) exceeds maximum allowed tokens (25000).')
+        part = part.slice(0, n)
+        cut = true
+      }
       seen.set(key, statSync(p).mtimeMs)
-      readSet.add(p)
-      return ok(numbered(part, offset))
+      return ok(numbered(part, offset), { type: 'text', file: { filePath: p, content: part.join('\n'), numLines: part.length, startLine: offset, totalLines: lines.length, ...(cut ? { truncatedByTokenCap: true } : {}) } })
     }
     case 'Write': {
-      if (existsSync(String(a.file_path)) && !readSet.has(String(a.file_path))) return err('<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>')
       writeFileSync(String(a.file_path), String(a.content))
       return ok('File created successfully at: ' + a.file_path)
     }
     case 'Edit': {
       const p = String(a.file_path)
-      if (!readSet.has(p)) return err('<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>')
       const s = readFileSync(p, 'utf8')
       const n = s.split(String(a.old_string)).length - 1
       if (!n) return err('String to replace not found in file.')
@@ -130,6 +137,12 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
         return err('ERROR: Command too large (' + Buffer.byteLength(command) + ' bytes, limit 8192). If you\'re writing file content, use the native Write/Edit tool instead. ctx_shell is for reading command output only (git, cargo, npm, etc.).')
       const r = await shell(command)
       if (tool !== 'Bash' && c.compressShell && a.raw !== true) return ok('[Firewalled ' + tool + ' output — ' + r.out.length + ' chars, stored out-of-band]')
+      if (tool === 'Bash' && c.persistBash && r.out.length > 30000) {
+        const saved = join(home, '.claude', 'projects', 'p', 's', 'tool-results', 'toolu_' + calls.length + '.txt')
+        mkdirSync(dirname(saved), { recursive: true })
+        writeFileSync(saved, r.out)
+        r.out = '<persisted-output>\nOutput too large (' + (r.out.length / 1024).toFixed(1) + 'KB). Full output saved to: ' + saved + '\n\nPreview (first 2KB):\n' + r.out.slice(0, 2000) + '\n</persisted-output>'
+      }
       if (tool === 'Bash') return r.code ? err('<tool_use_error>Exit code ' + r.code + '\n' + r.out + '</tool_use_error>') : ok(r.out)
       return r.code ? err(r.out + '\n[exit:' + r.code + ']') : ok(r.out || '(' + tool + ' completed with no output)')
     }

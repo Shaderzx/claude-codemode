@@ -18,7 +18,7 @@ const MAX_PICTURES = 10
 // delete a file another session's cut still points to.
 const KEEP_SPILLS = 200
 const SPILL_AGE_MS = 86_400_000
-const DENIED_MS = 7 * 86_400_000
+const DENIED_MS = 86_400_000
 const MAX_REPLY = 3_800_000
 
 // Argument lines for the built-in tools scripts call most. The description
@@ -34,7 +34,6 @@ const COMMON: [string, string][] = [
   ['AskUserQuestion', 'AskUserQuestion({ questions: [{ question, header, multiSelect, options: [{ label, description }] }] })'],
 ]
 
-// The run tool's description for a session whose tools are `names`; an empty
 export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<string, string | undefined> = new Map()): string => {
   const has = (n: string) => (names.size === 0 || names.has(n)) && !denied.has(n)
   const common = COMMON.filter(([n]) => has(n)).map(([, l]) => `- ${l}`)
@@ -68,7 +67,7 @@ export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<stri
     '',
     'Globals:',
     '- sh(cmd) runs a command on the session\'s shell (Bash or what replaces it) and resolves to its text, with .exitCode and .ok; a non-zero exit does not throw. quote(s) makes s one safe shell word.',
-    '- read(path) is a file\'s whole text without line numbers (a relative path starts at the session folder); write(path, text, { force }?) and edit(path, old, new) take absolute paths and go through Write/Edit or the session\'s patch tool, which keep their read-before-write check: replacing a file not yet read takes { force: true }.',
+    '- read(path) is a file\'s whole text without line numbers (a relative path starts at the session folder); write(path, text, { force }?) and edit(path, old, new, { all, force }?) take absolute paths and go through Write/Edit or the session\'s patch tool, which keep their read-before-write check: changing a file not yet read takes { force: true }, which reads it first. read() gives line endings back as \\n.',
     '- waitFor(check, { every = 1000, timeout }) calls check until it returns something truthy, and returns that; deadline() is the ms left before the run times out.',
     '- tools.<Name>(args): call a tool by its exact name (characters invalid in identifiers become _: tools.mcp__lean_ctx__ctx_read for mcp__lean-ctx__ctx_read; a unique suffix such as tools.ctx_read works too). Resolves to the result text; rejects on a denied or failed call.',
     '- call(name, args): the same, but never throws: { ok, text, result, error, exitCode? }, result being the structured output; String(r) is its text. Promise.allSettled also keeps partial results.',
@@ -92,12 +91,6 @@ export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<stri
   ].join('\n')
 }
 
-// The mod runtime refuses code generation, so scripts run in a Node child
-// under the permission model (no network, no subprocesses, file access only to
-// its run directory). The child asks for tool calls on stdout, one marked JSON
-// `vm` is not a boundary: a script can reach the child's `process` through
-// any host function it is given. The permission model is the boundary, so the
-// child drops its environment and reports its pid before the script starts.
 const RUNNER = String.raw`
 // Before Node 25 the permission model does not block the network.
 const fs = require('node:fs')
@@ -161,12 +154,41 @@ const show = (v) => {
 const keysOf = (v) => {
   if (!plain(v) || Array.isArray(v)) return undefined
   let entries
-  try { entries = Object.entries(v) } catch { return undefined }
-  if (entries.length < 2) return undefined
+  try {
+    if (typeof v.toJSON === 'function') return undefined
+    entries = Object.entries(v)
+  } catch { return undefined }
   const str = (x) => typeof x === 'string' || tag(x) === '[object String]'
   const multi = entries.length <= 100 && entries.some(([, x]) => str(x) && String(x).includes('\n'))
+  if (!multi) entries = entries.filter(([, x]) => { try { return JSON.stringify(x, replacer) !== undefined } catch { return true } })
+  if (entries.length < 2) return undefined
   return entries.map(([k, x]) => (multi ? '== ' + k.replace(/\s+/g, ' ') + ' ==\n' + (str(x) ? String(x) : json(x)) : JSON.stringify(k) + ': ' + json(x)))
 }
+const shareKeys = (keys, budget) => {
+  const out = keys.slice()
+  let left = budget - keys.length * 4
+  const order = keys.map((k, i) => [k.length, i]).sort((a, b) => a[0] - b[0])
+  order.forEach(([len, i], n) => {
+    const share = Math.max(0, Math.floor(left / (order.length - n)))
+    if (len > share) {
+      const note = '…' + (len - share) + ' chars cut past the 1000000-char cap…'
+      const half = Math.max(0, Math.floor((share - note.length) / 2))
+      out[i] = keys[i].slice(0, half) + note + keys[i].slice(len - half)
+    }
+    left -= out[i].length
+  })
+  return out
+}
+const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
+const isStubText = (t) => /^\s*\[(?:Firewalled \S+ output|lean-ctx gateway: content withheld|untrusted input: tool_output overflow)/.test(String(t)) || isDedup(t)
+const fileLines = (t) => String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
+const pickLimit = (limit, tried, cap, down) => {
+  for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
+  for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
+  return 0
+}
+const ENDINGS = ' (read() and Read give a file\'s line endings back as \\n, so text taken from a file with CRLF line endings does not match it; for such a file use sh() with sed or perl, or write the whole file with { force: true } through Write)'
+const endings = (e) => (/not found/i.test(String(e)) ? ENDINGS : '')
 const ident = (n) => n.replace(/[^A-Za-z0-9_$]/g, '_')
 class Exit extends Error {}
 const TIMERS = 'is not available: use waitFor(check, { every, timeout }) to wait for something, and deadline() for the time left'
@@ -222,6 +244,13 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const keep = (out, s, v) => {
     if (room <= 0) return
     const had = room
+    const over = s.length > room ? keysOf(v) : undefined
+    if (over) {
+      const fitted = shareKeys(over, room)
+      room -= fitted.reduce((n, k) => n + k.length + 4, 0)
+      send({ out, keys: fitted, json: !String(fitted[0]).startsWith('== ') })
+      return
+    }
     if (s.length > room) s = s.slice(0, room) + '\n…output cut at 1000000 chars…'
     room -= s.length
     const keys = s.length > 1000 && s.length <= had ? keysOf(v) : undefined
@@ -240,7 +269,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const unhandled = new Map()
   process.on('unhandledRejection', (err, p) => { unhandled.set(p, err) })
   process.on('rejectionHandled', (p) => { unhandled.delete(p) })
-  const leftover = () => (unhandled.size ? unhandled.values().next().value : undefined)
+  const leftover = () => (unhandled.size ? { reason: unhandled.values().next().value } : undefined)
   let seq = 0
   let tick = 0
   const timing = new Map()
@@ -266,7 +295,13 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       try { fs.unlinkSync(file) } catch {}
       t.answered = ++tick
       t.ok = !!(res && res.ok)
-      if (res && typeof res === 'object') Object.defineProperty(res, 'id', { value: id, enumerable: false })
+      if (res && typeof res === 'object') {
+        if (res.resultIsText) res.result = res.text
+        if (res.droppedResult) res.resultDropped = true
+        delete res.resultIsText
+        delete res.droppedResult
+        Object.defineProperty(res, 'id', { value: id, enumerable: false })
+      }
       return res
     }
   }
@@ -303,7 +338,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     return cwd ? cwd.replace(/\/$/, '') + '/' + s.replace(/^\.\//, '') : s
   }
   const noteRead = (tool, args, r) => {
-    if (tool === 'Read' && r.ok && args && typeof args.file_path === 'string') seen.add(abs(args.file_path))
+    if (tool === 'Read' && r.ok && args && typeof args.file_path === 'string' && args.offset === undefined && args.limit === undefined && !isStubText(r.text) && (fileLines(r.text).length || NOTICE.test(String(r.text)))) seen.add(abs(args.file_path))
     if (r.denied && r.alt) denied.add(tool)
     else if (r.ok) denied.delete(tool)
   }
@@ -346,16 +381,25 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const LIMIT = 7000
   const viaFile = async (tool, cmd, extra) => {
     const folder = '/tmp/codemode-' + require('node:crypto').randomBytes(12).toString('hex')
+    const clear = () => run(tool, 'rm -rf ' + folder, extra).catch(() => {})
     const made = await run(tool, 'mkdir -m 700 ' + folder, extra)
     if (made.denied || made.exitCode !== 0) throw toolError('sh: the command is ' + Buffer.byteLength(cmd) + ' bytes, over what ' + tool + ' takes, and a private folder for it could not be made: ' + (made.error || String(made)))
     const file = folder + '/command.sh'
     try {
       await write(file, cmd)
     } catch (e) {
-      await run(tool, 'rm -rf ' + folder, extra).catch(() => {})
+      await clear()
       throw toolError('sh: the command is ' + Buffer.byteLength(cmd) + ' bytes, over what ' + tool + ' takes, and writing it to ' + file + ' failed (' + e.message + '); write it to a file yourself and run sh("bash <file>")', { id: e && e.codemodeId })
     }
-    return run(tool, 'bash ' + file + '; rc=$?; rm -rf ' + folder + '; exit $rc', extra)
+    let r
+    try {
+      r = await run(tool, 'bash ' + file + '; rc=$?; rm -rf ' + folder + '; exit $rc', extra)
+    } catch (e) {
+      await clear()
+      throw e
+    }
+    if (r.denied || typeof r.exitCode !== 'number') await clear()
+    return r
   }
   const tooLong = (cmd, tool) =>
     toolError('sh: the command is ' + Buffer.byteLength(cmd) + ' bytes, over the ' + LIMIT + '-byte limit of ' + tool + '; pass { stage: true } to run it from a private file written through write(), and know that the shell tool\'s hooks then only see "bash <file>" (the write tool\'s hooks see the whole command), or write it yourself and run sh("bash <file>")')
@@ -364,7 +408,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (stage) return viaFile(tool, cmd, extra)
       throw tooLong(cmd, tool)
     }
-    const r = await req('call', { tool, args: { ...extra, command: cmd } })
+    const args = LEAN_SHELL.test(tool) && !('raw' in extra) ? { raw: true, ...extra, command: cmd } : { ...extra, command: cmd }
+    const r = await req('call', { tool, args, foreground: true })
     if (r.denied) return r
     if (typeof r.exitCode === 'number') return shResult(r.shellText ?? r.text ?? r.error ?? '', r.exitCode, tool)
     if (r.ok) return shResult(r.shellText ?? r.text, 0, tool)
@@ -378,6 +423,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const extra = opts && typeof opts === 'object' ? { ...opts } : {}
     const stage = extra.stage === true
     delete extra.stage
+    for (const k of Object.keys(extra)) if (/background/i.test(k) && !extra[k]) delete extra[k]
     if (Object.keys(extra).some((k) => /background/i.test(k))) throw toolError('sh() waits for its command and gives its exit code, so it starts no background job; call the shell tool directly for that')
     const order = shells()
     if (!order.length) throw toolError('sh: this session has no shell tool (no Bash, and no lean-ctx shell; CODEMODE_SHELL can name one)')
@@ -393,24 +439,34 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let offset = 1
     let limit = 2000
     let stubbed = 0
+    let tried = new Set()
+    let cap = 2000
     for (;;) {
       const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true })
       if (!r.ok) {
-        if (/exceeds maximum allowed/i.test(String(r.error)) && limit > 1) { limit = Math.max(1, Math.floor(limit / 2)); continue }
+        if (/exceeds maximum allowed/i.test(String(r.error))) {
+          tried.add(limit)
+          cap = Math.min(cap, limit - 1)
+          limit = pickLimit(limit, tried, cap, Math.floor(limit / 2))
+          if (limit) continue
+        }
         throw toolError('read: ' + r.error, r)
       }
       const t = String(r.text)
       if (isDedup(t)) {
-        if (++stubbed > 6) throw toolError('read: Read keeps answering with a stub, not the file: ' + t.slice(0, 200), r)
-        limit = Math.max(1, Math.min(limit, 2000) - 1 - Math.floor(Math.random() * Math.min(400, Math.floor(limit / 2))))
+        tried.add(limit)
+        limit = ++stubbed > 6 ? 0 : pickLimit(limit, tried, cap, Math.max(1, Math.min(limit, 2000) - 1 - Math.floor(Math.random() * Math.min(400, Math.floor(limit / 2)))))
+        if (!limit) throw toolError('read: Read keeps answering with a stub, not the file: ' + t.slice(0, 200), r)
         continue
       }
-      const got = t.split('\n').filter((l) => /^\s*\d+\t/.test(l)).map((l) => l.replace(/^\s*\d+\t/, ''))
-      if (!got.length && t.trim() && !/^\s*<system-reminder>/.test(t))
+      const got = fileLines(t).map((l) => l.replace(/^\s*\d+\t/, ''))
+      if (!got.length && t.trim() && !NOTICE.test(t))
         throw toolError('read: Read answered with no file lines (a picture, a binary file, or a hook rewrote the answer): ' + t.slice(0, 200), r)
       rows.push(...got)
       if (got.length < limit) break
       offset += got.length
+      tried = new Set()
+      cap = 2000
     }
     seen.add(file)
     return rows.join('\n')
@@ -441,24 +497,35 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (!now) throw toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
     r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now, new_text: body } })
     if (r.ok) return 'wrote ' + file
-    throw toolError('write: ' + r.error, r)
+    throw toolError('write: ' + r.error + endings(r.error), r)
   }
   const edit = async (path, from, to, opts) => {
     const file = absOnly(path, 'edit')
-    const force = !!(opts && typeof opts === 'object' && opts.force)
+    const o = opts && typeof opts === 'object' ? opts : {}
+    const force = !!o.force
+    const all = !!o.all
+    const unread = (r) => toolError('edit: ' + file + ' has not been read in this session: read(path) it first, or pass { force: true } to read it and edit it', r)
     if (usable('Edit')) {
-      const r = await req('call', { tool: 'Edit', args: { file_path: file, old_string: String(from), new_string: String(to) } })
+      const args = { file_path: file, old_string: String(from), new_string: String(to), ...(all ? { replace_all: true } : {}) }
+      let r = await req('call', { tool: 'Edit', args })
+      if (!r.ok && UNREAD.test(String(r.error))) {
+        if (!force) throw unread(r)
+        await read(file)
+        r = await req('call', { tool: 'Edit', args })
+      }
       if (r.ok) return 'edited ' + file
-      if (UNREAD.test(String(r.error))) throw toolError('edit: ' + file + ' has not been read in this session: read(path) it first', r)
       if (r.denied && r.alt) denied.add('Edit')
-      throw toolError('edit: ' + r.error, r)
+      throw toolError('edit: ' + r.error + endings(r.error), r)
     }
     const patch = patcher()
     if (!patch) throw toolError('edit: this session has no Edit tool and no patch tool')
-    if (!force && !seen.has(file)) throw toolError('edit: ' + file + ' has not been read in this session: read(path) it first, or pass { force: true }')
-    const r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: String(from), new_text: String(to) } })
+    if (!seen.has(file)) {
+      if (!force) throw unread()
+      await read(file)
+    }
+    const r = await req('call', { tool: patch, args: { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) } })
     if (r.ok) return 'edited ' + file
-    throw toolError('edit: ' + r.error, r)
+    throw toolError('edit: ' + r.error + endings(r.error), r)
   }
   const deadline = () => Math.max(0, started + timeout - Date.now())
   const waitFor = async (check, opts) => {
@@ -517,7 +584,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     tools, call, ALL_TOOLS: listed, searchTools,
     TEXT: new Proxy(Object.freeze(Object.assign(Object.create(null), texts || {})), {
       get: (t, k) => {
-        if (typeof k !== 'string' || k in t) return t[k]
+        if (typeof k !== 'string' || k in t || k === 'then' || k === 'toJSON') return t[k]
         throw new ReferenceError('TEXT.' + k + ' is no // @text block; the blocks here are: ' + (Object.keys(t).join(', ') || 'none'))
       },
     }),
@@ -552,7 +619,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (value !== undefined) keep('item', show(value), value)
     await sleep(0)
     const late = leftover()
-    if (late !== undefined) throw late
+    if (late) throw late.reason === undefined ? new Error('a promise was rejected with no reason (undefined), and nothing handled it') : late.reason
   } catch (err) {
     if (!(err instanceof Exit)) {
       failure = clean(err, script)
@@ -591,6 +658,8 @@ export const extractText = (script: string): { script: string; texts: Record<str
   let word = ''
   const KEYWORDS = new Set(['return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'new', 'delete', 'void', 'throw', 'await', 'yield', 'instanceof'])
   const parens: boolean[] = []
+  const braces: boolean[] = []
+  let before = ''
   const scan = (l: string) => {
     for (let i = 0; i < l.length; i++) {
       const ch = l[i] as string
@@ -622,7 +691,7 @@ export const extractText = (script: string): { script: string; texts: Record<str
         i++
         continue
       }
-      if (ch === '/' && (prev === '' || '(,=:[!&|?{};+-*%<>~^}'.includes(prev) || KEYWORDS.has(word))) {
+      if (ch === '/' && (prev === '' || '(,=:[!&|?{};+-*%<>~^}A'.includes(prev) || KEYWORDS.has(word))) {
         let cls = false
         for (i++; i < l.length; i++) {
           const c = l[i]
@@ -645,6 +714,7 @@ export const extractText = (script: string): { script: string; texts: Record<str
       if (/[\w$]/.test(ch)) {
         let j = i
         while (j < l.length && /[\w$]/.test(l[j] as string)) j++
+        before = word
         word = l.slice(i, j)
         prev = 'a'
         i = j - 1
@@ -656,9 +726,22 @@ export const extractText = (script: string): { script: string; texts: Record<str
         word = ''
         continue
       }
-      if (ch === '(') parens.push(['if', 'while', 'for', 'with'].includes(word))
+      if (ch === '(') parens.push(['if', 'while', 'for', 'with'].includes(word) || (word === 'await' && before === 'for'))
       if (ch === ')') {
         prev = parens.pop() ? ';' : ')'
+        word = ''
+        continue
+      }
+      if (ch === '>' && prev === '=') {
+        prev = 'A'
+        word = ''
+        continue
+      }
+      if (ch === '{') braces.push(prev !== '' && prev !== 'A' && '(,=:[!&|?+-*%<>~^'.includes(prev) || (prev === 'a' && KEYWORDS.has(word) && word !== 'else' && word !== 'do'))
+      if (ch === '}' && !(typeof top === 'number' && top === 0)) {
+        const expression = braces.pop()
+        if (typeof top === 'number') stack[stack.length - 1] = top - 1
+        prev = expression ? ')' : '}'
         word = ''
         continue
       }
@@ -671,10 +754,8 @@ export const extractText = (script: string): { script: string; texts: Record<str
       if (typeof top === 'number') {
         if (ch === '{') stack[stack.length - 1] = top + 1
         else if (ch === '}') {
-          if (top === 0) {
-            stack.pop()
-            prev = '"'
-          } else stack[stack.length - 1] = top - 1
+          stack.pop()
+          prev = '"'
         }
       }
     }
@@ -738,7 +819,33 @@ const countLines = (s: string) => {
   return n
 }
 
-export const cutPart = (s: string, budget: number, firstLine: number, file?: string) => {
+const utf8 = (s: string) => {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c < 0x80) n += 1
+    else if (c < 0x800) n += 2
+    else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
+      n += 4
+      i++
+    } else n += 3
+  }
+  return n
+}
+const LONG_LINE = 50_000
+const longest = (s: string) => {
+  let most = 0
+  for (let at = 0; at < s.length; ) {
+    const nl = s.indexOf('\n', at)
+    const end = nl < 0 ? s.length : nl
+    most = Math.max(most, end - at)
+    at = end + 1
+  }
+  return most
+}
+const shellWord = (s: string) => `'${s.split("'").join("'\\''")}'`
+
+export const cutPart = (s: string, budget: number, firstLine: number, file?: string, firstByte = 0) => {
   const noteRoom = 70 + (file ? file.length + 80 : 0)
   const keptRoom = Math.min(1200, Math.floor(budget / 4))
   const room = Math.max(0, budget - noteRoom - keptRoom)
@@ -753,7 +860,9 @@ export const cutPart = (s: string, budget: number, firstLine: number, file?: str
   const gone = s.slice(a, b)
   const from = firstLine + countLines(s.slice(0, a))
   const to = Math.max(from, firstLine + countLines(s.slice(0, b)) - (s[b - 1] === '\n' ? 1 : 0))
-  const back = file ? `; read them back with tools.Read({ file_path: ${JSON.stringify(file)}, offset: ${from}, limit: ${to - from + 1} })` : ''
+  const byRange = file !== undefined && longest(gone) > LONG_LINE
+  const range = byRange ? `tail -c +${firstByte + utf8(s.slice(0, a)) + 1} ${shellWord(file)} | head -c ${utf8(gone)}` : ''
+  const back = !file ? '' : byRange ? `; read them back with sh(${JSON.stringify(range)})` : `; read them back with tools.Read({ file_path: ${JSON.stringify(file)}, offset: ${from}, limit: ${to - from + 1} })`
   const errs: string[] = []
   let used = 0
   for (const l of gone.split('\n')) {
@@ -776,7 +885,7 @@ export const fit = (all: string[], max: number, file?: string, tailCount = 0): s
   const bodyText = body.join('\n')
   let tail = all.slice(all.length - keep).join('\n')
   const tailLine = body.length ? countLines(bodyText) + 2 : 1
-  if (tail.length > max / 2) tail = cutPart(tail, Math.floor(max / 2), tailLine, file)
+  if (tail.length > max / 2) tail = cutPart(tail, Math.floor(max / 2), tailLine, file, body.length ? utf8(bodyText) + 1 : 0)
   const room = Math.max(0, max - tail.length - (tail && body.length ? 1 : 0))
   const groups = Math.max(1, Math.min(40, Math.floor(room / 400)))
   const smallMax = Math.floor(room / (2 * groups))
@@ -814,12 +923,15 @@ export const fit = (all: string[], max: number, file?: string, tailCount = 0): s
     left -= budget[i] as number
   })
   let line = 1
+  let byte = 0
   let out = parts
     .map((p, i) => {
       const at = line
+      const from = byte
       line += countLines(p) + 1
+      byte += utf8(p) + 1
       const b = budget[i] as number
-      return p.length <= b ? p : cutPart(p, b, at, file)
+      return p.length <= b ? p : cutPart(p, b, at, file, from)
     })
     .join('\n')
   if (out.length > room) {
@@ -1013,6 +1125,31 @@ const readPaths = new Set<string>()
 const deniedTools = new Map<string, { alt?: string; at: number }>()
 const failedScripts = new Map<string, { first: string; at: number }>()
 
+const READ = Symbol('read')
+const readProgress = new Map<string, number>()
+const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
+const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number) => {
+  for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
+  for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
+  return 0
+}
+const wholeRead = (file: string, offset: unknown, limit: unknown, text: string): boolean => {
+  if (isStub(text)) return false
+  const rows = text.split('\n').filter((l) => /^\s*\d+\t/.test(l)).length
+  if (!rows && !NOTICE.test(text)) return false
+  if (offset === undefined && limit === undefined) return true
+  const from = typeof offset === 'number' ? offset : 1
+  const size = typeof limit === 'number' ? limit : 2000
+  const next = from === 1 ? 1 : readProgress.get(file)
+  if (next !== from) return false
+  if (rows >= size) {
+    readProgress.set(file, from + rows)
+    if (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
+    return false
+  }
+  readProgress.delete(file)
+  return true
+}
 const SHELL_RE = /^Bash$|(?:^|_)shell$/i
 const HOOK_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:\S+ hook (?:error|denied)/i
 const WHOLE_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:(\S+) hook error: \[DENIED\] [A-Za-z ]{1,60} blocked\. Use: ([A-Za-z0-9_-]+)\(/
@@ -1131,6 +1268,7 @@ export const register: Register = (on) => {
     const kept = (await $.store.get('denied').catch(() => undefined)) as Record<string, { alt?: string; at?: number }> | undefined
     deniedTools.clear()
     readPaths.clear()
+    readProgress.clear()
     failedScripts.clear()
     for (const [n, v] of Object.entries(kept && typeof kept === 'object' ? kept : {}))
       if (v && Date.now() - Number(v.at ?? 0) < DENIED_MS && (names.size === 0 || (typeof v.alt === 'string' && names.has(v.alt)))) deniedTools.set(n, { alt: v.alt, at: Number(v.at) })
@@ -1284,6 +1422,7 @@ export const register: Register = (on) => {
         Object.entries((p.args as Record<string, unknown> | null) ?? {}).filter(([k]) => !RESERVED.has(k)),
       )
       const args: Record<string, unknown> = { ...(defaults[tool] ?? {}), ...given }
+      if (p.foreground === true) for (const k of Object.keys(args)) if (/background/i.test(k)) delete args[k]
       if (tool === 'Read' && typeof args.file_path === 'string') args.file_path = absolute(args.file_path, cwd, home)
       // Plugins cannot run the Agent tool; codemode-agents spawns instead.
       const target = tool === 'Agent' || tool === 'Task' ? AGENTS_TOOL : tool
@@ -1360,22 +1499,25 @@ export const register: Register = (on) => {
           tally.arg ??= firstArg(args)
           return { ok: false, error: `The result of ${tool} is ${text.length} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
         }
-        if (tool === 'Read' && typeof args.file_path === 'string') {
-          readPaths.add(args.file_path)
-          if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
-        }
+        const whole = tool === 'Read' && typeof args.file_path === 'string' && wholeRead(args.file_path, args.offset, args.limit, text)
         if (isStub(text) && p.handled !== true) {
           stubs.add(tool)
           if (/read-dedup/.test(text)) deduped = true
         }
-        return { ok: true, text, result, ...exit }
+        return { ok: true, text, result, ...exit, ...(whole ? { [READ]: args.file_path } : {}) }
       }
       const bad = tidy(tool, text)
       if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
         const at = args.file_path.lastIndexOf('/')
         const folder = args.file_path.slice(0, at) || '/'
         const listed = ((await $.fs.list(folder).catch(() => [])) ?? []).map((x) => x.name)
-        const near = nearNames(args.file_path.slice(at + 1), listed).map((n) => `${folder === '/' ? '' : folder}/${n}`)
+        const near: string[] = []
+        for (const n of nearNames(args.file_path.slice(at + 1), listed)) {
+          const path = `${folder === '/' ? '' : folder}/${n}`
+          const probe = await $.tool.call({ file_path: path, limit: 1, tool: 'Read' } as never).catch(() => undefined)
+          const said = String(probe?.text ?? '')
+          if (probe && probe.deny === undefined && !(probe.isError === true && HOOK_RE.test(said))) near.push(path)
+        }
         if (near.length) bad.message = `${bad.message} Similar files: ${near.join(', ')}`
       }
       // Learned from built-ins only: an MCP server writes its own error text.
@@ -1396,6 +1538,8 @@ export const register: Register = (on) => {
       let offset = 1
       let limit = 2000
       let stubbed = 0
+      let tried = new Set<number>()
+      let cap = 2000
       const file = String(args.file_path)
       for (let guard = 0; guard < 10_000; guard++) {
         if (over) return undefined
@@ -1404,24 +1548,29 @@ export const register: Register = (on) => {
         if (r.deny !== undefined) return { error: `Reading ${file} in pages stopped at line ${offset}: ${r.deny}` }
         const t = String(r.text ?? show(r.result))
         if (r.isError) {
-          if (/exceeds maximum allowed/i.test(t) && limit > 1) {
-            limit = Math.max(1, Math.floor(limit / 2))
-            continue
+          if (/exceeds maximum allowed/i.test(t)) {
+            tried.add(limit)
+            cap = Math.min(cap, limit - 1)
+            limit = pickLimit(limit, tried, cap, Math.floor(limit / 2))
+            if (limit) continue
           }
           return offset > 1 ? { error: `Reading ${file} in pages stopped at line ${offset}: ${t.slice(0, 300)}` } : undefined
         }
         if (isStub(t) && /read-dedup/.test(t)) {
-          if (++stubbed > 6) return { error: `Reading ${file} in pages: Read keeps answering with a stub, not the file` }
-          limit = Math.max(2, Math.min(limit, 2000) - 1 - Math.floor(Math.random() * Math.min(400, Math.floor(limit / 2))))
+          tried.add(limit)
+          limit = ++stubbed > 6 ? 0 : pickLimit(limit, tried, cap, Math.max(1, Math.min(limit, 2000) - 1 - Math.floor(Math.random() * Math.min(400, Math.floor(limit / 2)))))
+          if (!limit) return { error: `Reading ${file} in pages: Read keeps answering with a stub, not the file` }
           continue
         }
         const rows = t.split('\n').filter((l) => /^\s*\d+\t/.test(l))
-        if (!rows.length && t.trim() && !/^\s*<system-reminder>/.test(t)) return { error: `Reading ${file} in pages stopped at line ${offset}: Read answered with no file lines: ${t.slice(0, 200)}` }
+        if (!rows.length && t.trim() && !NOTICE.test(t)) return { error: `Reading ${file} in pages stopped at line ${offset}: Read answered with no file lines: ${t.slice(0, 200)}` }
         size += t.length
         if (size > MAX_REPLY) return { error: `${file} is too large to pass to the script whole (over ${MAX_REPLY} chars); read it with read(path), which reads in pages, or with offset and limit` }
         if (rows.length) pages.push(rows.join('\n'))
         if (rows.length < limit) break
         offset += rows.length
+        tried = new Set()
+        cap = 2000
       }
       return { text: pages.join('\n') }
     }
@@ -1453,17 +1602,31 @@ export const register: Register = (on) => {
       if (over) return
       const file = `${dir}/${m.id}.json`
       // Tracked whole, fallbacks included, so the run dir is removed only after it.
-      const reply = (async () => {
-        try {
-          await $.fs.write(file, JSON.stringify(out))
-        } catch {
-          const size = typeof out.text === 'string' ? out.text.length : 0
-          const tool = String((m.payload as { tool?: unknown }).tool ?? 'the tool')
-          const slim = { ok: out.ok, error: out.error, text: out.shellText ?? out.text, exitCode: out.exitCode }
-          const failed = { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
-          await $.fs.write(file, JSON.stringify(slim)).catch(() => $.fs.write(file, JSON.stringify(failed)).catch(() => {}))
+      const delivered = (async () => {
+        if (await $.fs.write(file, JSON.stringify(out)).then(() => true, () => false)) return true
+        const size = typeof out.text === 'string' ? out.text.length : 0
+        const tool = String((m.payload as { tool?: unknown }).tool ?? 'the tool')
+        const sameText = out.result === out.text
+        const base = { ok: out.ok, error: out.error, text: out.shellText ?? out.text, exitCode: out.exitCode }
+        const slim = sameText ? { ...base, resultIsText: true } : { ...base, result: out.result }
+        if (await $.fs.write(file, JSON.stringify(slim)).then(() => true, () => false)) return true
+        if (!sameText && (await $.fs.write(file, JSON.stringify({ ...base, droppedResult: true })).then(() => true, () => false))) return true
+        const failed = { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
+        const t = calls.get(tool)
+        if (t && out.ok) {
+          t.ok--
+          t.failed++
         }
+        await $.fs.write(file, JSON.stringify(failed)).catch(() => {})
+        return false
       })()
+      const reply = delivered.then((ok) => {
+        const path = out[READ as never] as unknown
+        if (ok && typeof path === 'string') {
+          readPaths.add(path)
+          if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
+        }
+      })
       writes.add(reply)
       await reply
     }

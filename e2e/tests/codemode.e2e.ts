@@ -396,7 +396,7 @@ test('A rejection the script catches later does not fail the run', () => {
 
 test('One oversized item written past the runner is trimmed to the mod\'s own cap', () => {
   const out = run({ steps: [{ script: 'const p = Buffer.constructor("return process")()\np.stdout.write("\\x1eCM" + JSON.stringify({ out: "item", text: "x".repeat(2000000) }) + "\\n")\nreturn "end"' }] });
-  const spill = out.results[0]!.text.match(/file_path: "([^"]+)"/)![1]!;
+  const spill = out.results[0]!.text.match(/(\/[^"' ]+\/\.claude\/codemode\/out\/[^"' ]+\.txt)/)![1]!;
   expect(readFileSync(spill, 'utf8').length).toBeLessThanOrEqual(1_100_000);
 });
 
@@ -643,7 +643,7 @@ test('A rejected tool call nobody awaited is labelled a tool failure', () => {
 test('The mod holds its own output cap even when a script writes past the runner', () => {
   const out = run({ steps: [{ script: 'const p = Buffer.constructor("return process")()\nfor (let i = 0; i < 4; i++) p.stdout.write("\\x1eCM" + JSON.stringify({ out: "item", text: "x".repeat(1000000) }) + "\\n")\nreturn "end"' }] });
   const t = out.results[0]!.text;
-  const spill = t.match(/file_path: "([^"]+)"/)![1]!;
+  const spill = t.match(/(\/[^"' ]+\/\.claude\/codemode\/out\/[^"' ]+\.txt)/)![1]!;
   expect(readFileSync(spill, 'utf8').length).toBeLessThanOrEqual(1_100_000);
 });
 
@@ -894,7 +894,7 @@ test('A big object holding undefined and functions prints as valid JSON', () => 
 test('A second read() of a file that fits one or two lines per page never repeats the same page request', () => {
   const dir = scratch();
   const f = join(dir, 'wide.txt');
-  writeFileSync(f, Array.from({ length: 4 }, (_, i) => String(i).repeat(50000)).join('\n'));
-  const out = run({ tools: NO_BASH, dedupReads: true, steps: [{ script: 'const a = await read(' + JSON.stringify(f) + ')\nconst b = await read(' + JSON.stringify(f) + ')\nreturn String(a === b && a.length === 200003)' }] });
+  writeFileSync(f, Array.from({ length: 4 }, (_, i) => String(i).repeat(49000)).join('\n'));
+  const out = run({ tools: NO_BASH, dedupReads: true, steps: [{ script: 'const a = await read(' + JSON.stringify(f) + ')\nconst b = await read(' + JSON.stringify(f) + ')\nreturn String(a === b && a.length === 196003)' }] });
   expect(out.results[0]!.text).toBe('true');
 });

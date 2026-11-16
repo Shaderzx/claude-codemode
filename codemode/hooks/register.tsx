@@ -366,7 +366,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const noteRead = (tool, args, r) => {
     const target = args && (typeof args.file_path === 'string' ? args.file_path : args.path)
     if (r.ok && r.whole === true && typeof target === 'string') seen.add(abs(target))
+    if (r.ok && Array.isArray(r.readNow)) for (const f of r.readNow) seen.add(f)
     delete r.whole
+    delete r.readNow
     if (r.denied && r.alt) denied.add(tool)
     else if (r.ok) denied.delete(tool)
   }
@@ -432,19 +434,38 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const runningJob = (t) => {
     try {
       const j = JSON.parse(String(t))
-      return j && typeof j.jobId === 'string' && j.state === 'running' ? j.jobId : undefined
+      return j && typeof j.jobId === 'string' && /^shell_[0-9a-f]{16}$/.test(j.jobId) && j.state === 'running' && typeof j.summary === 'string' ? j.jobId : undefined
     } catch { return undefined }
+  }
+  const expandPages = async (expand, id, total, chars) => {
+    const rows = []
+    for (let s = 1; s <= total; ) {
+      const r = await req('call', { tool: expand, args: { id, start_line: s, end_line: Math.min(total, s + 499) }, handled: true })
+      const got = r.ok ? String(r.text).split('\n').map((l) => /^\s*(\d+)\|(.*)$/.exec(l)).filter(Boolean) : []
+      if (!got.length) throw toolError('sh: the command finished, but lean-ctx archive ' + id + ' could not be read from line ' + s + ': ' + String(r.error ?? r.text).slice(0, 200), r)
+      for (const m of got) rows.push(m[2])
+      s = Number(got[got.length - 1][1]) + 1
+    }
+    const text = rows.join('\n')
+    return text.length + 1 === chars ? text + '\n' : text
   }
   const archived = async (id) => {
     if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) return ''
-    if (names.has('Read') && home) {
-      const text = await read(home + '/.local/share/lean-ctx/archives/' + id.slice(0, 2) + '/' + id + '.txt').catch(() => undefined)
-      if (text !== undefined) return text
-    }
     const expand = named(/^mcp__lean[-_]ctx__(?:ctx_)?expand$/)[0]
-    if (!expand) return ''
-    const r = await req('call', { tool: expand, args: { id } })
-    return r.ok ? String(r.text).replace(/^Archive [^\n]*:\n/, '') : ''
+    if (expand) {
+      const r = await req('call', { tool: expand, args: { id } })
+      const t = String(r.text ?? '')
+      const head = r.ok ? /^Archive [^\n]*?\((\d+) chars, (\d+) lines\):\n/.exec(t) : null
+      if (head && !/\n\[… truncated at [^\n]*\]\n\[Original available[^\n]*\]\s*$/.test(t)) return t.slice(head[0].length)
+      if (head) return expandPages(expand, id, Number(head[2]), Number(head[1]))
+      if (r.ok && isStubText(t)) return t
+    }
+    if (!names.has('Read') || !home) throw toolError('sh: the command finished, but its output in lean-ctx archive ' + id + ' could not be fetched (no ctx_expand and no Read here)')
+    try {
+      return await read(home + '/.local/share/lean-ctx/archives/' + id.slice(0, 2) + '/' + id + '.txt')
+    } catch (e) {
+      throw toolError('sh: the command finished, but its output in lean-ctx archive ' + id + ' could not be read: ' + e.message)
+    }
   }
   const follow = async (tool, id) => {
     for (let wait = 200; ; wait = Math.min(wait * 2, 2000)) {
@@ -456,7 +477,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         let j
         try { j = JSON.parse(String(s.shellText ?? s.text)) } catch { j = undefined }
         if (j && j.state === 'running') continue
-        if (j && j.state === 'completed') return shResult(await archived(j.archiveId), Number(j.exitCode) || 0, tool)
+        if (j && j.state === 'completed') {
+          const done = shResult(await archived(j.archiveId), Number(j.exitCode) || 0, tool)
+          if (j.archiveTruncated === true) done.truncated = true
+          return done
+        }
         throw toolError('sh: background job ' + id + ' on ' + tool + ' answered: ' + String(s.text).slice(0, 300), s)
       }
       const failed = /^\s*\[background:[^\]\n]*failed, exit (\d+)\]\n?([\s\S]*?)\n*(?:\[exit:\d+[^\]\n]*\])?\s*$/.exec(String(s.error ?? ''))
@@ -577,7 +602,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (!now) throw toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
     r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now, new_text: body } })
     if (r.ok) return wrote(file)
-    if (/not found/i.test(String(r.error)) && !now.includes('\r')) {
+    if (!r.refused && !r.denied && /not found/i.test(String(r.error)) && !now.includes('\r')) {
       r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now.split('\n').join('\r\n'), new_text: body } })
       if (r.ok) return wrote(file)
     }
@@ -1647,9 +1672,16 @@ export const register: Register = (on) => {
       tally.open++
       open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
       const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
-      const patchPath = typeof args.path === 'string' && !args.path.trim().startsWith('~') ? absolute(args.path.trim(), cwd, home) : undefined
-      const patchTarget = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && patchPath?.startsWith('/') && String(args.op) !== 'create' ? patchPath : undefined
-      const patchFresh = patchTarget !== undefined && readPaths.has(patchTarget) && readVersions.get(patchTarget) !== undefined && readVersions.get(patchTarget) === (await versionOf(patchTarget))
+      const patchPath = (v: unknown) => (typeof v === 'string' && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
+      const patchOps = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+        ? (Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : [args])
+            .map((o) => ({ op: String(o?.op ?? ''), path: patchPath(o?.path) }))
+            .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))
+        : []
+      const patchFresh = new Map<string, boolean>()
+      for (const o of patchOps)
+        if (o.op !== 'create' && !patchFresh.has(o.path))
+          patchFresh.set(o.path, readPaths.has(o.path) && readVersions.get(o.path) !== undefined && readVersions.get(o.path) === (await versionOf(o.path)))
       let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
         tally.open--
         tally.failed++
@@ -1666,7 +1698,7 @@ export const register: Register = (on) => {
         tool === 'Read' &&
         !r.isError &&
         args.limit === undefined &&
-        (infoOf(r.result)?.truncatedByTokenCap === true || (args.offset === undefined && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
+        (infoOf(r.result)?.truncatedByTokenCap === true || ((args.offset === undefined || args.offset === 1) && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
       if (tool === 'Read' && args.limit === undefined && (capped || (r.isError && /exceeds maximum allowed (?:tokens|size)/i.test(String(r.text ?? show(r.result)))))) {
         const paged = await pageRead(args)
         if (paged?.text !== undefined) r = { text: paged.text, result: paged.result } as typeof r
@@ -1723,8 +1755,8 @@ export const register: Register = (on) => {
           tally.arg ??= firstArg(args)
           return { ok: false, error: `The result of ${tool} is ${text.length} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
         }
-        const target = typeof args.file_path === 'string' ? args.file_path : patchPath
-        const wrote = tool === 'Write' || tool === 'Edit' || (/^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && ['create', 'replace_unique', 'replace_all'].includes(String(args.op)))
+        const target = typeof args.file_path === 'string' ? args.file_path : undefined
+        const wrote = tool === 'Write' || tool === 'Edit'
         const moved = p.foreground === true && tool === 'Bash' ? (r.result as { backgroundTaskId?: unknown } | undefined)?.backgroundTaskId : undefined
         if (moved !== undefined) {
           tally.ok--
@@ -1732,10 +1764,18 @@ export const register: Register = (on) => {
           tally.arg ??= firstArg(args)
           return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
         }
-        const patched = patchTarget !== undefined
-        if (patched && !patchFresh) {
-          readPaths.delete(patchTarget)
-          readVersions.delete(patchTarget)
+        const readNow: string[] = []
+        for (const o of patchOps) {
+          if (o.op === 'create' || patchFresh.get(o.path) === true) {
+            const version = await versionOf(o.path)
+            readPaths.add(o.path)
+            if (version === undefined) readVersions.delete(o.path)
+            else readVersions.set(o.path, version)
+            readNow.push(o.path)
+          } else {
+            readPaths.delete(o.path)
+            readVersions.delete(o.path)
+          }
         }
         const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
         if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
@@ -1752,7 +1792,7 @@ export const register: Register = (on) => {
         const receipt =
           tool === 'Read' && typeof args.file_path === 'string'
             ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined)
-            : wrote && typeof target === 'string' && target.startsWith('/') && (!patched || patchFresh)
+            : wrote && typeof target === 'string' && target.startsWith('/')
               ? ({ file: normal(target), whole: true } as Receipt)
               : undefined
         if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
@@ -1761,7 +1801,7 @@ export const register: Register = (on) => {
           stubs.add(tool)
           if (/read-dedup/.test(text)) deduped = true
         }
-        return { ok: true, text, result, ...exit, ...(receipt?.whole ? { whole: true } : {}), ...(receipt ? { [READ]: receipt } : {}) }
+        return { ok: true, text, result, ...exit, ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}) }
       }
       const bad = tidy(tool, text)
       if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
@@ -1883,6 +1923,7 @@ export const register: Register = (on) => {
         const version = readVersions.get(receipt.file)
         const progress = readProgress.get(receipt.file)
         undo = () => {
+          if (readVersions.get(receipt.file) !== receipt.version || readProgress.get(receipt.file)?.next !== (receipt.whole ? undefined : receipt.next)) return
           if (!had) readPaths.delete(receipt.file)
           if (version === undefined) readVersions.delete(receipt.file)
           else readVersions.set(receipt.file, version)

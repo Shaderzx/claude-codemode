@@ -471,7 +471,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       return inBytes(file, why)
     }
   }
-  const BYTE_STEP = 22000
+  const BYTE_STEP = 21000
   const inBytes = async (file, why) => {
     const order = shells()
     if (!order.length) throw why
@@ -489,7 +489,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (part.length !== Math.min(BYTE_STEP, size - at)) throw why
       parts.push(part)
     }
-    return Buffer.concat(parts).toString('utf8')
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(parts))
+    } catch {
+      throw why
+    }
   }
   const archived = async (id) => {
     if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) return ''
@@ -524,6 +528,12 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (!isStubText(body) && !/^\s*\[Firewalled /.test(body)) return body
     return archived(namedArchive(body) ?? id)
   }
+  const EXIT_TAIL = /\n\[exit:(\d+)\]\n?$/
+  const exitless = (text, code) => {
+    const m = EXIT_TAIL.exec(String(text))
+    if (!m || (code !== undefined && Number(m[1]) !== code)) return { text, code }
+    return { text: Object.assign(new String(String(text).slice(0, m.index)), text && text.withheld === true ? { withheld: true } : {}), code: Number(m[1]) }
+  }
   const LEAN_CUT = /\n?\[… truncated at ~\d+ of \d+ tokens — the full output is archived — see the next line\]\n\[Original available via ctx_expand id=([A-Za-z0-9_-]+)\]\s*$/
   const ADVICE = /\n\[ctx_shell: [^\n]*\]\s*$/
   const follow = async (tool, id) => {
@@ -550,7 +560,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         const inline = failed[2]
         const whole = !s.cut && !isStubText(inline) && !/^\s*\[Firewalled /.test(inline)
         const expandable = named(/^mcp__lean[-_]ctx__(?:ctx_)?expand$/).length > 0
-        const out = expandable ? await archived(namedArchive(inline) ?? id).catch((e) => (whole ? inline : Promise.reject(e))) : await jobOutput(inline, id)
+        const fetched = expandable ? await archived(namedArchive(inline) ?? id).then((t) => exitless(t, Number(failed[1])).text, (e) => (whole ? inline : Promise.reject(e))) : await jobOutput(inline, id)
+        const out = expandable ? fetched : exitless(fetched, Number(failed[1])).text
         const done = shResult(out, Number(failed[1]), tool)
         if (s.cut && !expandable) {
           done.truncated = true
@@ -578,7 +589,12 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (lean && !r.denied) {
       const out = String(r.shellText ?? r.text ?? r.error ?? '').replace(ADVICE, '')
       const kept = LEAN_CUT.exec(out)
-      if (kept) return shResult(await archived(kept[1]), typeof r.exitCode === 'number' ? r.exitCode : r.ok ? 0 : undefined, tool)
+      if (kept) {
+        const whole = await archived(kept[1])
+        if (r.ok) return shResult(whole, typeof r.exitCode === 'number' ? r.exitCode : 0, tool)
+        const back = exitless(whole, typeof r.exitCode === 'number' ? r.exitCode : undefined)
+        return shResult(back.text, back.code, tool)
+      }
       if (withheldText(out)) return shResult(withheldOutput(out), typeof r.exitCode === 'number' ? r.exitCode : r.ok ? 0 : undefined, tool)
       if (r.shellText !== undefined) r.shellText = out
     }
@@ -1441,12 +1457,12 @@ const LEAN_WITHHELD = /^\s*\[lean-ctx[^\]\n]*withheld/i
 const GATEWAY_WITHHELD = /^\s*(?:\[(?:POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway\])|(?:stored output (?:is )?withheld by the context gateway|archive withheld by current policy|Tool may have completed; output withheld by policy)\.?\s*$)/i
 const ENGINE_CUT = /\n\n\.\.\. \[\d+ characters truncated\] \.\.\.\n\n/
 const LEAN_ARCHIVED = /\[Original available via ctx_expand id=[A-Za-z0-9_-]+\]\s*$/
-const SAVED = /^Error: result \(([\d,]+) characters across [\d,]+ lines\) exceeds maximum allowed tokens\. Output has been saved to (\/[^\n]+?\.txt)\.\nFormat: Plain text\n/
+const SAVED = /^Error: result \(([\d,]+) characters across [\d,]+ lines\) exceeds maximum allowed tokens\. Output has been saved to (\/[^\n]+?\.txt)\.\nFormat: [^\n]+\n/
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 const shellQuote = (s: string) => "'" + s.split("'").join("'\\''") + "'"
-export const fromBase64 = (s: string): string | undefined => {
+export const bytesOf = (s: string): number[] | undefined => {
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length % 4 !== 0) return undefined
-  const hex: string[] = []
+  const out: number[] = []
   let acc = 0
   let bits = 0
   for (const ch of s.replace(/=+$/, '')) {
@@ -1454,9 +1470,14 @@ export const fromBase64 = (s: string): string | undefined => {
     bits += 6
     if (bits >= 8) {
       bits -= 8
-      hex.push('%' + ((acc >> bits) & 255).toString(16).padStart(2, '0'))
+      out.push((acc >> bits) & 255)
     }
   }
+  return out
+}
+export const fromUtf8 = (bytes: number[]): string | undefined => {
+  const hex: string[] = []
+  for (const b of bytes) hex.push('%' + b.toString(16).padStart(2, '0'))
   try {
     return decodeURIComponent(hex.join(''))
   } catch {
@@ -1995,20 +2016,22 @@ export const register: Register = (on) => {
     }
 
     const viaBytes = async (shell: string, path: string): Promise<string | undefined> => {
-      const step = 21999
+      const step = 21000
       const extra = shell === 'Bash' ? {} : { raw: true }
       const ask = (command: string) => $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined)
       const sized = await ask('wc -c < ' + shellQuote(path))
       const size = Number(String(sized?.text ?? '').trim())
       if (!sized || sized.isError || sized.deny !== undefined || !Number.isInteger(size)) return undefined
-      const parts: string[] = []
+      const bytes: number[] = []
       for (let at = 0; at < size; at += step) {
         if (over) return undefined
         const r = await ask('tail -c +' + (at + 1) + ' ' + shellQuote(path) + ' | head -c ' + step + ' | base64')
         if (!r || r.isError || r.deny !== undefined) return undefined
-        parts.push(String(r.text ?? '').replace(/\s+/g, ''))
+        const part = bytesOf(String(r.text ?? '').replace(/\s+/g, ''))
+        if (!part || part.length !== Math.min(step, size - at)) return undefined
+        for (const b of part) bytes.push(b)
       }
-      return fromBase64(parts.join(''))
+      return bytes.length === size ? fromUtf8(bytes) : undefined
     }
     const pageRead = async (args: Record<string, unknown>): Promise<{ text?: string; error?: string; result?: unknown } | undefined> => {
       const pages: string[] = []

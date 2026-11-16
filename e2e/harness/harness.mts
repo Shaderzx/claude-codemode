@@ -43,6 +43,12 @@ type Case = {
   jobNoExit?: boolean
   headerOnly?: boolean
   pageWithheld?: boolean
+  leanCap?: number
+  noSwap?: boolean
+  archiveWithheldError?: boolean
+  shellWithheld?: boolean
+  expandEmptyBody?: boolean
+  shellAdvice?: string
 }
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -85,6 +91,28 @@ const jobArchive = new Map<string, string>()
 const shellOk = (t: string) => ok(t, [{ type: 'text', text: t }])
 const firewalled = (id: string, body: string) => '[Firewalled ctx_shell output — ' + body.length + ' chars, ' + body.split('\n').length + ' lines stored out-of-band]\n--- head ---\n' + body.slice(0, 200) + '\n--- retrieve full output ---\nFull:    ctx_expand(id="' + id + '")'
 const archive = (id: string) => join(home, '.local', 'share', 'lean-ctx', 'archives', id.slice(0, 2), id + '.txt')
+let archived = 0
+let swapped = 0
+const tokensOf = (rows: string[]) => rows.reduce((n, l) => n + (l.length > 200 && !/\s/.test(l) ? l.length : Math.ceil(l.length / 4)) + 1, 0)
+const leanReply = (tool: string, r: { code: number; out: string }) => {
+  if (c.shellWithheld) return ok('[lean-ctx gateway: retained output withheld by storage policy]')
+  const advice = c.shellAdvice === undefined ? '' : '\n' + c.shellAdvice
+  const full = r.code ? r.out + '\n[exit:' + r.code + ']' : r.out || '(' + tool + ' completed with no output)'
+  const cap = c.leanCap ?? 56000
+  if (full.length <= cap) return r.code ? err(full + advice) : shellOk(full + advice)
+  const aid = (++archived).toString(16).padStart(16, 'c')
+  mkdirSync(dirname(archive(aid)), { recursive: true })
+  writeFileSync(archive(aid), r.out)
+  const kept: string[] = []
+  let size = 0
+  for (const l of r.out.split('\n')) {
+    if (size + l.length + 1 > cap) break
+    kept.push(l)
+    size += l.length + 1
+  }
+  const text = kept.join('\n') + '\n[… truncated at ~' + Math.round(cap / 1.7) + ' of ' + Math.round(r.out.length / 1.7) + ' tokens — the full output is archived — see the next line]\n[Original available via ctx_expand id=' + aid + ']'
+  return r.code ? err(text) : shellOk(text)
+}
 let bashCwd = ''
 const writePath = (raw: unknown) => {
   const p = String(raw ?? '').trim()
@@ -136,14 +164,14 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         return err('File content (' + Math.round(statSync(p).size / 1024) + 'KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
       if (c.hugePageAt === offset) return ok(numbered(['\\'.repeat(1_200_000), '\\'.repeat(1_200_000)], offset))
       let part = lines.slice(offset - 1, offset - 1 + limit)
-      const tokens = Math.ceil(part.join('\n').length / 4)
+      const tokens = tokensOf(part)
       let cut = false
       if (tokens > 25000) {
         if (typeof a.limit === 'number' && !c.truncateLimited)
           return err('File content (' + tokens + ' tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
         let n = 0
-        for (let size = 0; n < part.length && Math.ceil((size + (part[n] as string).length + 1) / 4) <= 25000; n++) size += (part[n] as string).length + 1
-        part = n ? part.slice(0, n) : [(part[0] as string).slice(0, 100000)]
+        for (let used = 0; n < part.length && used + tokensOf([part[n] as string]) <= 25000; n++) used += tokensOf([part[n] as string])
+        part = n ? part.slice(0, n) : [(part[0] as string).slice(0, /\s/.test(part[0] as string) ? 100000 : 21000)]
         cut = true
       }
       seen.set(key, statSync(p).mtimeMs)
@@ -202,7 +230,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         const limit = typeof a.timeout_ms === 'number' ? a.timeout_ms : c.leanTimeoutMs
         const raced = await Promise.race([shell(command), new Promise<undefined>((r) => setTimeout(() => r(undefined), limit))])
         if (raced === undefined) return err('(timed out after ' + limit + 'ms)\n[exit:124]')
-        return raced.code ? err(raced.out + '\n[exit:' + raced.code + ']') : shellOk(raced.out || '(' + tool + ' completed with no output)')
+        return leanReply(tool, raced)
       }
       if (tool !== 'Bash' && c.detachAfterMs !== undefined) {
         const running = shell(command)
@@ -214,7 +242,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
           void running.then((d) => { j.done = d })
           return ok(JSON.stringify({ jobId: id, state: 'running', summary: 'auto-detached job is still running' }))
         }
-        return raced.code ? err(raced.out + '\n[exit:' + raced.code + ']') : shellOk(raced.out || '(' + tool + ' completed with no output)')
+        return leanReply(tool, raced)
       }
       if (tool === 'Bash' && typeof a.timeout === 'number') {
         const limit = a.timeout
@@ -232,7 +260,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         r.out = '<persisted-output>\nOutput too large (' + (r.out.length / 1024).toFixed(1) + 'KB). Full output saved to: ' + saved + '\n\nPreview (first 2KB):\n' + r.out.slice(0, 2000) + '\n</persisted-output>'
       }
       if (tool === 'Bash') return r.code ? err('<tool_use_error>Exit code ' + r.code + '\n' + r.out + '</tool_use_error>') : ok(r.out)
-      return r.code ? err(r.out + '\n[exit:' + r.code + ']') : shellOk(r.out || '(' + tool + ' completed with no output)')
+      return leanReply(tool, r)
     }
     case 'mcp__lean-ctx__ctx_patch': {
       if (Array.isArray(a.ops)) {
@@ -297,19 +325,29 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
     case 'mcp__lean-ctx__ctx_expand': {
       if (jobs.get(String(a.id))?.done && !jobArchive.has(String(a.id))) return ok("Background job '" + String(a.id) + "' finished (exit " + jobs.get(String(a.id))!.done!.code + ') without output.')
       const id = jobArchive.get(String(a.id)) ?? String(a.id)
-      if (c.archiveWithheld) return ok(c.archiveWithheldText ?? '[lean-ctx gateway: retained output withheld by storage policy]')
+      if (c.archiveWithheld) return (c.archiveWithheldError ? err : ok)(c.archiveWithheldText ?? '[lean-ctx gateway: retained output withheld by storage policy]')
       if (!existsSync(archive(id))) return err('no archive ' + id)
       const body = readFileSync(archive(id), 'utf8')
       const rows = body.replace(/\n$/, '').split('\n')
       const footer = '\n[… truncated at ~4071 of 11023 tokens — use ctx_read with lines= parameter to see specific sections]'
       const head = 'Archive ' + id + ' (' + Buffer.byteLength(body) + ' chars, ' + rows.length + ' lines):\n'
       if (a.start_line === undefined && c.headerOnly) return ok(head.replace(/\n$/, ''))
+      if (a.start_line === undefined && c.expandEmptyBody) return ok(head)
       if (a.start_line !== undefined && c.pageWithheld) return ok('[lean-ctx: content withheld — policy]')
       if (a.start_line === undefined && rows.length === 1 && (rows[0] as string).length > 16000) return ok(head + footer.slice(1))
-      if (a.start_line === undefined) return ok(head + rows.slice(0, 50).join('\n') + (rows.length > 50 ? footer : ''))
+      if (a.start_line === undefined) {
+        const preview: string[] = []
+        let size = 0
+        for (const l of rows.slice(0, 50)) {
+          if (size + l.length + 1 > 16000) break
+          preview.push(l)
+          size += l.length + 1
+        }
+        return ok(head + preview.join('\n') + (preview.length < rows.length ? footer : ''))
+      }
       const from = Number(a.start_line)
       const to = Math.min(Number(a.end_line ?? rows.length), rows.length, from + 99)
-      const shown = rows.slice(from - 1, to).filter((l) => l.length <= 16000).map((l, k) => String(from + k).padStart(6) + '|' + l).join('\n')
+      const shown = rows.slice(from - 1, to).map((l, k) => (l.length <= 16000 ? String(from + k).padStart(6) + '|' + l : '')).filter(Boolean).join('\n')
       return ok('Archive ' + id + ' lines ' + from + '-' + to + ':\n' + shown + (to < Number(a.end_line ?? rows.length) ? footer : ''))
     }
     case 'mcp__t3-code__big_report':
@@ -362,6 +400,13 @@ const $ = {
       const { tool, ...rest } = args
       const r = await fake(String(tool), rest)
       const t = typeof r.text === 'string' ? r.text : undefined
+      if (r.isError !== true && t !== undefined && t.length > 50000 && String(tool).startsWith('mcp__') && !c.noSwap) {
+        const saved = join(c.env?.CLAUDE_CONFIG_DIR ?? join(home, '.claude'), 'projects', 'p', 's', 'tool-results', String(tool).slice(5).replace(/__/g, '-') + '-' + Date.now() + '-' + ++swapped + '.txt')
+        mkdirSync(dirname(saved), { recursive: true })
+        writeFileSync(saved, t)
+        const said = 'Error: result (' + t.length.toLocaleString('en-US') + ' characters across ' + t.split('\n').length.toLocaleString('en-US') + ' lines) exceeds maximum allowed tokens. Output has been saved to ' + saved + '.\nFormat: Plain text\n- For targeted searches (find a line, locate a string): use grep on the file directly.\n- For analysis or summarization that requires reading the full content: read ' + saved + ' in chunks of ~816 lines using offset/limit until you have read 100% of it.\n'
+        return { text: said, result: [{ type: 'text', text: said }] }
+      }
       if (r.isError === true && t !== undefined && t.length > 10000) {
         const cut = t.slice(0, 5000) + '\n\n... [' + (t.length - 10000) + ' characters truncated] ...\n\n' + t.slice(-5000)
         return { ...r, text: cut, result: cut }

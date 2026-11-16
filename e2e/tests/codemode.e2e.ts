@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -775,12 +775,12 @@ test('A denial remembered more than a day ago is tried again', () => {
 });
 
 test('A tool result too big to pass with its text keeps the text and says the structured result was dropped', () => {
-  const text = one('const r = await call("mcp__t3-code__big_report", {})\nreturn [r.ok, r.text.length, r.result === undefined, r.resultDropped].join(" ")', { tools: [...NO_BASH, 'mcp__t3-code__big_report'] });
+  const text = one('const r = await call("mcp__t3-code__big_report", {})\nreturn [r.ok, r.text.length, r.result === undefined, r.resultDropped].join(" ")', { tools: [...NO_BASH, 'mcp__t3-code__big_report'], noSwap: true });
   expect(text).toBe('true 2100000 true true');
 });
 
 test('A shell result too big to pass three times over still has its result', () => {
-  const text = one('const r = await call("mcp__lean-ctx__ctx_shell", { command: "printf %1500000s x" })\nreturn [r.ok, r.text.length, r.result[0].text.length].join(" ")', { tools: NO_BASH });
+  const text = one('const r = await call("mcp__lean-ctx__ctx_shell", { command: "printf %1500000s x" })\nreturn [r.ok, r.text.length, r.result[0].text.length].join(" ")', { tools: NO_BASH, noSwap: true, leanCap: 2000000 });
   expect(text).toBe('true 1500000 1500000');
 });
 
@@ -902,7 +902,7 @@ test('A big object holding undefined and functions prints as valid JSON', () => 
 test('A second read() of a file that fits one or two lines per page never repeats the same page request', () => {
   const dir = scratch();
   const f = join(dir, 'wide.txt');
-  writeFileSync(f, Array.from({ length: 4 }, (_, i) => String(i).repeat(49000)).join('\n'));
+  writeFileSync(f, Array.from({ length: 4 }, (_, i) => (String(i) + ' ').repeat(24500)).join('\n'));
   const out = run({ tools: NO_BASH, dedupReads: true, steps: [{ script: 'const a = await read(' + JSON.stringify(f) + ')\nconst b = await read(' + JSON.stringify(f) + ')\nreturn String(a === b && a.length === 196003)' }] });
   expect(out.results[0]!.text).toBe('true');
 });
@@ -1652,4 +1652,72 @@ test('A withheld ctx_expand page is not read around through the archive file', (
 
 test('A waitFor check that fails after its timeout does not fail the run', () => {
   expect(one('try { await waitFor(async () => { await sh("sleep 0.3"); throw new Error("late") }, { timeout: 50 }) } catch {}\nawait sh("sleep 0.6")\nreturn "ok"')).toBe('ok');
+});
+
+
+test('A lean-ctx output over its own cap comes back whole from the archive it names', () => {
+  expect(one('const r = await sh("seq 1 40000")\nconst rows = String(r).trim().split("\\n")\nreturn r.exitCode + " " + rows.length + " " + rows.pop()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'] })).toBe('0 40000 40000');
+});
+
+test('A tool result Claude Code saved to a file instead of returning it comes back whole', () => {
+  expect(one('const r = await sh("seq 1 10500")\nconst rows = String(r).trim().split("\\n")\nreturn r.exitCode + " " + rows.length + " " + rows.pop()', { tools: NO_BASH })).toBe('0 10500 10500');
+  expect(one('const t = await tools.mcp__lean_ctx__ctx_shell({ command: "seq 1 10500", raw: true })\nreturn t.trim().split("\\n").length', { tools: NO_BASH })).toBe('10500');
+});
+
+test('A failed lean-ctx command over its own cap gives its whole output and does not pass', () => {
+  expect(one('const r = await sh("seq 1 40000; exit 4")\nconst rows = String(r).trim().split("\\n")\nreturn r.ok + " " + rows.length + " " + rows.pop()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'] })).toMatch(/^false 40000 40000/);
+});
+
+test('A failed detached job whose single line is over ctx_expand\'s cap is read from its archive file', () => {
+  expect(one('const r = await sh("sleep 1; printf \'%20000s\\\\n\' x | tr \' \' y; exit 3")\nreturn r.exitCode + " " + String(r).length', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300 })).toBe('3 20001');
+});
+
+test('A long failed detached job switches from ctx_expand pages to its archive file', () => {
+  const out = run({ tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, steps: [{ script: 'const r = await sh("sleep 1; seq 1 3000; exit 5")\nreturn r.exitCode + " " + String(r).trim().split("\\n").length' }] });
+  expect(out.results[0]!.text).toBe('5 3000');
+  expect(out.calls.filter((c) => c.tool === 'mcp__lean-ctx__ctx_expand').length).toBeLessThan(25);
+});
+
+test('A withheld notice ctx_expand gives as an error is still withheld, and never read around', () => {
+  const out = run({ tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, archiveWithheld: true, archiveWithheldError: true, steps: [{ script: 'const r = await sh("sleep 1; echo done")\nreturn String(r.withheld)' }] });
+  expect(out.results[0]!.text).toMatch(/^true/);
+  expect(out.calls.some((c) => c.tool === 'Read' && String(c.args.file_path).includes('lean-ctx/archives'))).toBe(false);
+});
+
+test('A foreground lean-ctx output withheld by policy is marked .withheld', () => {
+  expect(one('const r = await sh("echo hi")\nreturn String(r.withheld) + " " + String(r.truncated)', { tools: NO_BASH, shellWithheld: true })).toMatch(/^true true/);
+});
+
+test('A failed detached job without ctx_expand keeps its output\'s exact ending', () => {
+  expect(one('return JSON.stringify(String(await sh("sleep 1; printf \'x\\\\n\\\\n\'; exit 3")))', { tools: NO_BASH, detachAfterMs: 300 })).toBe('"x\\n\\n"');
+  expect(one('return JSON.stringify(String(await sh("sleep 1; printf x; exit 3")))', { tools: NO_BASH, detachAfterMs: 300 })).toBe('"x"');
+});
+
+test('A failed detached job whose inline output Claude Code cut is marked truncated and noted', () => {
+  const text = one('const r = await sh("sleep 1; seq 1 5000; exit 3")\nreturn r.exitCode + " " + r.truncated', { tools: NO_BASH, detachAfterMs: 300, env: { CODEMODE_TOOL_DEFAULTS: JSON.stringify({ 'mcp__lean-ctx__ctx_shell': { raw: true } }) } });
+  expect(text).toMatch(/^3 true/);
+  expect(text).toMatch(/Note: [^\n]*cut/);
+});
+
+test('A failed detached job keeps its whole inline output when ctx_expand is refused', () => {
+  expect(one('const r = await sh("sleep 1; echo hi; exit 3")\nreturn r.exitCode + " " + String(r).trim()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], denied: ['mcp__lean-ctx__ctx_expand'], detachAfterMs: 300 })).toBe('3 hi');
+});
+
+test('A ctx_expand reply with a header and an empty body is paged', () => {
+  expect(one('return JSON.stringify(String(await sh("sleep 1; echo hello")))', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, expandEmptyBody: true, denyReadPaths: ['.txt'] })).toBe('"hello\\n"');
+});
+
+test('A lean-ctx patch batch that creates a file and then changes it leaves it counted as read', () => {
+  const f = join(scratch(), 'fresh.txt');
+  expect(one('await tools.mcp__lean_ctx__ctx_patch({ ops: [{ op: "create", path: ' + JSON.stringify(f) + ', new_text: "red\\n" }, { op: "replace_unique", path: ' + JSON.stringify(f) + ', old_text: "red", new_text: "blue" }] })\nawait edit(' + JSON.stringify(f) + ', "blue", "green")\nreturn 1', { tools: NO_BASH })).toBe('1');
+  expect(readFileSync(f, 'utf8')).toBe('green\n');
+});
+
+test('A raw text block after a labelled or case block is still taken out', () => {
+  expect(one('lbl: {}\n/`/.test("a")\n// @text hi\nhello\n// @end\nreturn TEXT.hi')).toBe('hello');
+  expect(one('switch (0) {\ncase 0: {}\n/`/.test("a")\n}\n// @text hi\nhello\n// @end\nreturn TEXT.hi')).toBe('hello');
+});
+
+test('lean-ctx\'s own advice line after a command\'s output is left out', () => {
+  expect(one('return JSON.stringify(String(await sh("printf abc")))', { tools: NO_BASH, shellAdvice: '[ctx_shell: bare `cat` redirected to ctx_read for inline delivery. Use ctx_read(path=x) directly next time.]' })).toBe('"abc"');
 });

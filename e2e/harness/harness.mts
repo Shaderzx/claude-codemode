@@ -132,7 +132,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       }
       seen.set(key, statSync(p).mtimeMs)
       readTimes.set(p, statSync(p).mtimeMs)
-      if (typeof a.limit === 'number' && c.changeAfterPage === offset) setTimeout(() => writeFileSync(p, text + 'changed meanwhile\n'), 0)
+      if (typeof a.limit === 'number' && c.changeAfterPage === offset) writeFileSync(p, text + 'changed meanwhile\n')
       return ok(numbered(part, offset), { type: 'text', file: { filePath: p, content: part.join('\n'), numLines: part.length, startLine: offset, totalLines: lines.length, ...(cut ? { truncatedByTokenCap: true } : {}) } })
     }
     case 'Write': {
@@ -247,13 +247,14 @@ mod.register((name: string, h: (...x: unknown[]) => Promise<unknown>) => {
 const handlers: Record<string, (...x: unknown[]) => Promise<unknown>> = Object.fromEntries(
   Object.keys(hooks).map((name) => [
     name,
-    async ($: unknown, e: unknown, next: (x: unknown) => Promise<unknown>) => {
+    async (...x: unknown[]) => {
+      const [$, e, next] = x as [unknown, unknown, (y: unknown) => Promise<unknown>]
       try {
         return await hooks[name]!($, e, next)
       } catch (error) {
         const f = catches[name]
         if (!f) throw error
-        return f($, e, Object.assign((x: unknown) => next(x), next, { error, called: false }))
+        return f($, e, Object.assign((y: unknown) => next(y), next, { error: { kind: 'throw', message: String((error as Error)?.message ?? error) }, called: false }))
       }
     },
   ]),

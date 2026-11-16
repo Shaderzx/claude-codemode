@@ -194,7 +194,7 @@ const pickLimit = (limit, tried, cap, down) => {
   for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
   return 0
 }
-const ENDINGS = ' (read() and Read give a file\'s line endings back as \\n, so text taken from a file with CRLF line endings does not match it; for such a file use sh() with sed or perl, or write the whole file with { force: true } through Write)'
+const ENDINGS = ' (read() and Read give a file\'s line endings back as \\n, so text taken from a file with CRLF line endings does not match it; for such a file use sh() with sed or perl, or replace the whole file with write())'
 const endings = (e) => (/not found/i.test(String(e)) ? ENDINGS : '')
 const ident = (n) => n.replace(/[^A-Za-z0-9_$]/g, '_')
 class Exit extends Error {}
@@ -483,7 +483,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         }
         throw toolError('read: ' + r.error, r)
       }
-      whole = r.whole === true
+      if (r.whole === true) whole = true
       const t = String(r.text)
       if (isDedup(t)) {
         tried.add(limit)
@@ -495,7 +495,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (!got.length && !NOTICE.test(t))
         throw toolError('read: Read answered with no file lines (a picture, a binary file, or a hook rewrote the answer): ' + t.slice(0, 200), r)
       rows.push(...got)
-      if (got.length < limit) break
+      if (got.length < limit || r.whole === true) break
       offset += got.length
       tried = new Set()
       cap = 2000
@@ -538,6 +538,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (!now) throw toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
     r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now, new_text: body } })
     if (r.ok) return wrote(file)
+    if (/not found/i.test(String(r.error)) && !now.includes('\r')) {
+      r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now.split('\n').join('\r\n'), new_text: body } })
+      if (r.ok) return wrote(file)
+    }
     throw toolError('write: ' + r.error + endings(r.error), r)
   }
   const edit = async (path, from, to, opts) => {
@@ -577,7 +581,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (typeof check !== 'function') throw new Error('waitFor: check must be a function, such as () => sh("test -f /tmp/ready")')
     const o = opts && typeof opts === 'object' ? opts : {}
     const every = Math.max(10, o.every === undefined || !Number.isFinite(Number(o.every)) ? 1000 : Number(o.every))
-    const limit = Math.max(0, Math.min(Number.isFinite(o.timeout) ? o.timeout : deadline() - 1000, deadline()))
+    const asked = o.timeout === undefined || o.timeout === null || o.timeout === '' ? NaN : Number(o.timeout)
+    const limit = Math.max(0, Math.min(Number.isFinite(asked) ? asked : deadline() - 1000, deadline()))
     const t0 = Date.now()
     const LATE = {}
     const done = (v) => {
@@ -705,6 +710,7 @@ export const extractText = (script: string): { script: string; texts: Record<str
   const parens: string[] = []
   const braces: boolean[] = []
   let fn: { expression: boolean; depth: number } | undefined
+  let asyncOpens = false
   const keyword = (w: string) => KEYWORDS.has(w) && (w !== 'of' || parens[parens.length - 1] === 'for')
   let before = ''
   const scan = (l: string) => {
@@ -763,7 +769,9 @@ export const extractText = (script: string): { script: string; texts: Record<str
         while (j < l.length && /[\w$]/.test(l[j] as string)) j++
         before = word
         word = prev === '.' ? '' : l.slice(i, j)
-        if (word === 'function' || word === 'class') fn = { expression: (prev !== '' && '(,=:[!&|?+-*%<>~^A'.includes(prev)) || (prev === 'a' && keyword(before)), depth: parens.length }
+        const opens = (prev !== '' && '(,=:[!&|?+-*%<>~^A'.includes(prev)) || (prev === 'a' && keyword(before))
+        if (word === 'async') asyncOpens = opens
+        if (word === 'function' || word === 'class') fn = { expression: before === 'async' && prev === 'a' ? asyncOpens : opens, depth: parens.length }
         prev = 'a'
         i = j - 1
         continue
@@ -798,6 +806,7 @@ export const extractText = (script: string): { script: string; texts: Record<str
         word = ''
         continue
       }
+      if (fn && parens.length === fn.depth && (ch === ':' || ch === ',' || ch === ';')) fn = undefined
       prev = ch
       word = ''
       if (ch === '`') {
@@ -1186,15 +1195,15 @@ const deniedTools = new Map<string, { alt?: string; at: number }>()
 const failedScripts = new Map<string, { first: string; at: number }>()
 
 const READ = Symbol('read')
-const readProgress = new Map<string, { next: number; mtime?: number }>()
-const readMtimes = new Map<string, number>()
+const readProgress = new Map<string, { next: number; version?: string }>()
+const readVersions = new Map<string, string>()
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
 const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number) => {
   for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
   for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
   return 0
 }
-type Receipt = { file: string; whole: boolean; next?: number; mtime?: number }
+type Receipt = { file: string; whole: boolean; next?: number; version?: string }
 type FileInfo = { startLine?: unknown; numLines?: unknown; totalLines?: unknown; truncatedByTokenCap?: unknown }
 const infoOf = (result: unknown): FileInfo | undefined => {
   const f = result && typeof result === 'object' ? (result as { file?: unknown }).file : undefined
@@ -1202,7 +1211,8 @@ const infoOf = (result: unknown): FileInfo | undefined => {
 }
 const reachesEnd = (info: FileInfo | undefined) =>
   !!info && typeof info.startLine === 'number' && typeof info.numLines === 'number' && typeof info.totalLines === 'number' && info.startLine + info.numLines - 1 >= info.totalLines
-const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, mtime: number | undefined): Receipt | undefined => {
+const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, version: string | undefined): Receipt | undefined => {
+  if (version === undefined) return undefined
   if (isStub(text)) return undefined
   const info = infoOf(result)
   if (info?.truncatedByTokenCap === true) return undefined
@@ -1210,10 +1220,10 @@ const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, 
   if (!rows && !NOTICE.test(text)) return undefined
   const from = typeof offset === 'number' ? offset : 1
   const chain = readProgress.get(file)
-  if (from !== 1 && (!chain || chain.next !== from || chain.mtime !== mtime)) return undefined
-  if (!rows) return { file, whole: true, mtime }
+  if (from !== 1 && (!chain || chain.next !== from || chain.version !== version)) return undefined
+  if (!rows) return { file, whole: true, version }
   if (!info || rows !== info.numLines) return undefined
-  return reachesEnd(info) ? { file, whole: true, mtime } : { file, whole: false, next: from + rows, mtime }
+  return reachesEnd(info) ? { file, whole: true, version } : { file, whole: false, next: from + rows, version }
 }
 const PERSISTED = /^(\s*(?:<tool_use_error>)?(?:Exit code \d+\n)?)<persisted-output>\n(?:[^\n]*\n){0,5}?Output too large \([^)\n]*\)\. Full output saved to: ([^\n]+)\n\nPreview \([^)\n]*\):\n([\s\S]*?)\n?<\/persisted-output>(\s*(?:<\/tool_use_error>)?\s*)$/
 const isLow = (c: number) => c >= 0xdc00 && c < 0xe000
@@ -1349,7 +1359,7 @@ export const register: Register = (on) => {
     deniedTools.clear()
     readPaths.clear()
     readProgress.clear()
-    readMtimes.clear()
+    readVersions.clear()
     failedScripts.clear()
     for (const [n, v] of Object.entries(kept && typeof kept === 'object' ? kept : {}))
       if (v && Date.now() - Number(v.at ?? 0) < DENIED_MS && (names.size === 0 || (typeof v.alt === 'string' && names.has(v.alt)))) deniedTools.set(n, { alt: v.alt, at: Number(v.at) })
@@ -1369,9 +1379,9 @@ export const register: Register = (on) => {
   on('session.compact', async ($, e, next) => {
     readPaths.clear()
     readProgress.clear()
-    readMtimes.clear()
+    readVersions.clear()
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 
   on('skill.prompt', async ($, e, next) => {
     const r = await next(e)
@@ -1448,16 +1458,16 @@ export const register: Register = (on) => {
       const v = await version
       return v ? `type:${v}:${tool}` : undefined
     }
-    const home = (await $.env.get('HOME')) ?? '/tmp'
+    const home = (await $.env.get('HOME')) || '/tmp'
     const configDir = normal((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`)
     // A host whose own node is older than 25 points this at a newer one.
     const node = (await $.env.get('CODEMODE_NODE')) || 'node'
     const root = `${home}/.claude/codemode/runs`
     const dir = `${root}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${++runs}`
 
-    const mtimeOf = (path: string): Promise<number | undefined> =>
+    const versionOf = (path: string): Promise<string | undefined> =>
       $.fs.stat(path, { resolve: true }).then(
-        (s) => (typeof s?.mtimeMs === 'number' ? s.mtimeMs : undefined),
+        (s) => (typeof s?.mtimeMs === 'number' ? `${s.mtimeMs}:${s.size}` : undefined),
         () => undefined,
       )
 
@@ -1471,8 +1481,8 @@ export const register: Register = (on) => {
       }
       if (m.kind === 'fresh') {
         const path = normal(String(p.path))
-        const was = readMtimes.get(path)
-        const now = was === undefined ? undefined : await mtimeOf(path)
+        const was = readVersions.get(path)
+        const now = was === undefined ? undefined : await versionOf(path)
         return { ok: true, fresh: was !== undefined && now !== undefined && now === was }
       }
       if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
@@ -1534,8 +1544,8 @@ export const register: Register = (on) => {
         const exists = await $.fs.exists(path).catch(() => true)
         if (!readPaths.has(path) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
         if (exists) {
-          const was = readMtimes.get(path)
-          const now = await mtimeOf(path)
+          const was = readVersions.get(path)
+          const now = await versionOf(path)
           if (was === undefined || now === undefined || now !== was)
             return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
         }
@@ -1557,8 +1567,10 @@ export const register: Register = (on) => {
       calls.set(tool, tally)
       tally.open++
       open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
+      const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+      const patchTarget = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && typeof args.path === 'string' && String(args.op) !== 'create' ? normal(args.path) : undefined
+      const patchFresh = patchTarget !== undefined && readPaths.has(patchTarget) && readVersions.get(patchTarget) !== undefined && readVersions.get(patchTarget) === (await versionOf(patchTarget))
       let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
-        open.delete(m.id)
         tally.open--
         tally.failed++
         tally.arg ??= firstArg(args)
@@ -1568,7 +1580,6 @@ export const register: Register = (on) => {
         const near = msg.includes('no tool named') ? similar(tool, all.map((x) => x.name)) : []
         throw new Error(near.length ? `${msg}; similar: ${near.join(', ')}` : msg)
       })
-      open.delete(m.id)
       const body = release ? skillTexts.get(key) : undefined
       release?.()
       const capped =
@@ -1635,20 +1646,24 @@ export const register: Register = (on) => {
         const target = typeof args.file_path === 'string' ? args.file_path : typeof args.path === 'string' ? args.path : undefined
         const wrote = tool === 'Write' || tool === 'Edit' || (/^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && ['create', 'replace_unique', 'replace_all'].includes(String(args.op)))
         const moved = p.foreground === true && tool === 'Bash' ? (r.result as { backgroundTaskId?: unknown } | undefined)?.backgroundTaskId : undefined
-        if (p.foreground === true && tool === 'Bash' && (moved !== undefined || /^\s*Command (?:did not complete within|was moved to the background|was manually backgrounded)/.test(text))) {
+        if (moved !== undefined) {
           tally.ok--
           tally.failed++
           tally.arg ??= firstArg(args)
           return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
         }
-        const patched = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && typeof target === 'string' && String(args.op) !== 'create'
+        const patched = patchTarget !== undefined
+        if (patched && !patchFresh) {
+          readPaths.delete(patchTarget)
+          readVersions.delete(patchTarget)
+        }
         const receipt =
           tool === 'Read' && typeof args.file_path === 'string'
-            ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, await mtimeOf(args.file_path))
-            : wrote && typeof target === 'string' && target.startsWith('/') && (!patched || readPaths.has(normal(target)))
+            ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === (await versionOf(args.file_path)) ? readBefore : undefined)
+            : wrote && typeof target === 'string' && target.startsWith('/') && (!patched || patchFresh)
               ? ({ file: normal(target), whole: true } as Receipt)
               : undefined
-        if (receipt?.whole && receipt.mtime === undefined) receipt.mtime = await mtimeOf(receipt.file)
+        if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
         if (isStub(text) && p.handled !== true) {
           stubs.add(tool)
           if (/read-dedup/.test(text)) deduped = true
@@ -1694,9 +1709,12 @@ export const register: Register = (on) => {
       let total: number | undefined
       const start = offset
       const file = String(args.file_path)
+      const version = await versionOf(file)
+      const moved = async () => version === undefined || (await versionOf(file)) !== version
       for (let guard = 0; guard < 10_000; guard++) {
         if (over) return undefined
         const r = await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
+        if (r && !r.isError && r.deny === undefined && (await moved())) return { error: `${file} changed while it was read in pages; read it again` }
         if (!r) return undefined
         if (r.deny !== undefined) return { error: `Reading ${file} in pages stopped at line ${offset}: ${r.deny}` }
         const t = String(r.text ?? show(r.result))
@@ -1761,6 +1779,7 @@ export const register: Register = (on) => {
       } catch (err) {
         out = { ok: false, error: (err as Error)?.message ?? String(err) }
       }
+      open.delete(m.id)
       // The child is gone after a timeout; writing would recreate its run dir.
       if (over) return
       const file = `${dir}/${m.id}.json`
@@ -1791,11 +1810,11 @@ export const register: Register = (on) => {
         else if (receipt.whole) {
           readProgress.delete(receipt.file)
           readPaths.add(receipt.file)
-          if (receipt.mtime !== undefined) readMtimes.set(receipt.file, receipt.mtime)
-          if (readMtimes.size > 2000) readMtimes.delete(readMtimes.keys().next().value as string)
+          if (receipt.version !== undefined) readVersions.set(receipt.file, receipt.version)
+          if (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
           if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
         } else if (receipt.next !== undefined) {
-          readProgress.set(receipt.file, { next: receipt.next, mtime: receipt.mtime })
+          readProgress.set(receipt.file, { next: receipt.next, version: receipt.version })
           if (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
         }
       })
@@ -1962,5 +1981,9 @@ export const register: Register = (on) => {
     // A marker the cut removed still counts: the script chose to show it.
     const blocks = attach(full, pictures)
     return { result: blocks.length ? ([{ type: 'text', text: out }, ...blocks] as never) : out }
+  }).catch(($, e, next) => {
+    const why = next.error?.message ?? next.error?.kind ?? 'unknown failure'
+    if ((e.tool as string) === FULL) return { result: format(0, { items: [], logs: [], failure: `codemode's own hook failed: ${why}`, kind: 'runner' }) }
+    return next.called ? next(e) : { deny: `codemode could not check this call (${why}), so it is refused; call ${e.tool} from a ${FULL} script.` }
   })
 }

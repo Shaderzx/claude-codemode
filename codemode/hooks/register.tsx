@@ -187,7 +187,7 @@ const shareKeys = (keys, budget) => {
   return out
 }
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
-const withheldText = (t) => String(t).length < 600 && /^\s*(?:\[(?:lean-ctx[^\]\n]*withheld|POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway\])|(?:stored output (?:is )?withheld by the context gateway|archive withheld by current policy|Tool may have completed; output withheld by policy)\.?\s*$)/i.test(String(t))
+const withheldText = (t) => /^\s*\[lean-ctx[^\]\n]*withheld/i.test(String(t)) || (String(t).length < 600 && /^\s*(?:\[(?:POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway\])|(?:stored output (?:is )?withheld by the context gateway|archive withheld by current policy|Tool may have completed; output withheld by policy)\.?\s*$)/i.test(String(t)))
 const isStubText = (t) => /^\s*\[(?:Firewalled \S+ output|lean-ctx[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(String(t)) || withheldText(t) || isDedup(t)
 const fileLines = (t) => String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
 const pickLimit = (limit, tried, cap, down) => {
@@ -1484,7 +1484,7 @@ export const fromUtf8 = (bytes: number[]): string | undefined => {
     return undefined
   }
 }
-const isWithheld = (t: string, tool?: string) => t.length < 600 && (LEAN_WITHHELD.test(t) || ((tool === undefined || /lean[-_]ctx/.test(tool)) && GATEWAY_WITHHELD.test(t)))
+const isWithheld = (t: string, tool?: string) => LEAN_WITHHELD.test(t) || (t.length < 600 && (tool === undefined || /lean[-_]ctx/.test(tool)) && GATEWAY_WITHHELD.test(t))
 const jobOf = (t: string): string | undefined => {
   try {
     const j = JSON.parse(t) as { jobId?: unknown; state?: unknown; summary?: unknown }

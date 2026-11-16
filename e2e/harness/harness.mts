@@ -58,10 +58,20 @@ type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
 const work = mkdtempSync(join(tmpdir(), 'codemode-mod-'))
+const live = new Set<number>()
+const stop = (pid: number | undefined) => {
+  if (pid === undefined) return
+  live.delete(pid)
+  try { process.kill(-pid, 'SIGKILL') } catch {}
+}
+const home = c.home ?? mkdtempSync(join(tmpdir(), 'codemode-home-'))
+process.on('exit', () => {
+  for (const pid of [...live]) stop(pid)
+  rmSync(work, { recursive: true, force: true })
+  if (c.home === undefined) rmSync(home, { recursive: true, force: true })
+})
 copyFileSync(join(root, 'codemode/hooks/register.tsx'), join(work, 'register.mts'))
 const mod = await import(join(work, 'register.mts'))
-
-const home = c.home ?? mkdtempSync(join(tmpdir(), 'codemode-home-'))
 let cwd = c.cwd ?? home
 const store: Record<string, unknown> = { ...(c.store ?? {}) }
 const calls: { tool: string; args: Record<string, unknown> }[] = []
@@ -125,17 +135,25 @@ const writePath = (raw: unknown) => {
 const numbered = (lines: string[], from: number) => lines.map((l, i) => String(from + i) + '\t' + l).join('\n')
 const seen = new Map<string, number>()
 
-const shell = (command: string, keepCwd = false) =>
-  new Promise<{ code: number; out: string }>((done) => {
+const shell = (command: string, keepCwd = false) => {
+  let pid: number | undefined
+  const done = new Promise<{ code: number; out: string }>((finish) => {
     const marker = join(home, '.bash-cwd')
     const run = keepCwd ? command + '\n__cm_rc=$?; pwd > ' + JSON.stringify(marker) + '; exit $__cm_rc' : command
-    const p = spawn('bash', ['-c', run], { cwd: keepCwd ? bashCwd || cwd : cwd, env: { ...process.env, HOME: home } })
+    const p = spawn('bash', ['-c', run], { cwd: keepCwd ? bashCwd || cwd : cwd, env: { ...process.env, HOME: home }, detached: true })
+    pid = p.pid
+    if (pid !== undefined) live.add(pid)
     if (keepCwd) p.on('close', () => { try { bashCwd = readFileSync(marker, 'utf8').trim() } catch {} })
     let out = ''
     p.stdout.setEncoding('utf8').on('data', (t: string) => { out += t })
     p.stderr.setEncoding('utf8').on('data', (t: string) => { out += t })
-    p.on('close', (code) => done({ code: code ?? 1, out }))
+    p.on('close', (code) => {
+      if (p.pid !== undefined) live.delete(p.pid)
+      finish({ code: code ?? 1, out })
+    })
   })
+  return Object.assign(done, { stop: () => stop(pid) })
+}
 
 const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<string, unknown>> => {
   calls.push({ tool, args: a })
@@ -231,7 +249,9 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       }
       if (tool !== 'Bash' && c.leanTimeoutMs !== undefined) {
         const limit = typeof a.timeout_ms === 'number' ? a.timeout_ms : c.leanTimeoutMs
-        const raced = await Promise.race([shell(command), new Promise<undefined>((r) => setTimeout(() => r(undefined), limit))])
+        const running = shell(command)
+        const raced = await Promise.race([running, new Promise<undefined>((r) => setTimeout(() => r(undefined), limit))])
+        if (raced === undefined) running.stop()
         if (raced === undefined) return err('(timed out after ' + limit + 'ms)\n[exit:124]')
         return leanReply(tool, raced)
       }
@@ -520,5 +540,4 @@ for (const s of c.steps) {
     out.results.push({ text: String((r as { description?: string })?.description ?? ''), attachments: 0, ms: 0 })
   }
 }
-rmSync(work, { recursive: true, force: true })
 process.stdout.write(JSON.stringify(out), () => process.exit(0))

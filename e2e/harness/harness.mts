@@ -40,6 +40,9 @@ type Case = {
   archiveTruncated?: boolean
   deniedReplaceMessage?: string
   archiveWithheldText?: string
+  jobNoExit?: boolean
+  headerOnly?: boolean
+  pageWithheld?: boolean
 }
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -191,7 +194,8 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
           writeFileSync(archive(aid), j.done.out)
         }
         jobArchive.set(id, aid)
-        if (j.done.code) return err('[background:' + id + ' failed, exit ' + j.done.code + ']\n' + (j.done.out.length > 2000 ? firewalled(aid, j.done.out) : j.done.out) + '\n\n[exit:' + j.done.code + ']')
+        if (c.jobNoExit && !j.done.code) return ok(JSON.stringify({ archiveId: aid, jobId: id, state: 'completed', summary: 'done' }))
+        if (j.done.code) return err('[background:' + id + ' failed, exit ' + j.done.code + ']\n' + (j.done.out.length > 2000 && a.raw !== true ? firewalled(aid, j.done.out) : j.done.out) + '\n\n[exit:' + j.done.code + ']')
         return ok(JSON.stringify({ archiveId: aid, archiveTruncated: !!c.archiveTruncated, archivedChars: j.done.out.length, exitCode: 0, jobId: id, state: 'completed', summary: j.done.out.length + ' chars archived' }))
       }
       if (tool !== 'Bash' && c.leanTimeoutMs !== undefined) {
@@ -299,6 +303,8 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       const rows = body.replace(/\n$/, '').split('\n')
       const footer = '\n[… truncated at ~4071 of 11023 tokens — use ctx_read with lines= parameter to see specific sections]'
       const head = 'Archive ' + id + ' (' + Buffer.byteLength(body) + ' chars, ' + rows.length + ' lines):\n'
+      if (a.start_line === undefined && c.headerOnly) return ok(head.replace(/\n$/, ''))
+      if (a.start_line !== undefined && c.pageWithheld) return ok('[lean-ctx: content withheld — policy]')
       if (a.start_line === undefined && rows.length === 1 && (rows[0] as string).length > 16000) return ok(head + footer.slice(1))
       if (a.start_line === undefined) return ok(head + rows.slice(0, 50).join('\n') + (rows.length > 50 ? footer : ''))
       const from = Number(a.start_line)
@@ -354,7 +360,13 @@ const $ = {
     },
     call: async (args: Record<string, unknown>) => {
       const { tool, ...rest } = args
-      return fake(String(tool), rest)
+      const r = await fake(String(tool), rest)
+      const t = typeof r.text === 'string' ? r.text : undefined
+      if (r.isError === true && t !== undefined && t.length > 10000) {
+        const cut = t.slice(0, 5000) + '\n\n... [' + (t.length - 10000) + ' characters truncated] ...\n\n' + t.slice(-5000)
+        return { ...r, text: cut, result: cut }
+      }
+      return r
     },
   },
   env: { get: async (k: string) => ({ HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },

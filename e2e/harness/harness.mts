@@ -184,6 +184,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         const j = jobs.get(id)
         if (!j) return err('unknown job ' + id)
         if (!j.done) return ok(JSON.stringify({ jobId: id, state: 'running', summary: 'running' }))
+        if (!j.done.out && !j.done.code) return ok(JSON.stringify({ capturedChars: 0, exitCode: 0, jobId: id, state: 'completed', summary: 'no output' }))
         const aid = 'a' + id.slice(-15)
         if (!c.archiveWithheld) {
           mkdirSync(dirname(archive(aid)), { recursive: true })
@@ -290,13 +291,16 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
     case 'Skill':
       return ok('Launching skill: ' + a.skill)
     case 'mcp__lean-ctx__ctx_expand': {
+      if (jobs.get(String(a.id))?.done && !jobArchive.has(String(a.id))) return ok("Background job '" + String(a.id) + "' finished (exit " + jobs.get(String(a.id))!.done!.code + ') without output.')
       const id = jobArchive.get(String(a.id)) ?? String(a.id)
       if (c.archiveWithheld) return ok(c.archiveWithheldText ?? '[lean-ctx gateway: retained output withheld by storage policy]')
       if (!existsSync(archive(id))) return err('no archive ' + id)
       const body = readFileSync(archive(id), 'utf8')
       const rows = body.replace(/\n$/, '').split('\n')
       const footer = '\n[… truncated at ~4071 of 11023 tokens — use ctx_read with lines= parameter to see specific sections]'
-      if (a.start_line === undefined) return ok('Archive ' + id + ' (' + body.length + ' chars, ' + rows.length + ' lines):\n' + rows.slice(0, 50).join('\n') + (rows.length > 50 ? footer : ''))
+      const head = 'Archive ' + id + ' (' + Buffer.byteLength(body) + ' chars, ' + rows.length + ' lines):\n'
+      if (a.start_line === undefined && rows.length === 1 && (rows[0] as string).length > 16000) return ok(head + footer.slice(1))
+      if (a.start_line === undefined) return ok(head + rows.slice(0, 50).join('\n') + (rows.length > 50 ? footer : ''))
       const from = Number(a.start_line)
       const to = Math.min(Number(a.end_line ?? rows.length), rows.length, from + 99)
       const shown = rows.slice(from - 1, to).filter((l) => l.length <= 16000).map((l, k) => String(from + k).padStart(6) + '|' + l).join('\n')

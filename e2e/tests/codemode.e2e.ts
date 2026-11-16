@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -1456,4 +1456,50 @@ test('A lean-ctx background job whose output lean-ctx withheld says so', () => {
   const text = one('const r = await sh("sleep 1; echo done")\nreturn r.exitCode + " " + String(r).trim()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, archiveWithheld: true });
   expect(text).toMatch(/^0 /);
   expect(text).toMatch(/Note: [^\n]*withheld/);
+});
+
+
+test('A long output of a detached lean-ctx job comes back whole through ctx_expand, page by page', () => {
+  const text = one('const r = await sh("sleep 1; seq 1 400")\nreturn r.exitCode + " " + String(r).trim().split("\\n").length + " " + String(r).trim().split("\\n").pop()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, denyReadPaths: ['.txt'] });
+  expect(text).toBe('0 400 400');
+});
+
+test('A detached lean-ctx job whose output cannot be fetched fails and names its archive', () => {
+  const text = one('return await sh("sleep 1; echo PRIVATE_OUTPUT").then((r) => "ok " + JSON.stringify(String(r)), (e) => e.message)', { tools: NO_BASH, detachAfterMs: 300, denyReadPaths: ['.txt'] });
+  expect(text).toContain('archive');
+  expect(text).not.toMatch(/^ok/);
+});
+
+test('A detached lean-ctx job whose archive was cut says so with .truncated', () => {
+  expect(one('const r = await sh("sleep 1; echo done")\nreturn String(r.truncated)', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, archiveTruncated: true })).toBe('true');
+});
+
+test('A command that prints JSON shaped like a job is not taken for a lean-ctx job', () => {
+  expect(one('const r = await sh("echo \'{\\"jobId\\":\\"build-123\\",\\"state\\":\\"running\\"}\'")\nreturn r.exitCode + " " + String(r).trim()', { tools: NO_BASH })).toBe('0 {"jobId":"build-123","state":"running"}');
+});
+
+test('A refused patch-path replace is not tried again with CRLF line endings', () => {
+  const dir = scratch();
+  const f = join(dir, 'crlf.txt');
+  writeFileSync(f, 'x\r\ny\r\n');
+  const text = one('await read(' + JSON.stringify(f) + ')\nreturn await write(' + JSON.stringify(f) + ', "z").then(() => "wrote", (e) => e.message)', { tools: NO_BASH, deniedReplaceMessage: 'PreToolUse:mcp__lean-ctx__ctx_patch hook error: blocked: path not found in the allowlist' });
+  expect(text).toContain('allowlist');
+  expect(readFileSync(f, 'utf8')).toBe('x\r\ny\r\n');
+});
+
+test('Other lean-ctx patch ops and batches of a read file keep it counted as read', () => {
+  for (const patch of ['{ op: "set_line", line: 1, new_text: "RED" }', '{ ops: [{ op: "replace_unique", old_text: "red", new_text: "RED", path: P }] }']) {
+    const dir = scratch();
+    const f = join(dir, 'a.txt');
+    writeFileSync(f, 'red\nblue\n');
+    const args = patch.replace('P', JSON.stringify(f)).replace('{ op', '{ path: ' + JSON.stringify(f) + ', op');
+    expect(one('await read(' + JSON.stringify(f) + ')\nawait tools.mcp__lean_ctx__ctx_patch(' + args + ')\nreturn await write(' + JSON.stringify(f) + ', "x\\n")', { tools: NO_BASH })).toBe('wrote ' + f);
+  }
+});
+
+test('A repeated Read with offset 1 and no limit gets past a repeated-read stub', () => {
+  const dir = scratch();
+  const f = join(dir, 'wide.txt');
+  writeFileSync(f, Array.from({ length: 1500 }, (_, i) => String(i + 1).padStart(4, '0') + ' ' + 'w'.repeat(90)).join('\n'));
+  expect(one('const f = ' + JSON.stringify(f) + '\nawait tools.Read({ file_path: f, offset: 1 })\nconst b = await tools.Read({ file_path: f, offset: 1 })\nreturn b.split("\\n").length', { dedupReads: true })).toBe('1500');
 });

@@ -37,6 +37,8 @@ type Case = {
   slowWritesMs?: number
   leanTimeoutMs?: number
   archiveWithheld?: boolean
+  archiveTruncated?: boolean
+  deniedReplaceMessage?: string
 }
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -97,7 +99,7 @@ const shell = (command: string, keepCwd = false) =>
     p.on('close', (code) => done({ code: code ?? 1, out }))
   })
 
-const fake = async (tool: string, a: Record<string, unknown>) => {
+const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<string, unknown>> => {
   calls.push({ tool, args: a })
   if (tool === 'Bash' && (c.deniedCommands ?? []).some((d) => String(a.command ?? '').includes(d)))
     return err(c.deniedMessage ?? 'PreToolUse:Bash hook error: blocked: this command is not allowed here')
@@ -184,7 +186,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
           mkdirSync(dirname(archive(aid)), { recursive: true })
           writeFileSync(archive(aid), j.done.out)
         }
-        return ok(JSON.stringify({ archiveId: aid, archivedChars: j.done.out.length, exitCode: 0, jobId: id, state: 'completed', summary: j.done.out.length + ' chars archived' }))
+        return ok(JSON.stringify({ archiveId: aid, archiveTruncated: !!c.archiveTruncated, archivedChars: j.done.out.length, exitCode: 0, jobId: id, state: 'completed', summary: j.done.out.length + ' chars archived' }))
       }
       if (tool !== 'Bash' && c.leanTimeoutMs !== undefined) {
         const limit = typeof a.timeout_ms === 'number' ? a.timeout_ms : c.leanTimeoutMs
@@ -223,6 +225,15 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       return r.code ? err(r.out + '\n[exit:' + r.code + ']') : ok(r.out || '(' + tool + ' completed with no output)')
     }
     case 'mcp__lean-ctx__ctx_patch': {
+      if (Array.isArray(a.ops)) {
+        const said: string[] = []
+        for (const o of a.ops as Record<string, unknown>[]) {
+          const r = await fake('mcp__lean-ctx__ctx_patch', o)
+          if ((r as { isError?: boolean }).isError) return r
+          said.push(String((r as { text?: string }).text))
+        }
+        return ok(said.join('\n'))
+      }
       const p = String(a.path).startsWith('/') ? String(a.path) : join(cwd, String(a.path))
       if (a.op === 'create' && c.deniedCreateMessage !== undefined) return err(c.deniedCreateMessage)
       if (a.op === 'create') {
@@ -231,6 +242,13 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
         mkdirSync(dirname(p), { recursive: true })
         writeFileSync(p, String(a.new_text ?? ''))
         return ok('created ' + p)
+      }
+      if (a.op === 'replace_unique' && c.deniedReplaceMessage !== undefined && !String(a.old_text ?? '').includes('\r')) return err(c.deniedReplaceMessage)
+      if (a.op === 'set_line') {
+        const lines = readFileSync(p, 'utf8').split('\n')
+        lines[Number(a.line) - 1] = String(a.new_text ?? '')
+        writeFileSync(p, lines.join('\n'))
+        return ok('set line ' + a.line + ' in ' + p)
       }
       if (a.op === 'replace_unique') {
         const s = readFileSync(p, 'utf8')
@@ -271,7 +289,13 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       if (c.archiveWithheld) return ok('[lean-ctx gateway: retained output withheld by storage policy]')
       if (!existsSync(archive(id))) return err('no archive ' + id)
       const body = readFileSync(archive(id), 'utf8')
-      return ok('Archive ' + id + ' (' + body.length + ' chars):\n' + body)
+      const rows = body.replace(/\n$/, '').split('\n')
+      const footer = '\n[… truncated at ~4050 of 9000 tokens — the full output is archived — see the next line]\n[Original available via ctx_expand id=zz]'
+      if (a.start_line === undefined) return ok('Archive ' + id + ' (' + body.length + ' chars, ' + rows.length + ' lines):\n' + rows.slice(0, 50).join('\n') + (rows.length > 50 ? footer : ''))
+      const from = Number(a.start_line)
+      const to = Math.min(Number(a.end_line ?? rows.length), rows.length, from + 99)
+      const shown = rows.slice(from - 1, to).map((l, k) => String(from + k).padStart(6) + '|' + l).join('\n')
+      return ok('Archive ' + id + ' lines ' + from + '-' + to + ':\n' + shown + (to < Number(a.end_line ?? rows.length) ? footer : ''))
     }
     case 'mcp__t3-code__big_report':
       return ok('x'.repeat(2_100_000), { structuredContent: { data: 'y'.repeat(2_100_000) } })

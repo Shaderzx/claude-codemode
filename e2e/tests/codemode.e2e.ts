@@ -6,8 +6,8 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { compact?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean };
+type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -1393,4 +1393,56 @@ test('A failure inside codemode\'s own hook comes back as a failed run, not a cr
   const text = one('return 1', { listThrows: true });
   expect(text).toContain('[runner]');
   expect(text).toContain('$.tool.list failed');
+});
+
+
+test('sh() on lean-ctx\'s shell waits for a command the shell moved to a background job', () => {
+  const tools = [...NO_BASH, 'mcp__lean-ctx__ctx_expand'];
+  expect(one('const r = await sh("sleep 1; echo done; exit 4")\nreturn r.exitCode + " " + String(r).trim()', { tools, detachAfterMs: 300 })).toBe('4 done');
+  expect(one('const r = await sh("sleep 1; seq 1 3")\nreturn r.exitCode + " " + String(r).trim()', { tools, detachAfterMs: 300 })).toBe('0 1\n2\n3');
+});
+
+test('A string continued past a line end keeps a backtick in it from hiding a @text block', () => {
+  expect(one('const s = \'a\\\nb`c\'\n// @text a\nhi\n// @end\nreturn TEXT.a')).toBe('hi');
+});
+
+test('A regex on the line after debugger does not hide a @text block', () => {
+  expect(one('debugger\n/`/.test("a")\n// @text a\nhi\n// @end\nreturn TEXT.a')).toBe('hi');
+});
+
+test('A lean-ctx patch given a relative path renews the read record of the file it changed', () => {
+  const dir = scratch();
+  const f = join(dir, 'a.txt');
+  writeFileSync(f, 'red\n');
+  const text = one('await read(' + JSON.stringify(f) + ')\nawait tools.mcp__lean_ctx__ctx_patch({ op: "replace_unique", path: "a.txt", old_text: "red", new_text: "RED" })\nreturn await write(' + JSON.stringify(f) + ', "x\\n")', { tools: NO_BASH, cwd: dir });
+  expect(text).toBe('wrote ' + f);
+  expect(readFileSync(f, 'utf8')).toBe('x\n');
+});
+
+test('read() of a file that changes between its pages fails instead of returning mixed pages', () => {
+  const dir = scratch();
+  const f = join(dir, 'long.txt');
+  writeFileSync(f, Array.from({ length: 2500 }, (_, i) => 'row ' + i).join('\n'));
+  expect(one('return await read(' + JSON.stringify(f) + ').then(() => "read", (e) => e.message)', { tools: NO_BASH, changeAfterPage: 1 })).toContain('changed while');
+});
+
+test('A subagent\'s compaction, or one a hook skipped, keeps what the session had read', () => {
+  for (const step of [{ compact: true, compactAgent: 'sub-1' }, { compact: true, compactSkipped: true }]) {
+    const dir = scratch();
+    const f = join(dir, 'a.txt');
+    writeFileSync(f, 'red\n');
+    const out = run({ tools: NO_BASH, steps: [{ script: 'await read(' + JSON.stringify(f) + ')' }, step, { script: 'return await edit(' + JSON.stringify(f) + ', "red", "RED")' }] });
+    expect(out.results[1]!.text).toBe('edited ' + f);
+  }
+});
+
+test('A read counts at once, even when the reply file is still being written', () => {
+  const dir = scratch();
+  const f = join(dir, 'a.txt');
+  writeFileSync(f, 'red\n');
+  expect(one('await read(' + JSON.stringify(f) + ')\nreturn await edit(' + JSON.stringify(f) + ', "red", "RED")', { tools: NO_BASH, slowWritesMs: 300 })).toBe('edited ' + f);
+});
+
+test('A word async at the end of a line does not make the next line\'s function an expression', () => {
+  expect(one('let async = 1\nconst a = async\nfunction f() {}\n/`/.test("a")\n// @text a\nhi\n// @end\nreturn TEXT.a')).toBe('hi');
 });

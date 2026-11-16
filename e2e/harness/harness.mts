@@ -33,8 +33,10 @@ type Case = {
   changeAfterPage?: number
   readDelayMs?: number
   listThrows?: boolean
+  detachAfterMs?: number
+  slowWritesMs?: number
 }
-type Step = { compact?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -61,6 +63,7 @@ const DESCRIPTIONS: Record<string, string> = {
   'mcp__aaa-ssh__remote_shell': 'Runs a command on a remote host.',
   'mcp__other__git_patch': 'Applies a git patch.',
   'mcp__t3-code__big_report': 'Returns a big report.',
+  'mcp__lean-ctx__ctx_expand': 'Expands an archived output.',
 }
 const names = c.tools ?? ['Read', 'Bash', 'Write', 'Edit', 'Skill', 'ToolSearch', 'mcp__lean-ctx__ctx_shell', 'mcp__lean-ctx__ctx_patch', 'mcp__t3-code__thread_note']
 const NOTE_SCHEMA = { type: 'object', properties: { threadId: { type: 'string' }, note: { type: 'string' } }, required: ['threadId', 'note'] }
@@ -69,6 +72,8 @@ const err = (text: string) => ({ isError: true, text, result: text })
 const ok = (text: string, result: unknown = text) => ({ text, result })
 
 const readTimes = new Map<string, number>()
+const jobs = new Map<string, { done?: { code: number; out: string } }>()
+const archive = (id: string) => join(home, '.local', 'share', 'lean-ctx', 'archives', id.slice(0, 2), id + '.txt')
 let bashCwd = ''
 const writePath = (raw: unknown) => {
   const p = String(raw ?? '').trim()
@@ -166,6 +171,29 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       }
       if (tool !== 'Bash' && Buffer.byteLength(command) > 8192)
         return err('ERROR: Command too large (' + Buffer.byteLength(command) + ' bytes, limit 8192). If you\'re writing file content, use the native Write/Edit tool instead. ctx_shell is for reading command output only (git, cargo, npm, etc.).')
+      if (tool !== 'Bash' && a.background_action === 'status') {
+        const id = String(a.job_id)
+        const j = jobs.get(id)
+        if (!j) return err('unknown job ' + id)
+        if (!j.done) return ok(JSON.stringify({ jobId: id, state: 'running', summary: 'running' }))
+        if (j.done.code) return err('[background:' + id + ' failed, exit ' + j.done.code + ']\n' + j.done.out + '\n\n[exit:' + j.done.code + ']')
+        const aid = 'a' + id.slice(-15)
+        mkdirSync(dirname(archive(aid)), { recursive: true })
+        writeFileSync(archive(aid), j.done.out)
+        return ok(JSON.stringify({ archiveId: aid, archivedChars: j.done.out.length, exitCode: 0, jobId: id, state: 'completed', summary: j.done.out.length + ' chars archived' }))
+      }
+      if (tool !== 'Bash' && c.detachAfterMs !== undefined) {
+        const running = shell(command)
+        const raced = await Promise.race([running, new Promise<undefined>((r) => setTimeout(() => r(undefined), c.detachAfterMs))])
+        if (raced === undefined) {
+          const id = 'shell_' + String(jobs.size + 1).padStart(16, '0')
+          const j: { done?: { code: number; out: string } } = {}
+          jobs.set(id, j)
+          void running.then((d) => { j.done = d })
+          return ok(JSON.stringify({ jobId: id, state: 'running', summary: 'auto-detached job is still running' }))
+        }
+        return raced.code ? err(raced.out + '\n[exit:' + raced.code + ']') : ok(raced.out || '(' + tool + ' completed with no output)')
+      }
       if (tool === 'Bash' && typeof a.timeout === 'number') {
         const limit = a.timeout
         const raced = await Promise.race([shell(command, true), new Promise<undefined>((r) => setTimeout(() => r(undefined), limit))])
@@ -185,7 +213,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       return r.code ? err(r.out + '\n[exit:' + r.code + ']') : ok(r.out || '(' + tool + ' completed with no output)')
     }
     case 'mcp__lean-ctx__ctx_patch': {
-      const p = String(a.path)
+      const p = String(a.path).startsWith('/') ? String(a.path) : join(cwd, String(a.path))
       if (a.op === 'create' && c.deniedCreateMessage !== undefined) return err(c.deniedCreateMessage)
       if (a.op === 'create') {
         if (existsSync(dirname(p)) && !statSync(dirname(p)).isDirectory()) return err('ERROR: parent directory does not exist for ' + p)
@@ -228,6 +256,12 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
     }
     case 'Skill':
       return ok('Launching skill: ' + a.skill)
+    case 'mcp__lean-ctx__ctx_expand': {
+      const id = String(a.id)
+      if (!existsSync(archive(id))) return err('no archive ' + id)
+      const body = readFileSync(archive(id), 'utf8')
+      return ok('Archive ' + id + ' (' + body.length + ' chars):\n' + body)
+    }
     case 'mcp__t3-code__big_report':
       return ok('x'.repeat(2_100_000), { structuredContent: { data: 'y'.repeat(2_100_000) } })
     case 'mcp__other__git_patch':
@@ -285,6 +319,7 @@ const $ = {
       if (Buffer.byteLength(t) > 4 * 1024 * 1024) throw new Error('fs.write: over the 4 MiB limit')
       mkdirSync(dirname(p), { recursive: true })
       writeFileSync(p, t)
+      if (c.slowWritesMs) await new Promise((r) => setTimeout(r, c.slowWritesMs))
       return p
     },
     read: async (p: string) => readFileSync(p, 'utf8'),
@@ -361,7 +396,10 @@ for (const s of c.steps) {
   started = Date.now()
   if (s.setDenied) { c.denied = s.setDenied; continue }
   if (s.setCwd) { cwd = s.setCwd; continue }
-  if (s.compact) { await handlers['session.compact']?.($, {}, engine(async () => ({}))); continue }
+  if (s.compact) {
+    await handlers['session.compact']?.($, { trigger: 'manual', ...(s.compactAgent ? { agentId: s.compactAgent } : {}) }, engine(async () => (s.compactSkipped ? { skip: 'kept by a hook' } : { messages: [] })))
+    continue
+  }
   if (s.newSession) { await startSession(); continue }
   if (s.script !== undefined) {
     const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: s.script }, engine(async () => ({})))

@@ -51,6 +51,7 @@ type Case = {
   shellAdvice?: string
   bytesShort?: boolean
   swapFormat?: string
+  archiveBytes?: string
 }
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -221,7 +222,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         const aid = 'a' + id.slice(-15)
         if (!c.archiveWithheld) {
           mkdirSync(dirname(archive(aid)), { recursive: true })
-          writeFileSync(archive(aid), j.done.code ? j.done.out + '\n[exit:' + j.done.code + ']' : j.done.out)
+          writeFileSync(archive(aid), c.archiveBytes !== undefined ? Buffer.from(c.archiveBytes, 'base64') : j.done.code ? j.done.out + '\n[exit:' + j.done.code + ']' : j.done.out)
         }
         jobArchive.set(id, aid)
         if (c.jobNoExit && !j.done.code) return ok(JSON.stringify({ archiveId: aid, jobId: id, state: 'completed', summary: 'done' }))

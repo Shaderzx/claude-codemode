@@ -429,6 +429,42 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.denied || typeof r.exitCode !== 'number') await clear()
     return r
   }
+  const runningJob = (t) => {
+    try {
+      const j = JSON.parse(String(t))
+      return j && typeof j.jobId === 'string' && j.state === 'running' ? j.jobId : undefined
+    } catch { return undefined }
+  }
+  const archived = async (id) => {
+    if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) return ''
+    if (names.has('Read') && home) {
+      const text = await read(home + '/.local/share/lean-ctx/archives/' + id.slice(0, 2) + '/' + id + '.txt').catch(() => undefined)
+      if (text !== undefined) return text
+    }
+    const expand = named(/^mcp__lean[-_]ctx__(?:ctx_)?expand$/)[0]
+    if (!expand) return ''
+    const r = await req('call', { tool: expand, args: { id }, handled: true })
+    return r.ok ? String(r.text).replace(/^Archive [^\n]*:\n/, '') : ''
+  }
+  const follow = async (tool, id) => {
+    for (let wait = 200; ; wait = Math.min(wait * 2, 2000)) {
+      if (deadline() < wait + 500)
+        throw toolError('sh: ' + tool + ' moved the command to background job ' + id + ', still running as the run ends; check it with tools.' + ident(tool) + '({ background_action: "status", job_id: "' + id + '" })')
+      await sleep(wait)
+      const s = await req('call', { tool, args: { background_action: 'status', job_id: id }, handled: true })
+      if (s.ok) {
+        let j
+        try { j = JSON.parse(String(s.shellText ?? s.text)) } catch { j = undefined }
+        if (j && j.state === 'running') continue
+        if (j && j.state === 'completed') return shResult(await archived(j.archiveId), Number(j.exitCode) || 0, tool)
+        throw toolError('sh: background job ' + id + ' on ' + tool + ' answered: ' + String(s.text).slice(0, 300), s)
+      }
+      const failed = /^\s*\[background:[^\]\n]*failed, exit (\d+)\]\n?([\s\S]*?)\n*(?:\[exit:\d+[^\]\n]*\])?\s*$/.exec(String(s.error ?? ''))
+      if (failed) return shResult(failed[2] ? failed[2] + '\n' : '', Number(failed[1]), tool)
+      if (typeof s.exitCode === 'number') return shResult(String(s.shellText ?? '').replace(/^\s*\[background:[^\]\n]*\]\n?/, ''), s.exitCode, tool)
+      throw toolError('sh: background job ' + id + ' on ' + tool + ': ' + s.error, s)
+    }
+  }
   const tooLong = (cmd, tool) =>
     toolError('sh: the command is ' + Buffer.byteLength(cmd) + ' bytes, over the ' + LIMIT + '-byte limit of ' + tool + '; pass { stage: true } to run it from a private file written through write(), and know that the shell tool\'s hooks then only see "bash <file>" (the write tool\'s hooks see the whole command), or write it yourself and run sh("bash <file>")')
   const run = async (tool, cmd, extra, stage = false) => {
@@ -439,6 +475,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const args = LEAN_SHELL.test(tool) && !('raw' in extra) ? { raw: true, ...extra, command: cmd } : { ...extra, command: cmd }
     const r = await req('call', { tool, args, foreground: true })
     if (r.denied) return r
+    const job = r.ok && LEAN_SHELL.test(tool) ? runningJob(r.shellText ?? r.text) : undefined
+    if (job) return follow(tool, job)
     if (typeof r.exitCode === 'number') return shResult(r.shellText ?? r.text ?? r.error ?? '', r.exitCode, tool)
     if (r.ok) return shResult(r.shellText ?? r.text, 0, tool)
     if (/^\s*ERROR: Command too large \(\d+ bytes, limit \d+\)/.test(String(r.error))) {
@@ -706,15 +744,39 @@ export const extractText = (script: string): { script: string; texts: Record<str
   let comment = false
   let prev = ''
   let word = ''
-  const KEYWORDS = new Set(['return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'new', 'delete', 'void', 'throw', 'await', 'yield', 'instanceof'])
+  const KEYWORDS = new Set(['return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'new', 'delete', 'void', 'throw', 'await', 'yield', 'instanceof', 'debugger', 'break', 'continue'])
   const parens: string[] = []
   const braces: boolean[] = []
   let fn: { expression: boolean; depth: number } | undefined
   let asyncOpens = false
   const keyword = (w: string) => KEYWORDS.has(w) && (w !== 'of' || parens[parens.length - 1] === 'for')
   let before = ''
+  const closeQuote = (l: string, from: number, q: string) => {
+    for (let i = from; i < l.length; i++) {
+      if (l[i] === '\\') i++
+      else if (l[i] === q) return i
+    }
+    return -1
+  }
+  const continues = (l: string) => (/\\+$/.exec(l)?.[0].length ?? 0) % 2 === 1
+  let quote = ''
+  let lineNo = 0
+  let asyncLine = -1
   const scan = (l: string) => {
-    for (let i = 0; i < l.length; i++) {
+    lineNo++
+    let start = 0
+    if (quote) {
+      const end = closeQuote(l, 0, quote)
+      if (end < 0) {
+        if (!continues(l)) quote = ''
+        return
+      }
+      quote = ''
+      prev = '"'
+      word = ''
+      start = end + 1
+    }
+    for (let i = start; i < l.length; i++) {
       const ch = l[i] as string
       const top = stack[stack.length - 1]
       if (comment) {
@@ -759,7 +821,12 @@ export const extractText = (script: string): { script: string; texts: Record<str
         continue
       }
       if (ch === '"' || ch === "'") {
-        for (i++; i < l.length && l[i] !== ch; i++) if (l[i] === '\\') i++
+        const end = closeQuote(l, i + 1, ch)
+        if (end < 0) {
+          if (continues(l)) quote = ch
+          return
+        }
+        i = end
         prev = '"'
         word = ''
         continue
@@ -770,8 +837,11 @@ export const extractText = (script: string): { script: string; texts: Record<str
         before = word
         word = prev === '.' ? '' : l.slice(i, j)
         const opens = (prev !== '' && '(,=:[!&|?+-*%<>~^A'.includes(prev)) || (prev === 'a' && keyword(before))
-        if (word === 'async') asyncOpens = opens
-        if (word === 'function' || word === 'class') fn = { expression: before === 'async' && prev === 'a' ? asyncOpens : opens, depth: parens.length }
+        if (word === 'async') {
+          asyncOpens = opens
+          asyncLine = lineNo
+        }
+        if (word === 'function' || word === 'class') fn = { expression: before === 'async' && prev === 'a' && asyncLine === lineNo ? asyncOpens : opens, depth: parens.length }
         prev = 'a'
         i = j - 1
         continue
@@ -826,7 +896,7 @@ export const extractText = (script: string): { script: string; texts: Record<str
   const END = /^\s*\/\/\s*@end(?:\s+([A-Za-z_$][\w$]*))?\s*$/
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i] as string
-    const inText = comment || stack[stack.length - 1] === 'tpl'
+    const inText = comment || quote !== '' || stack[stack.length - 1] === 'tpl'
     const m = inText ? null : OPEN.exec(l)
     if (!m) {
       scan(l)
@@ -1197,6 +1267,7 @@ const failedScripts = new Map<string, { first: string; at: number }>()
 const READ = Symbol('read')
 const readProgress = new Map<string, { next: number; version?: string }>()
 const readVersions = new Map<string, string>()
+const pageStart = new Map<string, string | undefined>()
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
 const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number) => {
   for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
@@ -1360,6 +1431,7 @@ export const register: Register = (on) => {
     readPaths.clear()
     readProgress.clear()
     readVersions.clear()
+    pageStart.clear()
     failedScripts.clear()
     for (const [n, v] of Object.entries(kept && typeof kept === 'object' ? kept : {}))
       if (v && Date.now() - Number(v.at ?? 0) < DENIED_MS && (names.size === 0 || (typeof v.alt === 'string' && names.has(v.alt)))) deniedTools.set(n, { alt: v.alt, at: Number(v.at) })
@@ -1377,10 +1449,15 @@ export const register: Register = (on) => {
   })
 
   on('session.compact', async ($, e, next) => {
-    readPaths.clear()
-    readProgress.clear()
-    readVersions.clear()
-    return next(e)
+    const r = await next(e)
+    const skipped = !!r && typeof r === 'object' && 'skip' in r && (r as { skip?: unknown }).skip !== undefined
+    if (!e.agentId && e.trigger !== 'precompute' && !skipped) {
+      readPaths.clear()
+      readProgress.clear()
+      readVersions.clear()
+      pageStart.clear()
+    }
+    return r
   }).catch(($, e, next) => next(e))
 
   on('skill.prompt', async ($, e, next) => {
@@ -1568,7 +1645,8 @@ export const register: Register = (on) => {
       tally.open++
       open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
       const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
-      const patchTarget = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && typeof args.path === 'string' && String(args.op) !== 'create' ? normal(args.path) : undefined
+      const patchPath = typeof args.path === 'string' && !args.path.trim().startsWith('~') ? absolute(args.path.trim(), cwd, home) : undefined
+      const patchTarget = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && patchPath?.startsWith('/') && String(args.op) !== 'create' ? patchPath : undefined
       const patchFresh = patchTarget !== undefined && readPaths.has(patchTarget) && readVersions.get(patchTarget) !== undefined && readVersions.get(patchTarget) === (await versionOf(patchTarget))
       let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
         tally.open--
@@ -1643,7 +1721,7 @@ export const register: Register = (on) => {
           tally.arg ??= firstArg(args)
           return { ok: false, error: `The result of ${tool} is ${text.length} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
         }
-        const target = typeof args.file_path === 'string' ? args.file_path : typeof args.path === 'string' ? args.path : undefined
+        const target = typeof args.file_path === 'string' ? args.file_path : patchPath
         const wrote = tool === 'Write' || tool === 'Edit' || (/^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && ['create', 'replace_unique', 'replace_all'].includes(String(args.op)))
         const moved = p.foreground === true && tool === 'Bash' ? (r.result as { backgroundTaskId?: unknown } | undefined)?.backgroundTaskId : undefined
         if (moved !== undefined) {
@@ -1657,9 +1735,21 @@ export const register: Register = (on) => {
           readPaths.delete(patchTarget)
           readVersions.delete(patchTarget)
         }
+        const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+        if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
+          const from = typeof args.offset === 'number' ? args.offset : 1
+          const first = pageStart.get(args.file_path)
+          if (from === 1) pageStart.set(args.file_path, readBefore)
+          else if (first !== undefined && (readBefore !== first || readAfter !== first)) {
+            tally.ok--
+            tally.failed++
+            return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
+          }
+          if (pageStart.size > 200) pageStart.delete(pageStart.keys().next().value as string)
+        }
         const receipt =
           tool === 'Read' && typeof args.file_path === 'string'
-            ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === (await versionOf(args.file_path)) ? readBefore : undefined)
+            ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined)
             : wrote && typeof target === 'string' && target.startsWith('/') && (!patched || patchFresh)
               ? ({ file: normal(target), whole: true } as Receipt)
               : undefined
@@ -1783,6 +1873,30 @@ export const register: Register = (on) => {
       // The child is gone after a timeout; writing would recreate its run dir.
       if (over) return
       const file = `${dir}/${m.id}.json`
+      const receipt = out[READ as never] as Receipt | undefined
+      let undo: (() => void) | undefined
+      if (receipt) {
+        const had = readPaths.has(receipt.file)
+        const version = readVersions.get(receipt.file)
+        const progress = readProgress.get(receipt.file)
+        undo = () => {
+          if (!had) readPaths.delete(receipt.file)
+          if (version === undefined) readVersions.delete(receipt.file)
+          else readVersions.set(receipt.file, version)
+          if (progress === undefined) readProgress.delete(receipt.file)
+          else readProgress.set(receipt.file, progress)
+        }
+        if (receipt.whole) {
+          readProgress.delete(receipt.file)
+          readPaths.add(receipt.file)
+          if (receipt.version !== undefined) readVersions.set(receipt.file, receipt.version)
+          if (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
+          if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
+        } else if (receipt.next !== undefined) {
+          readProgress.set(receipt.file, { next: receipt.next, version: receipt.version })
+          if (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
+        }
+      }
       // Tracked whole, fallbacks included, so the run dir is removed only after it.
       const delivered = (async () => {
         if (await $.fs.write(file, JSON.stringify(out)).then(() => true, () => false)) return true
@@ -1804,21 +1918,10 @@ export const register: Register = (on) => {
         return false
       })()
       const reply = delivered.then((ok) => {
-        const receipt = out[READ as never] as Receipt | undefined
-        if (!receipt) return
-        if (!ok) readProgress.delete(receipt.file)
-        else if (receipt.whole) {
-          readProgress.delete(receipt.file)
-          readPaths.add(receipt.file)
-          if (receipt.version !== undefined) readVersions.set(receipt.file, receipt.version)
-          if (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
-          if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
-        } else if (receipt.next !== undefined) {
-          readProgress.set(receipt.file, { next: receipt.next, version: receipt.version })
-          if (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
-        }
+        if (!ok) undo?.()
       })
       writes.add(reply)
+      void reply.finally(() => writes.delete(reply))
       await reply
     }
 

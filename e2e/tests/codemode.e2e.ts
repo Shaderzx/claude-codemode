@@ -15,8 +15,10 @@ test.afterAll(() => {
   for (const d of made) rmSync(d, { recursive: true, force: true });
 });
 
+const base = /^[\w./-]+$/.test(tmpdir()) ? tmpdir() : '/tmp';
+
 function scratch(): string {
-  const d = mkdtempSync(join(tmpdir(), 'codemode-e2e-'));
+  const d = mkdtempSync(join(base, 'codemode-e2e-'));
   made.push(d);
   return d;
 }
@@ -1736,4 +1738,12 @@ test('A detached job whose long line holds bytes that are not UTF-8 fails instea
 
 test('A tool result Claude Code saved under another format label is still read back whole', () => {
   expect(one('return String(await sh("seq 1 10500")).trim().split("\\n").length', { tools: NO_BASH, swapFormat: 'JSON' })).toBe('10500');
+});
+
+
+test('A withheld notice longer than 600 chars is still withheld, and never read around', () => {
+  const said = '[lean-ctx gateway: retained output withheld by storage policy] ' + 'reason '.repeat(120);
+  const out = run({ tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, archiveWithheld: true, archiveWithheldText: said, steps: [{ script: 'const r = await sh("sleep 1; echo done")\nreturn String(r.withheld)' }] });
+  expect(out.results[0]!.text).toMatch(/^true/);
+  expect(out.calls.some((c) => c.tool === 'Read' && String(c.args.file_path).includes('lean-ctx/archives'))).toBe(false);
 });

@@ -447,9 +447,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       const pageArgs = { id, start_line: s, end_line: Math.min(total, s + 499) }
       const r = await req('call', { tool: expand, args: pageArgs, handled: true })
       if (r.refused || r.denied) throw refusedRead(expand, r)
-      if (r.ok && withheldText(r.text)) {
+      if (withheldText(said(r))) {
         const again = await req('call', { tool: expand, args: pageArgs })
-        return withheldOutput(String(again.ok && withheldText(again.text) ? again.text : r.text))
+        return withheldOutput(withheldText(said(again)) ? said(again) : said(r))
       }
       const got = r.ok ? String(r.text).split('\n').map((l) => /^\s*(\d+)\|([^\n]*)$/.exec(l)).filter(Boolean) : []
       if (!got.length || got.some((m, k) => Number(m[1]) !== s + k)) return undefined
@@ -471,19 +471,25 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       return inBytes(file, why)
     }
   }
+  const BYTE_STEP = 22000
   const inBytes = async (file, why) => {
     const order = shells()
     if (!order.length) throw why
-    const step = LEAN_SHELL.test(order[0]) ? 300000 : 22000
+    const extra = LEAN_SHELL.test(order[0]) ? { raw: true } : {}
+    const sized = await run(order[0], 'wc -c < ' + quote(file), extra)
+    const size = Number(String(sized).trim())
+    if (sized.denied || sized.exitCode !== 0 || !/^\d+$/.test(String(sized).trim())) throw why
     const parts = []
-    for (let at = 0; ; at += step) {
+    for (let at = 0; at < size; at += BYTE_STEP) {
       if (deadline() < 1500) throw why
-      const r = await run(order[0], 'tail -c +' + (at + 1) + ' ' + quote(file) + ' | head -c ' + step + ' | base64', {})
-      if (r.denied || r.exitCode !== 0) throw why
-      const part = Buffer.from(String(r).replace(/\s+/g, ''), 'base64')
+      const r = await run(order[0], 'tail -c +' + (at + 1) + ' ' + quote(file) + ' | head -c ' + BYTE_STEP + ' | base64', extra)
+      const text = String(r).replace(/\s+/g, '')
+      if (r.denied || r.exitCode !== 0 || r.truncated || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) throw why
+      const part = Buffer.from(text, 'base64')
+      if (part.length !== Math.min(BYTE_STEP, size - at)) throw why
       parts.push(part)
-      if (part.length < step) return Buffer.concat(parts).toString('utf8')
     }
+    return Buffer.concat(parts).toString('utf8')
   }
   const archived = async (id) => {
     if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) return ''
@@ -492,26 +498,34 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       const r = await req('call', { tool: expand, args: { id } })
       if (r.refused || r.denied) throw refusedRead(expand, r)
       const t = String(r.text ?? '')
-      if (r.ok && withheldText(t)) return withheldOutput(t)
-      if (r.ok && isStubText(t)) return fromFile(id)
+      if (withheldText(said(r))) return withheldOutput(said(r))
+      if (r.ok && isStubText(t)) return fromFile(namedArchive(t) ?? id)
       if (r.ok && /^Background job '[^']+' finished \(exit \d+\) without output\.\s*$/.test(t)) return ''
-      const head = r.ok ? /^Archive [^\n]*?\((\d+) chars, (\d+) lines\):(?:\n|$)/.exec(t) : null
+      const head = r.ok ? /^Archive ([A-Za-z0-9_-]+) [^\n]*?\((\d+) chars, (\d+) lines\):(?:\n|$)/.exec(t) : null
       if (head) {
-        const chars = Number(head[1])
-        const total = Number(head[2])
+        const aid = head[1]
+        const chars = Number(head[2])
+        const total = Number(head[3])
         const shown = t.slice(head[0].length)
         const body = shown.replace(/(?:^|\n)\[… truncated at [^\n]*\](?:\n\[Original available[^\n]*\])?\s*$/, '')
-        if (body === shown && (head[0].endsWith('\n') || chars === 0) && body.split('\n').length >= total) return endLine(body, chars)
-        const paged = await expandPages(expand, id, total, chars)
+        const fits = Math.abs(Buffer.byteLength(body) - chars) <= 1
+        if (body === shown && fits && (head[0].endsWith('\n') || chars === 0) && body.split('\n').length >= total) return endLine(body, chars)
+        const paged = await expandPages(expand, aid, total, chars)
         if (paged !== undefined) return paged
+        return fromFile(aid)
       }
     }
     return fromFile(id)
   }
+  const said = (r) => String((r.ok ? r.text : r.error) ?? '')
+  const namedArchive = (t) => /ctx_expand\(id="?([A-Za-z0-9_-]+)"?\)|ctx_expand id=([A-Za-z0-9_-]+)/.exec(String(t))?.slice(1).find(Boolean)
   const jobOutput = async (body, id) => {
-    if (!isStubText(body) && !/^\s*\[Firewalled /.test(body)) return body ? body.replace(/\n*$/, '\n') : ''
-    return archived(/ctx_expand\(id="([A-Za-z0-9_-]+)"\)/.exec(body)?.[1] ?? id)
+    if (withheldText(body)) return withheldOutput(body)
+    if (!isStubText(body) && !/^\s*\[Firewalled /.test(body)) return body
+    return archived(namedArchive(body) ?? id)
   }
+  const LEAN_CUT = /\n?\[… truncated at ~\d+ of \d+ tokens — the full output is archived — see the next line\]\n\[Original available via ctx_expand id=([A-Za-z0-9_-]+)\]\s*$/
+  const ADVICE = /\n\[ctx_shell: [^\n]*\]\s*$/
   const follow = async (tool, id) => {
     for (let wait = 200; ; wait = Math.min(wait * 2, 2000)) {
       if (deadline() < wait + 500)
@@ -530,11 +544,18 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         }
         throw toolError('sh: background job ' + id + ' on ' + tool + ' answered: ' + String(s.text).slice(0, 300), s)
       }
-      const failed = /^\s*\[background:[^\]\n]*failed, exit (\d+)\]\n?([\s\S]*?)\n*(?:\[exit:\d+[^\]\n]*\])?\s*$/.exec(String(s.error ?? ''))
+      const err = String(s.error ?? '')
+      const failed = /^\s*\[background:[^\]\n]*failed, exit (\d+)\]\n([\s\S]*?)\n\n\[exit:\d+[^\]\n]*\]\s*$/.exec(err) ?? /^\s*\[background:[^\]\n]*failed, exit (\d+)\]\n?([\s\S]*?)\n*(?:\[exit:\d+[^\]\n]*\])?\s*$/.exec(err)
       if (failed) {
+        const inline = failed[2]
+        const whole = !s.cut && !isStubText(inline) && !/^\s*\[Firewalled /.test(inline)
         const expandable = named(/^mcp__lean[-_]ctx__(?:ctx_)?expand$/).length > 0
-        const done = shResult(expandable ? await archived(id) : await jobOutput(failed[2], id), Number(failed[1]), tool)
-        if (s.cut && !expandable) done.truncated = true
+        const out = expandable ? await archived(namedArchive(inline) ?? id).catch((e) => (whole ? inline : Promise.reject(e))) : await jobOutput(inline, id)
+        const done = shResult(out, Number(failed[1]), tool)
+        if (s.cut && !expandable) {
+          done.truncated = true
+          await req('cut', { tool })
+        }
         return done
       }
       if (typeof s.exitCode === 'number') return shResult(await jobOutput(String(s.shellText ?? '').replace(/^\s*\[background:[^\]\n]*\]\n?/, ''), id), s.exitCode, tool)
@@ -554,6 +575,13 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.denied) return r
     const job = r.ok && lean && typeof r.job === 'string' ? r.job : undefined
     if (job) return follow(tool, job)
+    if (lean && !r.denied) {
+      const out = String(r.shellText ?? r.text ?? r.error ?? '').replace(ADVICE, '')
+      const kept = LEAN_CUT.exec(out)
+      if (kept) return shResult(await archived(kept[1]), typeof r.exitCode === 'number' ? r.exitCode : r.ok ? 0 : undefined, tool)
+      if (withheldText(out)) return shResult(withheldOutput(out), typeof r.exitCode === 'number' ? r.exitCode : r.ok ? 0 : undefined, tool)
+      if (r.shellText !== undefined) r.shellText = out
+    }
     if (typeof r.exitCode === 'number') {
       const done = shResult(r.shellText ?? r.text ?? r.error ?? '', r.exitCode, tool)
       if (r.cut) done.truncated = true
@@ -834,6 +862,8 @@ export const extractText = (script: string): { script: string; texts: Record<str
   let fn: { expression: boolean; depth: number } | undefined
   let asyncOpens = false
   const keyword = (w: string) => KEYWORDS.has(w) && (w !== 'of' || parens[parens.length - 1] === 'for')
+  let lead = false
+  let caseAt = -1
   let before = ''
   const closeQuote = (l: string, from: number, q: string) => {
     for (let i = from; i < l.length; i++) {
@@ -920,6 +950,8 @@ export const extractText = (script: string): { script: string; texts: Record<str
         while (j < l.length && /[\w$]/.test(l[j] as string)) j++
         before = word
         word = prev === '.' ? '' : l.slice(i, j)
+        lead = word !== '' && typeof top !== 'number' && (prev === '' || prev === ';' || prev === '}' || (prev === '{' && braces[braces.length - 1] === false))
+        if (lead && (word === 'case' || word === 'default')) caseAt = parens.length + braces.length
         const opens = (prev !== '' && '(,=:[!&|?+-*%<>~^A'.includes(prev)) || (prev === 'a' && keyword(before))
         if (word === 'async') {
           asyncOpens = opens
@@ -961,6 +993,13 @@ export const extractText = (script: string): { script: string; texts: Record<str
         continue
       }
       if (fn && parens.length === fn.depth && (ch === ':' || ch === ',' || ch === ';')) fn = undefined
+      if (ch === ':' && (caseAt === parens.length + braces.length || (prev === 'a' && lead))) {
+        caseAt = -1
+        lead = false
+        prev = ';'
+        word = ''
+        continue
+      }
       prev = ch
       word = ''
       if (ch === '`') {
@@ -1333,7 +1372,7 @@ const show = (v: unknown): string => {
 
 type Request = { id: number; kind: 'call' | 'describe' | 'store' | 'load' | 'ask' | 'fresh'; payload: Record<string, unknown> }
 type Done = { done: true; failure?: string; kind?: string; failedId?: number; alongside?: number }
-const KINDS = new Set(['call', 'describe', 'store', 'load', 'ask', 'fresh'])
+const KINDS = new Set(['call', 'describe', 'store', 'load', 'ask', 'fresh', 'cut'])
 
 // Keys `$.tool.call` reads beside a tool's arguments. `consent` would stand in
 // for the user's own approval, so a script never gets to set any of them.
@@ -1401,6 +1440,29 @@ const WHOLE_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:(\S+) hook error: \[DEN
 const LEAN_WITHHELD = /^\s*\[lean-ctx[^\]\n]*withheld/i
 const GATEWAY_WITHHELD = /^\s*(?:\[(?:POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway\])|(?:stored output (?:is )?withheld by the context gateway|archive withheld by current policy|Tool may have completed; output withheld by policy)\.?\s*$)/i
 const ENGINE_CUT = /\n\n\.\.\. \[\d+ characters truncated\] \.\.\.\n\n/
+const LEAN_ARCHIVED = /\[Original available via ctx_expand id=[A-Za-z0-9_-]+\]\s*$/
+const SAVED = /^Error: result \(([\d,]+) characters across [\d,]+ lines\) exceeds maximum allowed tokens\. Output has been saved to (\/[^\n]+?\.txt)\.\nFormat: Plain text\n/
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+const shellQuote = (s: string) => "'" + s.split("'").join("'\\''") + "'"
+export const fromBase64 = (s: string): string | undefined => {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length % 4 !== 0) return undefined
+  const hex: string[] = []
+  let acc = 0
+  let bits = 0
+  for (const ch of s.replace(/=+$/, '')) {
+    acc = ((acc << 6) | B64.indexOf(ch)) & 0xffffff
+    bits += 6
+    if (bits >= 8) {
+      bits -= 8
+      hex.push('%' + ((acc >> bits) & 255).toString(16).padStart(2, '0'))
+    }
+  }
+  try {
+    return decodeURIComponent(hex.join(''))
+  } catch {
+    return undefined
+  }
+}
 const isWithheld = (t: string, tool?: string) => t.length < 600 && (LEAN_WITHHELD.test(t) || ((tool === undefined || /lean[-_]ctx/.test(tool)) && GATEWAY_WITHHELD.test(t)))
 const jobOf = (t: string): string | undefined => {
   try {
@@ -1622,6 +1684,7 @@ export const register: Register = (on) => {
     let persisted = false
     const withheld = new Set<string>()
     const cut = new Set<string>()
+    const savedAway = new Set<string>()
     const defaults = toolDefaults(await $.env.get('CODEMODE_TOOL_DEFAULTS'))
     const cwd = sessionCwd ?? (await $.env.get('PWD')) ?? undefined
     // Stored types belong to one engine version: an upgrade can change a schema.
@@ -1662,6 +1725,10 @@ export const register: Register = (on) => {
         return { ok: true, fresh: was !== undefined && now !== undefined && now === was }
       }
       if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
+      if (m.kind === 'cut') {
+        if (typeof p.tool === 'string' && SHELL_RE.test(p.tool)) cut.add(p.tool)
+        return { ok: true }
+      }
       if (m.kind === 'describe') {
         const t = all.find((x) => x.name === p.tool)
         if (!t) {
@@ -1813,14 +1880,30 @@ export const register: Register = (on) => {
         if (body && body.seq > since) text = `${text}\n\n${body.text}`
       }
       if (markers.length) text = [text.trim(), ...markers].filter(Boolean).join('\n')
+      const toolResult = (path: string) => path.startsWith(`${configDir}/projects/`) && /\/tool-results\/[^/]+\.txt$/.test(path)
+      const readBack = async (path: string, shell?: string) => {
+        const paged = await pageRead({ file_path: path })
+        if (paged?.text !== undefined) return paged.text.split('\n').map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
+        if (shell && (paged === undefined || /over Read's token cap/.test(paged.error ?? ''))) return viaBytes(shell, path)
+        return undefined
+      }
       const saved = tool === 'Bash' ? PERSISTED.exec(text) : null
       if (saved) {
         const path = normal((saved[2] as string).trim())
         const head = (saved[3] as string).replace(/\r/g, '').slice(0, 1000)
-        const paged = path.startsWith(`${configDir}/projects/`) && /\/tool-results\/[^/]+\.txt$/.test(path) ? await pageRead({ file_path: path }) : undefined
-        const whole = paged?.text === undefined ? undefined : paged.text.split('\n').map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
-        if (whole !== undefined && head && whole.startsWith(head)) text = (saved[1] as string) + whole + (saved[4] as string)
+        const whole = toolResult(path) ? await readBack(path, 'Bash') : undefined
+        if (whole !== undefined && head && whole.replace(/\r/g, '').startsWith(head)) text = (saved[1] as string) + whole + (saved[4] as string)
         else persisted = true
+      }
+      const swapped = !r.isError && isMcp.has(tool) ? SAVED.exec(text) : null
+      if (swapped) {
+        const path = normal((swapped[2] as string).trim())
+        const size = Number((swapped[1] as string).replace(/,/g, ''))
+        const lean = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? tool : undefined
+        const back = toolResult(path) ? await readBack(path, lean) : undefined
+        const whole = back !== undefined && back.length + 1 === size ? back + '\n' : back
+        if (whole !== undefined && whole.length === size) text = whole
+        else savedAway.add(tool)
       }
       const shell = SHELL_RE.test(tool) ? exitOf(text, !r.isError, tool) : undefined
       const exit = shell ? { ...(shell.code === undefined ? {} : { exitCode: shell.code }), shellText: shell.out } : {}
@@ -1841,8 +1924,9 @@ export const register: Register = (on) => {
           return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
         }
         const readNow: string[] = []
+        const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => o.path))
         for (const o of patchOps) {
-          if (o.op === 'create' || patchFresh.get(o.path) === true) {
+          if (created.has(o.path) || patchFresh.get(o.path) === true) {
             const version = await versionOf(o.path)
             readPaths.add(o.path)
             if (version === undefined) readVersions.delete(o.path)
@@ -1905,11 +1989,27 @@ export const register: Register = (on) => {
         const k = await typeKey(tool)
         if (k) await $.store.set(k, bad.type as never).catch(() => {})
       }
-      const engineCut = SHELL_RE.test(tool) && ENGINE_CUT.test(text)
+      const engineCut = SHELL_RE.test(tool) && ENGINE_CUT.test(text) && !LEAN_ARCHIVED.test(text)
       if (engineCut && p.poll !== true) cut.add(tool)
       return { ok: false, error: bad.message, text: bad.message, result, ...exit, ...(engineCut ? { cut: true } : {}) }
     }
 
+    const viaBytes = async (shell: string, path: string): Promise<string | undefined> => {
+      const step = 21999
+      const extra = shell === 'Bash' ? {} : { raw: true }
+      const ask = (command: string) => $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined)
+      const sized = await ask('wc -c < ' + shellQuote(path))
+      const size = Number(String(sized?.text ?? '').trim())
+      if (!sized || sized.isError || sized.deny !== undefined || !Number.isInteger(size)) return undefined
+      const parts: string[] = []
+      for (let at = 0; at < size; at += step) {
+        if (over) return undefined
+        const r = await ask('tail -c +' + (at + 1) + ' ' + shellQuote(path) + ' | head -c ' + step + ' | base64')
+        if (!r || r.isError || r.deny !== undefined) return undefined
+        parts.push(String(r.text ?? '').replace(/\s+/g, ''))
+      }
+      return fromBase64(parts.join(''))
+    }
     const pageRead = async (args: Record<string, unknown>): Promise<{ text?: string; error?: string; result?: unknown } | undefined> => {
       const pages: string[] = []
       let size = 0
@@ -2154,6 +2254,9 @@ export const register: Register = (on) => {
         : []),
       ...(cut.size
         ? [`Note: Claude Code cut the middle out of a failed command's output from ${[...cut].join(', ')} (it keeps the first and last 5,000 chars of a failed result over 10,000); that sh() result is marked .truncated, and sending the output to a file (cmd > /tmp/out.txt 2>&1) and reading it with read(path) gets all of it.`]
+        : []),
+      ...(savedAway.size
+        ? [`Note: Claude Code saved a result from ${[...savedAway].join(', ')} to a file instead of returning it (it was over its token limit), and it could not be read back here; read(path) of the file the result names gets it where Read may open it.`]
         : []),
       ...(withheld.size ? [`Note: lean-ctx withheld a result from ${[...withheld].join(', ')} by its storage policy; that text is not available to scripts here.`] : []),
       ...(persisted ? ['Note: Bash saved a big output to a file instead of returning it (<persisted-output>), and it could not be read back here; read(path) of the file it names gets it whole where Read may open it.'] : []),

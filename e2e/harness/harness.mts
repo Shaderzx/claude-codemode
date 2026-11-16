@@ -19,6 +19,9 @@ type Case = {
   readRewrite?: string
   denyReadFrom?: number
   rewriteFromOffset?: string
+  compressShell?: boolean
+  denyReadPaths?: string[]
+  deniedShellCommands?: string[]
 }
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -46,6 +49,7 @@ const DESCRIPTIONS: Record<string, string> = {
   'mcp__t3-code__thread_note': 'Adds a note to a thread.',
   'mcp__aaa-ssh__remote_shell': 'Runs a command on a remote host.',
   'mcp__other__git_patch': 'Applies a git patch.',
+  'mcp__t3-code__big_report': 'Returns a big report.',
 }
 const readSet = new Set<string>()
 const names = c.tools ?? ['Read', 'Bash', 'Write', 'Edit', 'Skill', 'ToolSearch', 'mcp__lean-ctx__ctx_shell', 'mcp__lean-ctx__ctx_patch', 'mcp__t3-code__thread_note']
@@ -75,6 +79,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
   if (!names.includes(tool)) throw new Error('codemode: $.tool.call: no tool named "' + tool + '" in this session')
   switch (tool) {
     case 'Read': {
+      if ((c.denyReadPaths ?? []).some((d) => String(a.file_path ?? '').endsWith(d))) return { deny: 'Permission to read ' + String(a.file_path) + ' has been denied.' }
       if (c.readRewrite !== undefined) return ok(c.readRewrite)
       if (c.denyReadFrom !== undefined && Number(a.offset ?? 1) >= c.denyReadFrom) return { deny: 'Read of this range is denied by policy' }
       if (c.rewriteFromOffset !== undefined && Number(a.offset ?? 1) > 1) return ok(c.rewriteFromOffset)
@@ -82,12 +87,13 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       if (!p.startsWith('/') || !existsSync(p)) return err('File does not exist. Note: your current working directory is ' + cwd + '.')
       const text = readFileSync(p, 'utf8')
       if (!text) return ok('<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>')
-      const lines = text.split('\n')
+      const lines = text.split('\n').map((l) => l.replace(/\r$/, ''))
       const key = p + ':' + String(a.offset) + ':' + String(a.limit)
       if (c.dedupReads && seen.get(key) === statSync(p).mtimeMs)
         return ok('1\t' + p + ' [unchanged ' + lines.length + 'L · lean-ctx read-dedup]\n2\tUnchanged since your last Read in this session — the full line-numbered content is already in this conversation above.')
       const offset = typeof a.offset === 'number' ? a.offset : 1
       const limit = typeof a.limit === 'number' ? a.limit : 2000
+      if (offset > lines.length) return ok('<system-reminder>Warning: the file exists but is shorter than the provided offset (' + offset + '). The file has ' + lines.length + ' lines.</system-reminder>')
       const part = lines.slice(offset - 1, offset - 1 + limit)
       const tokens = Math.ceil(part.join('\n').length / 4)
       if (tokens > 25000)
@@ -105,16 +111,25 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       const p = String(a.file_path)
       if (!readSet.has(p)) return err('<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>')
       const s = readFileSync(p, 'utf8')
-      if (!s.includes(String(a.old_string))) return err('String to replace not found in file.')
-      writeFileSync(p, s.replace(String(a.old_string), () => String(a.new_string)))
+      const n = s.split(String(a.old_string)).length - 1
+      if (!n) return err('String to replace not found in file.')
+      if (n > 1 && a.replace_all !== true) return err('Found ' + n + ' matches of the string to replace, but replace_all is false.')
+      writeFileSync(p, a.replace_all === true ? s.split(String(a.old_string)).join(String(a.new_string)) : s.replace(String(a.old_string), () => String(a.new_string)))
       return ok('The file ' + p + ' has been updated.')
     }
     case 'Bash':
     case 'mcp__lean-ctx__ctx_shell': {
       const command = String(a.command ?? '')
+      if (tool !== 'Bash' && (c.deniedShellCommands ?? []).some((d) => command.includes(d)))
+        return err('PreToolUse:' + tool + ' hook error: blocked: this command is not allowed here')
+      if (tool === 'Bash' && a.run_in_background === true) {
+        spawn('bash', ['-c', command], { cwd, detached: true, stdio: 'ignore' }).unref()
+        return ok('Command running in background with ID: bg1. Output is being written to: /tmp/bg1.output')
+      }
       if (tool !== 'Bash' && Buffer.byteLength(command) > 8192)
         return err('ERROR: Command too large (' + Buffer.byteLength(command) + ' bytes, limit 8192). If you\'re writing file content, use the native Write/Edit tool instead. ctx_shell is for reading command output only (git, cargo, npm, etc.).')
       const r = await shell(command)
+      if (tool !== 'Bash' && c.compressShell && a.raw !== true) return ok('[Firewalled ' + tool + ' output — ' + r.out.length + ' chars, stored out-of-band]')
       if (tool === 'Bash') return r.code ? err('<tool_use_error>Exit code ' + r.code + '\n' + r.out + '</tool_use_error>') : ok(r.out)
       return r.code ? err(r.out + '\n[exit:' + r.code + ']') : ok(r.out || '(' + tool + ' completed with no output)')
     }
@@ -134,6 +149,14 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
         writeFileSync(p, s.replace(old, () => String(a.new_text ?? '')))
         return ok('patched ' + p)
       }
+      if (a.op === 'replace_all') {
+        const s = readFileSync(p, 'utf8')
+        const old = String(a.old_text ?? '')
+        const n = s.split(old).length - 1
+        if (!n) return err('ERROR: old_text not found in ' + p)
+        writeFileSync(p, s.split(old).join(String(a.new_text ?? '')))
+        return ok('Replaced ' + n + ' occurrence(s) in ' + p)
+      }
       return err("missing 'op'")
     }
     case 'mcp__t3-code__thread_note': {
@@ -152,6 +175,8 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
     }
     case 'Skill':
       return ok('Launching skill: ' + a.skill)
+    case 'mcp__t3-code__big_report':
+      return ok('x'.repeat(2_100_000), { structuredContent: { data: 'y'.repeat(2_100_000) } })
     case 'mcp__other__git_patch':
       return err('git_patch must never be chosen by write() or edit()')
     case 'mcp__aaa-ssh__remote_shell':

@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[] };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -727,4 +727,174 @@ test('Every failure is labelled with its kind', () => {
   expect(one('const = 1')).toContain('[syntax]');
   expect(one('await tools.Read({ file_path: "/nope" })')).toContain('[tool]');
   expect(one('null.x')).toContain('[script]');
+});
+
+
+test('A returned object over the 1M cap keeps every key, each cut to its share', () => {
+  const text = one('return { a: "x".repeat(2000000), b: "tail" }');
+  expect(text).toContain('"b": "tail"');
+});
+
+test('A cut through one very long line offers a byte-range command that brings the cut text back', () => {
+  const original = 'head\n' + 'x'.repeat(300000) + 'y'.repeat(300000) + '\ntail';
+  const text = one('return "head\\n" + "x".repeat(300000) + "y".repeat(300000) + "\\ntail"');
+  const m = /…(\d+) chars cut \(lines 2-2\); read them back with sh\(("[^\n]*?")\)…/.exec(text);
+  expect(m).not.toBeNull();
+  const back = execFileSync('bash', ['-c', JSON.parse(m![2]!)], { encoding: 'utf8', maxBuffer: 10_000_000 });
+  expect(back.length).toBe(Number(m![1]));
+  expect(original.includes(back)).toBe(true);
+});
+
+test('TEXT can be returned and stringified like any object', () => {
+  expect(one('// @text a\nhello\n// @end\nreturn JSON.stringify(TEXT)')).toBe('{"a":"hello"}');
+  expect(one('// @text a\nhello\n// @end\nconst t = TEXT\nreturn t')).toBe('{\n  "a": "hello"\n}');
+});
+
+test('A patch-tool write over a file with CRLF line endings says read() gave them back as \\n', () => {
+  const dir = scratch();
+  const f = join(dir, 'crlf.txt');
+  writeFileSync(f, 'x\r\ny\r\n');
+  const text = one('await read(' + JSON.stringify(f) + ')\nawait write(' + JSON.stringify(f) + ', "z")', { tools: NO_BASH });
+  expect(text).toContain('CRLF');
+  expect(readFileSync(f, 'utf8')).toBe('x\r\ny\r\n');
+});
+
+test('sh() runs in the foreground even when the tool defaults ask for the background', () => {
+  const text = one('const r = await sh("printf DONE; exit 3")\nreturn r.exitCode + " " + r', { env: { CODEMODE_TOOL_DEFAULTS: JSON.stringify({ Bash: { run_in_background: true } }) } });
+  expect(text).toBe('3 DONE');
+});
+
+test('sh() with run_in_background: false runs the command', () => {
+  expect(one('return String(await sh("echo hi", { run_in_background: false })).trim()')).toBe('hi');
+});
+
+test('A denial remembered more than a day ago is tried again', () => {
+  const out = run({ tools: ['Read', 'Bash', 'Write', 'Edit', 'mcp__lean-ctx__ctx_shell'], store: { denied: { Bash: { alt: 'mcp__lean-ctx__ctx_shell', at: Date.now() - 2 * 86_400_000 } } }, steps: [{ script: 'return (await sh("echo ok")).tool' }] });
+  expect(out.description).not.toMatch(/Bash[^\n]*denied by a hook/);
+  expect(out.results[0]!.text).toBe('Bash');
+});
+
+test('A tool result too big to pass with its text keeps the text and says the structured result was dropped', () => {
+  const text = one('const r = await call("mcp__t3-code__big_report", {})\nreturn [r.ok, r.text.length, r.result === undefined, r.resultDropped].join(" ")', { tools: [...NO_BASH, 'mcp__t3-code__big_report'] });
+  expect(text).toBe('true 2100000 true true');
+});
+
+test('A shell result too big to pass three times over still has its result', () => {
+  const text = one('const r = await call("mcp__lean-ctx__ctx_shell", { command: "printf %1500000s x" })\nreturn [r.ok, r.text.length, r.result === r.text].join(" ")', { tools: NO_BASH });
+  expect(text).toBe('true 1500000 true');
+});
+
+test('Near names for a missing file never include one Read may not open', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+  const script = 'await tools.Read({ file_path: ' + JSON.stringify(join(dir, '.envv')) + ' })';
+  expect(one(script)).toContain('Similar files: ' + join(dir, '.env'));
+  expect(one(script, { denyReadPaths: ['/.env'] })).not.toContain('Similar files');
+});
+
+test('edit() with { all: true } replaces every occurrence through Edit and through the patch tool', () => {
+  for (const tools of [undefined, NO_BASH]) {
+    const dir = scratch();
+    const f = join(dir, 'a.txt');
+    writeFileSync(f, 'a b a\n');
+    one('await read(' + JSON.stringify(f) + ')\nawait edit(' + JSON.stringify(f) + ', "a", "Z", { all: true })', tools ? { tools } : {});
+    expect(readFileSync(f, 'utf8')).toBe('Z b Z\n');
+  }
+});
+
+test('edit() with { force: true } through Edit reads the file first and edits it', () => {
+  const dir = scratch();
+  const f = join(dir, 'a.txt');
+  writeFileSync(f, 'red blue\n');
+  const text = one('return await edit(' + JSON.stringify(f) + ', "blue", "BLUE", { force: true })');
+  expect(text).toBe('edited ' + f);
+  expect(readFileSync(f, 'utf8')).toBe('red BLUE\n');
+});
+
+test('sh() on lean-ctx\'s shell gets the raw text, not a compressed stub', () => {
+  expect(one('return String(await sh("echo hello")).trim()', { tools: NO_BASH, compressShell: true })).toBe('hello');
+});
+
+test('A Read whose reply could not be delivered does not count as reading the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'slashes.txt');
+  writeFileSync(f, Array.from({ length: 25000 }, () => '\\'.repeat(100)).join('\n'));
+  const out = run({ tools: NO_BASH, steps: [{ script: 'const r = await call("Read", { file_path: ' + JSON.stringify(f) + ' })\nreturn String(r.ok)' }, { script: 'await edit(' + JSON.stringify(f) + ', "\\\\", "X")\nreturn "edited"' }] });
+  expect(out.results[0]!.text).toBe('false');
+  expect(out.results[1]!.text).toContain('has not been read');
+  expect(readFileSync(f, 'utf8').includes('X')).toBe(false);
+});
+
+test('read() refuses a notice that is not the file, and the file stays unread', () => {
+  const dir = scratch();
+  const f = join(dir, 'held.txt');
+  writeFileSync(f, 'secret\n');
+  const out = run({ tools: NO_BASH, readRewrite: '<system-reminder>The contents of this file are withheld by policy.</system-reminder>', steps: [{ script: 'return await read(' + JSON.stringify(f) + ').then(() => "read", (e) => e.message)' }, { script: 'await tools.Read({ file_path: ' + JSON.stringify(f) + ' })\nawait edit(' + JSON.stringify(f) + ', "secret", "X")\nreturn "edited"' }] });
+  expect(out.results[0]!.text).toContain('no file lines');
+  expect(out.results[1]!.text).toContain('has not been read');
+  expect(readFileSync(f, 'utf8')).toBe('secret\n');
+});
+
+test('A read() that fails on a later page leaves the file unread', () => {
+  const dir = scratch();
+  const f = join(dir, 'long.txt');
+  writeFileSync(f, Array.from({ length: 2500 }, (_, i) => 'line ' + i).join('\n'));
+  const out = run({ tools: NO_BASH, denyReadFrom: 2001, steps: [{ script: 'return await read(' + JSON.stringify(f) + ').then(() => "read", (e) => "failed")' }, { script: 'await edit(' + JSON.stringify(f) + ', "line 7\\n", "X\\n")\nreturn "edited"' }] });
+  expect(out.results[0]!.text).toBe('failed');
+  expect(out.results[1]!.text).toContain('has not been read');
+});
+
+test('A Read of only part of a file does not count as reading it', () => {
+  const dir = scratch();
+  const f = join(dir, 'three.txt');
+  writeFileSync(f, 'one\ntwo\nthree\n');
+  const read1 = 'await tools.Read({ file_path: ' + JSON.stringify(f) + ', offset: 1, limit: 1 })';
+  const edit1 = 'await edit(' + JSON.stringify(f) + ', "three", "X")\nreturn "edited"';
+  const out = run({ tools: NO_BASH, steps: [{ script: read1 }, { script: edit1 }, { script: read1 + '\n' + edit1 }] });
+  expect(out.results[1]!.text).toContain('has not been read');
+  expect(out.results[2]!.text).toContain('has not been read');
+  expect(readFileSync(f, 'utf8')).toBe('one\ntwo\nthree\n');
+});
+
+test('A Read answered with a compressed stub does not count as reading the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'stub.txt');
+  writeFileSync(f, 'body\n');
+  const out = run({ tools: NO_BASH, readRewrite: '[Firewalled ctx_read output — 900 chars, stored out-of-band]', steps: [{ script: 'await tools.Read({ file_path: ' + JSON.stringify(f) + ' })' }, { script: 'await edit(' + JSON.stringify(f) + ', "body", "X")\nreturn "edited"' }] });
+  expect(out.results[1]!.text).toContain('has not been read');
+});
+
+test('An empty object divided before a template literal keeps the template whole', () => {
+  expect(one('const n = {} / 2; const t = `\n// @text KEEP\nx\n`\nreturn t')).toBe('\n// @text KEEP\nx\n');
+});
+
+test('A regex after a for await header does not hide a @text block', () => {
+  expect(one('for await (const x of []) /`/.test("a")\n// @text a\nhi\n// @end\nreturn TEXT.a')).toBe('hi');
+});
+
+test('A staged command its shell refuses leaves no folder behind', () => {
+  const out = run({ tools: NO_BASH, deniedShellCommands: ['bash /tmp/codemode-'], steps: [{ script: 'await sh("echo " + "x".repeat(9000) + " >/dev/null", { stage: true })' }] });
+  expect(out.results[0]!.text).toContain('not allowed here');
+  const mkdir = out.calls.map((c) => String(c.args.command ?? '')).find((c) => c.startsWith('mkdir -m 700 /tmp/codemode-'));
+  expect(mkdir).toBeDefined();
+  expect(existsSync(mkdir!.slice('mkdir -m 700 '.length))).toBe(false);
+});
+
+test('A rejection with no reason that nothing handles fails the run', () => {
+  const text = one('Promise.reject()\nreturn "SUCCESS"');
+  expect(text).toContain('[script]');
+  expect(text).toContain('rejected with no reason');
+});
+
+test('A big object holding undefined and functions prints as valid JSON', () => {
+  const text = one('// @options: {"max_output_chars": 1000000}\nreturn { a: "x".repeat(600000), b: undefined, fn: () => 1, c: 1 }');
+  expect(Object.keys(JSON.parse(text))).toEqual(['a', 'c']);
+});
+
+test('A second read() of a file that fits one or two lines per page never repeats the same page request', () => {
+  const dir = scratch();
+  const f = join(dir, 'wide.txt');
+  writeFileSync(f, Array.from({ length: 4 }, (_, i) => String(i).repeat(50000)).join('\n'));
+  const out = run({ tools: NO_BASH, dedupReads: true, steps: [{ script: 'const a = await read(' + JSON.stringify(f) + ')\nconst b = await read(' + JSON.stringify(f) + ')\nreturn String(a === b && a.length === 200003)' }] });
+  expect(out.results[0]!.text).toBe('true');
 });

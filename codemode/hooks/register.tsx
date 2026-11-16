@@ -187,8 +187,8 @@ const shareKeys = (keys, budget) => {
   return out
 }
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
-const isStubText = (t) => /^\s*\[(?:Firewalled \S+ output|lean-ctx[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(String(t)) || isDedup(t)
-const withheldText = (t) => String(t).length < 600 && /withheld by (?:the )?current policy|stored output is withheld|^\s*\[lean-ctx[^\]\n]*withheld/.test(String(t))
+const withheldText = (t) => String(t).length < 600 && /^\s*(?:\[(?:lean-ctx[^\]\n]*withheld|POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway)|stored output (?:is )?withheld|archive withheld by current policy|Tool may have completed; output withheld by policy)/i.test(String(t))
+const isStubText = (t) => /^\s*\[(?:Firewalled \S+ output|lean-ctx[^\]\n]*withheld|untrusted input: tool_output overflow)/.test(String(t)) || withheldText(t) || isDedup(t)
 const fileLines = (t) => String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
 const pickLimit = (limit, tried, cap, down) => {
   for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
@@ -432,21 +432,21 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.denied || typeof r.exitCode !== 'number') await clear()
     return r
   }
+  const endLine = (text, bytes) => (!text.endsWith('\n') && Buffer.byteLength(text) + 1 === bytes ? text + '\n' : text)
   const refusedRead = (expand, r) => toolError('sh: the command finished, but reading its output through ' + expand + ' was refused: ' + r.error, r)
   const expandPages = async (expand, id, total, chars) => {
     const rows = []
     for (let s = 1; s <= total; ) {
       const r = await req('call', { tool: expand, args: { id, start_line: s, end_line: Math.min(total, s + 499) }, handled: true })
       if (r.refused || r.denied) throw refusedRead(expand, r)
-      const got = r.ok ? String(r.text).split('\n').map((l) => /^\s*(\d+)\|(.*)$/.exec(l)).filter(Boolean) : []
-      if (!got.length) return undefined
+      const got = r.ok ? String(r.text).split('\n').map((l) => /^\s*(\d+)\|([^\n]*)$/.exec(l)).filter(Boolean) : []
+      if (!got.length || got.some((m, k) => Number(m[1]) !== s + k)) return undefined
       for (const m of got) rows.push(m[2])
       const next = Number(got[got.length - 1][1]) + 1
       if (next <= s) return undefined
       s = next
     }
-    const text = rows.join('\n')
-    return text.length + 1 === chars ? text + '\n' : text
+    return endLine(rows.join('\n'), chars)
   }
   const fromFile = async (id) => {
     if (!names.has('Read') || !home) throw toolError('sh: the command finished, but its output in lean-ctx archive ' + id + ' could not be fetched (no ctx_expand and no Read here)')
@@ -464,13 +464,14 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (r.refused || r.denied) throw refusedRead(expand, r)
       const t = String(r.text ?? '')
       if (r.ok && (isStubText(t) || withheldText(t))) return t
+      if (r.ok && /^Background job '[^']+' finished \(exit \d+\) without output\.\s*$/.test(t)) return ''
       const head = r.ok ? /^Archive [^\n]*?\((\d+) chars, (\d+) lines\):\n/.exec(t) : null
       if (head) {
         const chars = Number(head[1])
         const total = Number(head[2])
         const shown = t.slice(head[0].length)
-        const body = shown.replace(/\n\[… truncated at [^\n]*\](?:\n\[Original available[^\n]*\])?\s*$/, '')
-        if (body === shown && body.split('\n').length >= total) return body.length + 1 === chars ? body + '\n' : body
+        const body = shown.replace(/(?:^|\n)\[… truncated at [^\n]*\](?:\n\[Original available[^\n]*\])?\s*$/, '')
+        if (body === shown && body.split('\n').length >= total) return endLine(body, chars)
         const paged = await expandPages(expand, id, total, chars)
         if (paged !== undefined) return paged
       }
@@ -492,7 +493,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         try { j = JSON.parse(String(s.shellText ?? s.text)) } catch { j = undefined }
         if (j && j.state === 'running') continue
         if (j && j.state === 'completed') {
-          const done = shResult(await archived(j.archiveId ?? id), Number(j.exitCode) || 0, tool)
+          const quiet = j.archiveId === undefined && (j.capturedChars === 0 || j.summary === 'no output')
+          const done = shResult(quiet ? '' : await archived(j.archiveId ?? id), Number(j.exitCode) || 0, tool)
           if (j.archiveTruncated === true) done.truncated = true
           return done
         }
@@ -1355,7 +1357,9 @@ export const normal = (p: string) => {
 const SHELL_RE = /^Bash$|(?:^|_)shell$/i
 const HOOK_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:\S+ hook (?:error|denied)/i
 const WHOLE_RE = /^\s*(?:<tool_use_error>)?\s*PreToolUse:(\S+) hook error: \[DENIED\] [A-Za-z ]{1,60} blocked\. Use: ([A-Za-z0-9_-]+)\(/
-const isWithheld = (t: string) => t.length < 600 && /withheld by (?:the )?current policy|stored output is withheld|^\s*\[lean-ctx[^\]\n]*withheld/.test(t)
+const isWithheld = (t: string) =>
+  t.length < 600 &&
+  /^\s*(?:\[(?:lean-ctx[^\]\n]*withheld|POLICY BLOCKED\][^\n]*withheld|withheld by the context gateway)|stored output (?:is )?withheld|archive withheld by current policy|Tool may have completed; output withheld by policy)/i.test(t)
 const jobOf = (t: string): string | undefined => {
   try {
     const j = JSON.parse(t) as { jobId?: unknown; state?: unknown; summary?: unknown }
@@ -1664,7 +1668,9 @@ export const register: Register = (on) => {
       )
       const args: Record<string, unknown> = { ...(defaults[tool] ?? {}), ...given }
       if (p.foreground === true) for (const k of Object.keys(args)) if (/background/i.test(k)) delete args[k]
-      if (p.fill && typeof p.fill === 'object') for (const [k, v] of Object.entries(p.fill as Record<string, unknown>)) if (!(k in args)) args[k] = v
+      const fill = p.fill && typeof p.fill === 'object' && /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? (p.fill as Record<string, unknown>) : undefined
+      if (fill && typeof fill.raw === 'boolean' && !('raw' in args)) args.raw = fill.raw
+      if (fill && typeof fill.timeout_ms === 'number' && Number.isFinite(fill.timeout_ms) && !('timeout_ms' in args)) args.timeout_ms = fill.timeout_ms
       if ((tool === 'Write' || tool === 'Edit') && args.file_path !== undefined) {
         const given = String(args.file_path).trim()
         const expanded = given === '~' || given.startsWith('~/') ? home + given.slice(1) : given

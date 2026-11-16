@@ -1575,8 +1575,8 @@ test('A detached lean-ctx job with no output passes with empty output', () => {
 });
 
 test('A detached job output with a U+2028 line keeps every line', () => {
-  const text = one('const r = await sh("sleep 1; perl -CS -e \'print qq(a\\\\n\\\\x{2028}b\\\\n), map { qq($_\\\\n) } 1..200\'")\nconst rows = String(r).split("\\n")\nreturn rows.length + " " + JSON.stringify(rows[1])', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, denyReadPaths: ['.txt'] });
-  expect(text).toBe('203 "\\u2028b"');
+  const text = one('const r = await sh("sleep 1; perl -CS -e \'print qq(a\\\\n\\\\x{2028}b\\\\n), map { qq($_\\\\n) } 1..200\'")\nconst rows = String(r).split("\\n")\nreturn rows.length + " " + rows[1].charCodeAt(0) + rows[1].slice(1)', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, denyReadPaths: ['.txt'] });
+  expect(text).toBe('203 8232b');
 });
 
 test('A detached job output with non-ASCII text keeps its line endings exactly', () => {

@@ -214,7 +214,7 @@ The same tasks and setup with `--model glm-5.3[1m]` through the same gateway, th
 - A `context: fork` skill run through `tools.Skill` starts its agent inside codemode's chain, so that agent is not held to scripts.
 - An escaped script can still signal processes owned by the same user; the permission model does not cover signals.
 - When a script times out its unfinished tool calls are abandoned; the mod cannot stop them.
-- `sh(cmd, { stage: true })` runs a long command from a file, so a shell hook that filters commands sees only `bash <file>`; the write tool's hooks see the whole command. It is off unless a script asks for it.
+- `sh(cmd, { stage: true })` runs a long command from a file, so a shell hook that filters commands sees only `bash <file>`; the write tool's hooks see the whole command. It is off unless a script asks for it, and with lean-ctx's patch tool as the only writer it fails cleanly, since lean-ctx keeps writes inside the project and the private folder is in `/tmp`.
 - `read()` cannot keep CRLF line endings: Read drops the `\r`, so `write()` of a text taken from `read()` turns such a file into LF.
 - A result over the 4 MiB the mod can pass keeps its text and drops its structured `result`, and `call()` then says `resultDropped: true`.
 - A cut through a line longer than 50,000 characters names a byte range of the spill file to read back with `sh()`, since Read cannot return a line that long.

@@ -49,6 +49,8 @@ type Case = {
   shellWithheld?: boolean
   expandEmptyBody?: boolean
   shellAdvice?: string
+  bytesShort?: boolean
+  swapFormat?: string
 }
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -102,7 +104,7 @@ const leanReply = (tool: string, r: { code: number; out: string }) => {
   if (full.length <= cap) return r.code ? err(full + advice) : shellOk(full + advice)
   const aid = (++archived).toString(16).padStart(16, 'c')
   mkdirSync(dirname(archive(aid)), { recursive: true })
-  writeFileSync(archive(aid), r.out)
+  writeFileSync(archive(aid), r.code ? r.out + '\n[exit:' + r.code + ']' : r.out)
   const kept: string[] = []
   let size = 0
   for (const l of r.out.split('\n')) {
@@ -219,7 +221,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         const aid = 'a' + id.slice(-15)
         if (!c.archiveWithheld) {
           mkdirSync(dirname(archive(aid)), { recursive: true })
-          writeFileSync(archive(aid), j.done.out)
+          writeFileSync(archive(aid), j.done.code ? j.done.out + '\n[exit:' + j.done.code + ']' : j.done.out)
         }
         jobArchive.set(id, aid)
         if (c.jobNoExit && !j.done.code) return ok(JSON.stringify({ archiveId: aid, jobId: id, state: 'completed', summary: 'done' }))
@@ -259,6 +261,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         writeFileSync(saved, r.out)
         r.out = '<persisted-output>\nOutput too large (' + (r.out.length / 1024).toFixed(1) + 'KB). Full output saved to: ' + saved + '\n\nPreview (first 2KB):\n' + r.out.slice(0, 2000) + '\n</persisted-output>'
       }
+      if (tool === 'Bash' && c.bytesShort && command.endsWith('| base64') && !r.code) return ok(r.out.trim().slice(0, -4))
       if (tool === 'Bash') return r.code ? err('<tool_use_error>Exit code ' + r.code + '\n' + r.out + '</tool_use_error>') : ok(r.out)
       return leanReply(tool, r)
     }
@@ -404,7 +407,7 @@ const $ = {
         const saved = join(c.env?.CLAUDE_CONFIG_DIR ?? join(home, '.claude'), 'projects', 'p', 's', 'tool-results', String(tool).slice(5).replace(/__/g, '-') + '-' + Date.now() + '-' + ++swapped + '.txt')
         mkdirSync(dirname(saved), { recursive: true })
         writeFileSync(saved, t)
-        const said = 'Error: result (' + t.length.toLocaleString('en-US') + ' characters across ' + t.split('\n').length.toLocaleString('en-US') + ' lines) exceeds maximum allowed tokens. Output has been saved to ' + saved + '.\nFormat: Plain text\n- For targeted searches (find a line, locate a string): use grep on the file directly.\n- For analysis or summarization that requires reading the full content: read ' + saved + ' in chunks of ~816 lines using offset/limit until you have read 100% of it.\n'
+        const said = 'Error: result (' + t.length.toLocaleString('en-US') + ' characters across ' + t.split('\n').length.toLocaleString('en-US') + ' lines) exceeds maximum allowed tokens. Output has been saved to ' + saved + '.\nFormat: ' + (c.swapFormat ?? 'Plain text') + '\n- For targeted searches (find a line, locate a string): use grep on the file directly.\n- For analysis or summarization that requires reading the full content: read ' + saved + ' in chunks of ~816 lines using offset/limit until you have read 100% of it.\n'
         return { text: said, result: [{ type: 'text', text: said }] }
       }
       if (r.isError === true && t !== undefined && t.length > 10000) {

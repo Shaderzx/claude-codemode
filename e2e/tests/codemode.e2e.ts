@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -1664,8 +1664,8 @@ test('A tool result Claude Code saved to a file instead of returning it comes ba
   expect(one('const t = await tools.mcp__lean_ctx__ctx_shell({ command: "seq 1 10500", raw: true })\nreturn t.trim().split("\\n").length', { tools: NO_BASH })).toBe('10500');
 });
 
-test('A failed lean-ctx command over its own cap gives its whole output and does not pass', () => {
-  expect(one('const r = await sh("seq 1 40000; exit 4")\nconst rows = String(r).trim().split("\\n")\nreturn r.ok + " " + rows.length + " " + rows.pop()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'] })).toMatch(/^false 40000 40000/);
+test('A failed lean-ctx command over its own cap gives its whole output and its exit code', () => {
+  expect(one('const r = await sh("seq 1 40000; exit 4")\nconst rows = String(r).trim().split("\\n")\nreturn r.ok + " " + r.exitCode + " " + rows.length + " " + rows.pop()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'] })).toMatch(/^false 4 40000 40000/);
 });
 
 test('A failed detached job whose single line is over ctx_expand\'s cap is read from its archive file', () => {
@@ -1720,4 +1720,19 @@ test('A raw text block after a labelled or case block is still taken out', () =>
 
 test('lean-ctx\'s own advice line after a command\'s output is left out', () => {
   expect(one('return JSON.stringify(String(await sh("printf abc")))', { tools: NO_BASH, shellAdvice: '[ctx_shell: bare `cat` redirected to ctx_read for inline delivery. Use ctx_read(path=x) directly next time.]' })).toBe('"abc"');
+});
+
+
+test('A saved Bash output read back short in byte ranges is not passed off as whole', () => {
+  const text = one('return String(await sh("printf %40000s x | tr \' \' y")).length', { persistBash: true, bytesShort: true });
+  expect(text).not.toMatch(/^39/);
+  expect(text).toMatch(/Note: Bash saved a big output/);
+});
+
+test('A detached job whose long line holds bytes that are not UTF-8 fails instead of guessing them', () => {
+  expect(one('return String(await sh("sleep 1; printf \'%120000s\\\\377\\\\n\' x | tr \' \' y")).length', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300 })).toMatch(/could not be read/);
+});
+
+test('A tool result Claude Code saved under another format label is still read back whole', () => {
+  expect(one('return String(await sh("seq 1 10500")).trim().split("\\n").length', { tools: NO_BASH, swapFormat: 'JSON' })).toBe('10500');
 });

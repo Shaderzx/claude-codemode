@@ -25,6 +25,10 @@ type Case = {
   hugePageAt?: number
   persistBash?: boolean
   deniedWriteMessage?: string
+  deniedCreateMessage?: string
+  pageErrorAt?: number
+  truncateLimited?: boolean
+  abortStyle?: string
 }
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -61,12 +65,21 @@ const err = (text: string) => ({ isError: true, text, result: text })
 const ok = (text: string, result: unknown = text) => ({ text, result })
 
 const readTimes = new Map<string, number>()
+let bashCwd = ''
+const writePath = (raw: unknown) => {
+  const p = String(raw ?? '').trim()
+  if (p === '~' || p.startsWith('~/')) return home + p.slice(1)
+  return p.startsWith('/') ? p : join(bashCwd || cwd, p)
+}
 const numbered = (lines: string[], from: number) => lines.map((l, i) => String(from + i) + '\t' + l).join('\n')
 const seen = new Map<string, number>()
 
-const shell = (command: string) =>
+const shell = (command: string, keepCwd = false) =>
   new Promise<{ code: number; out: string }>((done) => {
-    const p = spawn('bash', ['-c', command], { cwd, env: { ...process.env, HOME: home } })
+    const marker = join(home, '.bash-cwd')
+    const run = keepCwd ? command + '\n__cm_rc=$?; pwd > ' + JSON.stringify(marker) + '; exit $__cm_rc' : command
+    const p = spawn('bash', ['-c', run], { cwd: keepCwd ? bashCwd || cwd : cwd, env: { ...process.env, HOME: home } })
+    if (keepCwd) p.on('close', () => { try { bashCwd = readFileSync(marker, 'utf8').trim() } catch {} })
     let out = ''
     p.stdout.setEncoding('utf8').on('data', (t: string) => { out += t })
     p.stderr.setEncoding('utf8').on('data', (t: string) => { out += t })
@@ -97,12 +110,15 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       const offset = typeof a.offset === 'number' ? a.offset : 1
       const limit = typeof a.limit === 'number' ? a.limit : lines.length
       if (offset > lines.length) return ok('<system-reminder>Warning: the file exists but is shorter than the provided offset (' + offset + '). The file has ' + lines.length + ' lines.</system-reminder>')
+      if (typeof a.limit === 'number' && c.pageErrorAt === offset) return err('EACCES: permission denied, open ' + p)
+      if (a.limit === undefined && statSync(p).size > 256 * 1024)
+        return err('File content (' + Math.round(statSync(p).size / 1024) + 'KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
       if (c.hugePageAt === offset) return ok(numbered(['\\'.repeat(1_200_000), '\\'.repeat(1_200_000)], offset))
       let part = lines.slice(offset - 1, offset - 1 + limit)
       const tokens = Math.ceil(part.join('\n').length / 4)
       let cut = false
       if (tokens > 25000) {
-        if (typeof a.limit === 'number')
+        if (typeof a.limit === 'number' && !c.truncateLimited)
           return err('File content (' + tokens + ' tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.')
         let n = 0
         for (let size = 0; n < part.length && Math.ceil((size + (part[n] as string).length + 1) / 4) <= 25000; n++) size += (part[n] as string).length + 1
@@ -115,13 +131,14 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
     }
     case 'Write': {
       if (c.deniedWriteMessage !== undefined) return err(c.deniedWriteMessage)
-      if (existsSync(String(a.file_path)) && readTimes.has(String(a.file_path)) && statSync(String(a.file_path)).mtimeMs !== readTimes.get(String(a.file_path))) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
-      writeFileSync(String(a.file_path), String(a.content))
-      readTimes.set(String(a.file_path), statSync(String(a.file_path)).mtimeMs)
+      const w = writePath(a.file_path)
+      if (existsSync(w) && readTimes.has(w) && statSync(w).mtimeMs !== readTimes.get(w)) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
+      writeFileSync(w, String(a.content))
+      readTimes.set(w, statSync(w).mtimeMs)
       return ok('File created successfully at: ' + a.file_path)
     }
     case 'Edit': {
-      const p = String(a.file_path)
+      const p = writePath(a.file_path)
       if (c.deniedWriteMessage !== undefined) return err(c.deniedWriteMessage)
       if (existsSync(p) && readTimes.has(p) && statSync(p).mtimeMs !== readTimes.get(p)) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
       const s = readFileSync(p, 'utf8')
@@ -143,7 +160,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       }
       if (tool !== 'Bash' && Buffer.byteLength(command) > 8192)
         return err('ERROR: Command too large (' + Buffer.byteLength(command) + ' bytes, limit 8192). If you\'re writing file content, use the native Write/Edit tool instead. ctx_shell is for reading command output only (git, cargo, npm, etc.).')
-      const r = await shell(command)
+      const r = await shell(command, tool === 'Bash')
       if (tool !== 'Bash' && c.compressShell && a.raw !== true) return ok('[Firewalled ' + tool + ' output — ' + r.out.length + ' chars, stored out-of-band]')
       if (tool === 'Bash' && c.persistBash && r.out.length > 30000) {
         const saved = join(c.env?.CLAUDE_CONFIG_DIR ?? join(home, '.claude'), 'projects', 'p', 's', 'tool-results', 'toolu_' + calls.length + '.txt')
@@ -156,6 +173,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
     }
     case 'mcp__lean-ctx__ctx_patch': {
       const p = String(a.path)
+      if (a.op === 'create' && c.deniedCreateMessage !== undefined) return err(c.deniedCreateMessage)
       if (a.op === 'create') {
         if (existsSync(p)) return err('ERROR: ' + p + ' already exists — create is for new files only. Use anchored ops')
         mkdirSync(dirname(p), { recursive: true })
@@ -254,6 +272,7 @@ const $ = {
         while (true) {
           if (abortAt !== undefined && Date.now() >= abortAt) {
             child.kill('SIGKILL')
+            if (c.abortStyle === 'dom') throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
             throw new Error('codemode: $.process.spawn(node) aborted')
           }
           const piece = queue.shift()

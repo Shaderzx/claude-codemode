@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -268,7 +268,7 @@ test('A cut gives every output item a share instead of dropping the small ones',
   expect(text).toContain('TAIL end');
   expect(text).toContain('BIG aaa');
   expect(text).toContain('BIG2 bbb');
-  expect(text.length).toBeLessThan(2600);
+  expect(text.length).toBeLessThanOrEqual(2000);
 });
 
 test('A cut gives every key of a returned object a share', () => {
@@ -331,7 +331,7 @@ test('The output stays within max_output_chars however many items a run prints',
 test('A cut gives every key of a single-line object a share', () => {
   const text = one('// @options: {"max_output_chars": 2000}\nreturn { first: "a".repeat(15000), critical: "BUILD_SUMMARY_42", last: "b".repeat(15000) }');
   expect(text).toContain('BUILD_SUMMARY_42');
-  expect(text.length).toBeLessThanOrEqual(2300);
+  expect(text.length).toBeLessThanOrEqual(2000);
 });
 
 test('waitFor() holds its timeout even while a check is still running', () => {
@@ -998,16 +998,23 @@ test('A cut through a line of emoji never splits one in half', () => {
 });
 
 
-test('A printed persisted-output block never makes the mod read the file it names', () => {
+test('A printed persisted-output block is read back only through Read, only when it is the whole answer and its preview matches', () => {
   const home = scratch();
   const saved = join(home, '.claude', 'projects', 'p', 's', 'tool-results', 'k.txt');
   execFileSync('mkdir', ['-p', dirname(saved)]);
   writeFileSync(saved, 'TOP-SECRET-VALUE-42\n');
   const block = (preview: string) => '<persisted-output>\nOutput too large (1.0KB). Full output saved to: ' + saved + '\n\nPreview (first 2KB):\n' + preview + '\n</persisted-output>';
   const script = (preview: string) => 'return String(await sh("printf %s " + quote(' + JSON.stringify(block(preview)) + ')))';
-  expect(one('return String(await sh("echo before; printf %s " + quote(' + JSON.stringify(block('TOP')) + ')))', { home })).not.toContain('TOP-SECRET-VALUE-42');
+  const readsOf = (o: Out) => o.calls.filter((c) => c.tool === 'Read' && c.args.file_path === saved).length;
+  const prefixed = run({ home, steps: [{ script: 'return String(await sh("echo before; printf %s " + quote(' + JSON.stringify(block('TOP')) + ')))' }] });
+  expect(prefixed.results[0]!.text).not.toContain('TOP-SECRET-VALUE-42');
+  expect(readsOf(prefixed)).toBe(0);
   expect(one(script('nothing alike'), { home })).not.toContain('TOP-SECRET-VALUE-42');
-  expect(one(script('TOP'), { home, denyReadPaths: ['/k.txt'] })).not.toContain('TOP-SECRET-VALUE-42');
+  const denied = run({ home, denyReadPaths: ['/k.txt'], steps: [{ script: script('TOP') }] });
+  expect(denied.results[0]!.text).not.toContain('TOP-SECRET-VALUE-42');
+  const whole = run({ home, steps: [{ script: script('TOP') }] });
+  expect(whole.results[0]!.text).toBe('TOP-SECRET-VALUE-42\n');
+  expect(readsOf(whole)).toBeGreaterThan(0);
 });
 
 test('write() then edit() of a file the session created works without force', () => {
@@ -1087,4 +1094,111 @@ test('A saved Bash output the session may not read back says so, without advice 
 test('A saved Bash output comes back whole under CLAUDE_CONFIG_DIR', () => {
   const home = scratch();
   expect(one('return String(await sh("printf %40000s x | tr \' \' y")).length', { home, persistBash: true, env: { CLAUDE_CONFIG_DIR: join(home, 'cfg') } })).toBe('40000');
+});
+
+
+test('A direct Write to a ~ path or a path with stray whitespace is checked like its absolute path', () => {
+  const home = scratch();
+  const f = join(home, 'keep.txt');
+  writeFileSync(f, 'keep\n');
+  for (const path of ['~/keep.txt', ' ' + f, f + '\n']) {
+    expect(one('return await call("Write", { file_path: ' + JSON.stringify(path) + ', content: "x" }).then((r) => r.ok ? "wrote" : r.error)', { home })).toContain('has not been read');
+    expect(readFileSync(f, 'utf8')).toBe('keep\n');
+  }
+});
+
+test('A direct Write or Edit to a relative path is refused, since a shell cd can move where it lands', () => {
+  const dir = scratch();
+  execFileSync('mkdir', [join(dir, 'sub')]);
+  writeFileSync(join(dir, 'sub', 'target.txt'), 'keep\n');
+  const text = one('await sh("cd sub")\nreturn await call("Write", { file_path: "target.txt", content: "x" }).then((r) => r.ok ? "wrote" : r.error)', { cwd: dir });
+  expect(text).toContain('absolute path');
+  expect(readFileSync(join(dir, 'sub', 'target.txt'), 'utf8')).toBe('keep\n');
+});
+
+test('A Read with only an offset of a file over the size cap is read in pages', () => {
+  const dir = scratch();
+  const f = join(dir, 'large.txt');
+  writeFileSync(f, Array.from({ length: 6000 }, (_, i) => 'line ' + i + ' ' + 'y'.repeat(56)).join('\n') + '\n');
+  expect(one('const r = await call("Read", { file_path: ' + JSON.stringify(f) + ', offset: 1 })\nreturn r.ok ? r.text.split("\\n").length : r.error')).toBe('6001');
+});
+
+test('A whole Read with numbered lines but no file fields does not count as reading the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'x.txt');
+  writeFileSync(f, 'one\ntwo\n');
+  const text = one('await tools.Read({ file_path: ' + JSON.stringify(f) + ' })\nreturn await edit(' + JSON.stringify(f) + ', "two", "X").then(() => "edited", (e) => e.message)', { tools: NO_BASH, readRewrite: '1\tone' });
+  expect(text).toContain('has not been read');
+});
+
+test('A patch-tool write() that a hook refuses is not done another way', () => {
+  const dir = scratch();
+  const f = join(dir, 'guarded.txt');
+  writeFileSync(f, 'keep\n');
+  const out = run({ tools: NO_BASH, deniedCreateMessage: 'PreToolUse:mcp__lean-ctx__ctx_patch hook error: blocked: this file already exists and is protected', steps: [{ script: 'await read(' + JSON.stringify(f) + ')\nreturn await write(' + JSON.stringify(f) + ', "x").then(() => "wrote", (e) => e.message)' }] });
+  expect(out.results[0]!.text).toContain('protected');
+  expect(out.calls.some((c) => c.args.op === 'replace_unique')).toBe(false);
+  expect(readFileSync(f, 'utf8')).toBe('keep\n');
+});
+
+test('A variable named of before a division keeps the template whole', () => {
+  expect(one('const of = 4\nconst n = of / 2; const t = `\n// @text KEEP\nx\n`\nreturn t')).toBe('\n// @text KEEP\nx\n');
+});
+
+test('write() through the patch tool refuses a file changed since the session read it, and force replaces it', () => {
+  const dir = scratch();
+  const f = join(dir, 'moved.txt');
+  writeFileSync(f, 'one\n');
+  const out = run({ tools: NO_BASH, steps: [{ script: 'await read(' + JSON.stringify(f) + ')\nawait sh("echo changed > ' + f + '")\nreturn await write(' + JSON.stringify(f) + ', "mine\\n").then(() => "wrote", (e) => e.message)' }, { script: 'return await write(' + JSON.stringify(f) + ', "mine\\n", { force: true })' }] });
+  expect(out.results[0]!.text).toContain('changed since');
+  expect(out.results[1]!.text).toBe('wrote ' + f);
+  expect(readFileSync(f, 'utf8')).toBe('mine\n');
+});
+
+test('A saved Bash output with CRLF line endings, a blank start, or a folder with a space comes back whole', () => {
+  expect(one('return String(await sh("perl -e \'print qq(line\\\\r\\\\n) x 7000\'")).split("\\n").filter((l) => l === "line").length', { persistBash: true })).toBe('7000');
+  expect(one('return String(await sh("printf %1500s; printf %40000s x | tr \' \' y")).length', { persistBash: true })).toBe('41500');
+  const home = scratch();
+  expect(one('return String(await sh("printf %40000s x | tr \' \' y")).length', { home, persistBash: true, env: { CLAUDE_CONFIG_DIR: join(home, 'c fg') } })).toBe('40000');
+});
+
+test('A big object of many-line values over the cap still fills most of the cap', () => {
+  const text = one('// @options: {"max_output_chars": 1000000}\nreturn { a: Array.from({ length: 300000 }, (_, i) => i), b: "KEEP_B" }');
+  expect(text).toContain('"b": "KEEP_B"');
+  expect(text.length).toBeGreaterThan(900000);
+});
+
+test('A Read error on the first page of a paged read is reported as it is', () => {
+  const dir = scratch();
+  const f = join(dir, 'big.txt');
+  writeFileSync(f, Array.from({ length: 3000 }, (_, i) => 'line ' + i + ' ' + 'x'.repeat(60)).join('\n') + '\n');
+  expect(one('return await tools.Read({ file_path: ' + JSON.stringify(f) + ' }).then(() => "read", (e) => e.message)', { pageErrorAt: 1 })).toContain('EACCES');
+});
+
+test('A page Read cut at the token cap is read again smaller, never taken as the end of the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'big.txt');
+  writeFileSync(f, Array.from({ length: 3000 }, (_, i) => 'line ' + i + ' ' + 'x'.repeat(60)).join('\n') + '\n');
+  expect(one('return (await read(' + JSON.stringify(f) + ')).split("\\n").length', { truncateLimited: true })).toBe('3001');
+});
+
+test('A run stopped by a standard AbortError is reported as stopped', () => {
+  const out = run({ abortAfterMs: 1500, abortStyle: 'dom', steps: [{ script: 'text("partial")\nawait sh("perl -e \'select(undef, undef, undef, 4)\'")' }] });
+  expect(out.results[0]!.text).toMatch(/\[aborted\]/);
+});
+
+test('waitFor() takes every: 0 as fast polling and checks at least once near the deadline', () => {
+  expect(one('let n = 0\nreturn await waitFor(() => n++ >= 3, { every: 0, timeout: 500 })')).toBe('true');
+  expect(one('// @options: {"timeout_ms": 1000}\nreturn await waitFor(() => "yes")')).toBe('yes');
+});
+
+test('A byte-range read-back stays exact after a lone surrogate', () => {
+  const original = '\uD800é' + '0123456789'.repeat(30000) + '\ntail';
+  const text = one('return "\\uD800\\u00e9" + "0123456789".repeat(30000) + "\\ntail"');
+  const m = /read them back with sh\(("[^\n]*?")\)…/.exec(text);
+  expect(m).not.toBeNull();
+  const back = execFileSync('bash', ['-c', JSON.parse(m![1]!)], { encoding: 'utf8', maxBuffer: 10_000_000 });
+  const head = text.slice(0, text.indexOf('…')).replace(/\n$/, '');
+  expect(back.length).toBeGreaterThan(0);
+  expect(original.startsWith(head + back)).toBe(true);
 });

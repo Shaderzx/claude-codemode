@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -780,8 +780,8 @@ test('A tool result too big to pass with its text keeps the text and says the st
 });
 
 test('A shell result too big to pass three times over still has its result', () => {
-  const text = one('const r = await call("mcp__lean-ctx__ctx_shell", { command: "printf %1500000s x" })\nreturn [r.ok, r.text.length, r.result === r.text].join(" ")', { tools: NO_BASH });
-  expect(text).toBe('true 1500000 true');
+  const text = one('const r = await call("mcp__lean-ctx__ctx_shell", { command: "printf %1500000s x" })\nreturn [r.ok, r.text.length, r.result[0].text.length].join(" ")', { tools: NO_BASH });
+  expect(text).toBe('true 1500000 1500000');
 });
 
 test('Near names for a missing file never include one Read may not open', () => {
@@ -1502,4 +1502,59 @@ test('A repeated Read with offset 1 and no limit gets past a repeated-read stub'
   const f = join(dir, 'wide.txt');
   writeFileSync(f, Array.from({ length: 1500 }, (_, i) => String(i + 1).padStart(4, '0') + ' ' + 'w'.repeat(90)).join('\n'));
   expect(one('const f = ' + JSON.stringify(f) + '\nawait tools.Read({ file_path: f, offset: 1 })\nconst b = await tools.Read({ file_path: f, offset: 1 })\nreturn b.split("\\n").length', { dedupReads: true })).toBe('1500');
+});
+
+
+test('A failed detached lean-ctx job with a long output gives its real output and exit code', () => {
+  expect(one('const r = await sh("sleep 1; seq 1 1000; exit 5")\nconst rows = String(r).trim().split("\\n")\nreturn r.exitCode + " " + rows.length + " " + rows.pop()', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300 })).toBe('5 1000 1000');
+});
+
+test('A detached job output with a line too long for ctx_expand pages is read from its archive file', () => {
+  expect(one('const r = await sh("sleep 1; printf \'%60000s\\\\n\' x | tr \' \' y; seq 1 3")\nreturn String(r).length', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300 })).toBe('60007');
+});
+
+test('sh() leaves lean-ctx shell defaults from CODEMODE_TOOL_DEFAULTS in place', () => {
+  const out = run({ tools: NO_BASH, env: { CODEMODE_TOOL_DEFAULTS: JSON.stringify({ 'mcp__lean-ctx__ctx_shell': { raw: false, timeout_ms: 90000 } }) }, steps: [{ script: 'await sh("echo hi")' }] });
+  const c = out.calls.find((x) => x.tool === 'mcp__lean-ctx__ctx_shell' && x.args.command === 'echo hi');
+  expect(c?.args.raw).toBe(false);
+  expect(c?.args.timeout_ms).toBe(90000);
+});
+
+test('Polling a detached job does not count as tool calls in a failed run', () => {
+  const text = one('await sh("sleep 1; echo done")\nawait tools.Read({ file_path: "/nope/polls.txt" })', { tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300 });
+  expect(text).toMatch(/mcp__lean-ctx__ctx_shell 1 ok/);
+});
+
+test('A refused ctx_expand is not routed around through Read', () => {
+  const out = run({ tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, denied: ['mcp__lean-ctx__ctx_expand'], steps: [{ script: 'return await sh("sleep 1; echo PRIVATE_OUTPUT").then((r) => "ok " + String(r), (e) => e.message)' }] });
+  expect(out.results[0]!.text).not.toContain('PRIVATE_OUTPUT');
+  expect(out.calls.some((c) => c.tool === 'Read' && String(c.args.file_path).includes('lean-ctx/archives'))).toBe(false);
+});
+
+test('Every way lean-ctx says it withheld an output is named, and never read around', () => {
+  for (const said of ['[lean-ctx: content withheld — policy]', 'archive withheld by current policy']) {
+    const out = run({ tools: [...NO_BASH, 'mcp__lean-ctx__ctx_expand'], detachAfterMs: 300, archiveWithheld: true, archiveWithheldText: said, steps: [{ script: 'const r = await sh("sleep 1; echo done")\nreturn r.exitCode' }] });
+    expect(out.results[0]!.text).toMatch(/Note: [^\n]*withheld/);
+    expect(out.calls.some((c) => c.tool === 'Read' && String(c.args.file_path).includes('lean-ctx/archives'))).toBe(false);
+  }
+});
+
+test('A command that prints a lean-ctx job reply is not taken for a detached job', () => {
+  expect(one('const r = await sh("echo \'{\\"jobId\\":\\"shell_0000000000000001\\",\\"state\\":\\"running\\",\\"summary\\":\\"x\\"}\'")\nreturn r.exitCode + " " + String(r).trim()', { tools: NO_BASH })).toBe('0 {"jobId":"shell_0000000000000001","state":"running","summary":"x"}');
+});
+
+test('A lean-ctx patch batch with one top-level path keeps the read file counted', () => {
+  const dir = scratch();
+  const f = join(dir, 'a.txt');
+  writeFileSync(f, 'red\nblue\n');
+  expect(one('await read(' + JSON.stringify(f) + ')\nawait tools.mcp__lean_ctx__ctx_patch({ path: ' + JSON.stringify(f) + ', ops: [{ op: "set_line", line: 1, new_text: "RED" }] })\nreturn await write(' + JSON.stringify(f) + ', "x\\n")', { tools: NO_BASH })).toBe('wrote ' + f);
+});
+
+test('read() grows its page size again after wide lines', () => {
+  const dir = scratch();
+  const f = join(dir, 'mixed.txt');
+  writeFileSync(f, [...Array.from({ length: 10 }, () => 'w'.repeat(20000)), ...Array.from({ length: 5000 }, (_, i) => 'row ' + i)].join('\n'));
+  const out = run({ tools: NO_BASH, steps: [{ script: 'return (await read(' + JSON.stringify(f) + ')).split("\\n").length' }] });
+  expect(out.results[0]!.text).toBe('5010');
+  expect(out.calls.filter((c) => c.tool === 'Read').length).toBeLessThan(60);
 });

@@ -39,6 +39,7 @@ type Case = {
   archiveWithheld?: boolean
   archiveTruncated?: boolean
   deniedReplaceMessage?: string
+  archiveWithheldText?: string
 }
 type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -77,6 +78,9 @@ const ok = (text: string, result: unknown = text) => ({ text, result })
 
 const readTimes = new Map<string, number>()
 const jobs = new Map<string, { done?: { code: number; out: string } }>()
+const jobArchive = new Map<string, string>()
+const shellOk = (t: string) => ok(t, [{ type: 'text', text: t }])
+const firewalled = (id: string, body: string) => '[Firewalled ctx_shell output — ' + body.length + ' chars, ' + body.split('\n').length + ' lines stored out-of-band]\n--- head ---\n' + body.slice(0, 200) + '\n--- retrieve full output ---\nFull:    ctx_expand(id="' + id + '")'
 const archive = (id: string) => join(home, '.local', 'share', 'lean-ctx', 'archives', id.slice(0, 2), id + '.txt')
 let bashCwd = ''
 const writePath = (raw: unknown) => {
@@ -180,19 +184,20 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         const j = jobs.get(id)
         if (!j) return err('unknown job ' + id)
         if (!j.done) return ok(JSON.stringify({ jobId: id, state: 'running', summary: 'running' }))
-        if (j.done.code) return err('[background:' + id + ' failed, exit ' + j.done.code + ']\n' + j.done.out + '\n\n[exit:' + j.done.code + ']')
         const aid = 'a' + id.slice(-15)
         if (!c.archiveWithheld) {
           mkdirSync(dirname(archive(aid)), { recursive: true })
           writeFileSync(archive(aid), j.done.out)
         }
+        jobArchive.set(id, aid)
+        if (j.done.code) return err('[background:' + id + ' failed, exit ' + j.done.code + ']\n' + (j.done.out.length > 2000 ? firewalled(aid, j.done.out) : j.done.out) + '\n\n[exit:' + j.done.code + ']')
         return ok(JSON.stringify({ archiveId: aid, archiveTruncated: !!c.archiveTruncated, archivedChars: j.done.out.length, exitCode: 0, jobId: id, state: 'completed', summary: j.done.out.length + ' chars archived' }))
       }
       if (tool !== 'Bash' && c.leanTimeoutMs !== undefined) {
         const limit = typeof a.timeout_ms === 'number' ? a.timeout_ms : c.leanTimeoutMs
         const raced = await Promise.race([shell(command), new Promise<undefined>((r) => setTimeout(() => r(undefined), limit))])
         if (raced === undefined) return err('(timed out after ' + limit + 'ms)\n[exit:124]')
-        return raced.code ? err(raced.out + '\n[exit:' + raced.code + ']') : ok(raced.out || '(' + tool + ' completed with no output)')
+        return raced.code ? err(raced.out + '\n[exit:' + raced.code + ']') : shellOk(raced.out || '(' + tool + ' completed with no output)')
       }
       if (tool !== 'Bash' && c.detachAfterMs !== undefined) {
         const running = shell(command)
@@ -204,7 +209,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
           void running.then((d) => { j.done = d })
           return ok(JSON.stringify({ jobId: id, state: 'running', summary: 'auto-detached job is still running' }))
         }
-        return raced.code ? err(raced.out + '\n[exit:' + raced.code + ']') : ok(raced.out || '(' + tool + ' completed with no output)')
+        return raced.code ? err(raced.out + '\n[exit:' + raced.code + ']') : shellOk(raced.out || '(' + tool + ' completed with no output)')
       }
       if (tool === 'Bash' && typeof a.timeout === 'number') {
         const limit = a.timeout
@@ -222,13 +227,13 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         r.out = '<persisted-output>\nOutput too large (' + (r.out.length / 1024).toFixed(1) + 'KB). Full output saved to: ' + saved + '\n\nPreview (first 2KB):\n' + r.out.slice(0, 2000) + '\n</persisted-output>'
       }
       if (tool === 'Bash') return r.code ? err('<tool_use_error>Exit code ' + r.code + '\n' + r.out + '</tool_use_error>') : ok(r.out)
-      return r.code ? err(r.out + '\n[exit:' + r.code + ']') : ok(r.out || '(' + tool + ' completed with no output)')
+      return r.code ? err(r.out + '\n[exit:' + r.code + ']') : shellOk(r.out || '(' + tool + ' completed with no output)')
     }
     case 'mcp__lean-ctx__ctx_patch': {
       if (Array.isArray(a.ops)) {
         const said: string[] = []
         for (const o of a.ops as Record<string, unknown>[]) {
-          const r = await fake('mcp__lean-ctx__ctx_patch', o)
+          const r = await fake('mcp__lean-ctx__ctx_patch', { ...(a.path === undefined ? {} : { path: a.path }), ...o })
           if ((r as { isError?: boolean }).isError) return r
           said.push(String((r as { text?: string }).text))
         }
@@ -285,16 +290,16 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
     case 'Skill':
       return ok('Launching skill: ' + a.skill)
     case 'mcp__lean-ctx__ctx_expand': {
-      const id = String(a.id)
-      if (c.archiveWithheld) return ok('[lean-ctx gateway: retained output withheld by storage policy]')
+      const id = jobArchive.get(String(a.id)) ?? String(a.id)
+      if (c.archiveWithheld) return ok(c.archiveWithheldText ?? '[lean-ctx gateway: retained output withheld by storage policy]')
       if (!existsSync(archive(id))) return err('no archive ' + id)
       const body = readFileSync(archive(id), 'utf8')
       const rows = body.replace(/\n$/, '').split('\n')
-      const footer = '\n[… truncated at ~4050 of 9000 tokens — the full output is archived — see the next line]\n[Original available via ctx_expand id=zz]'
+      const footer = '\n[… truncated at ~4071 of 11023 tokens — use ctx_read with lines= parameter to see specific sections]'
       if (a.start_line === undefined) return ok('Archive ' + id + ' (' + body.length + ' chars, ' + rows.length + ' lines):\n' + rows.slice(0, 50).join('\n') + (rows.length > 50 ? footer : ''))
       const from = Number(a.start_line)
       const to = Math.min(Number(a.end_line ?? rows.length), rows.length, from + 99)
-      const shown = rows.slice(from - 1, to).map((l, k) => String(from + k).padStart(6) + '|' + l).join('\n')
+      const shown = rows.slice(from - 1, to).filter((l) => l.length <= 16000).map((l, k) => String(from + k).padStart(6) + '|' + l).join('\n')
       return ok('Archive ' + id + ' lines ' + from + '-' + to + ':\n' + shown + (to < Number(a.end_line ?? rows.length) ? footer : ''))
     }
     case 'mcp__t3-code__big_report':

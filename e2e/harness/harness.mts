@@ -30,6 +30,9 @@ type Case = {
   truncateLimited?: boolean
   abortStyle?: string
   engineForgets?: boolean
+  changeAfterPage?: number
+  readDelayMs?: number
+  listThrows?: boolean
 }
 type Step = { compact?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
@@ -96,6 +99,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
   if (!names.includes(tool)) throw new Error('codemode: $.tool.call: no tool named "' + tool + '" in this session')
   switch (tool) {
     case 'Read': {
+      if (c.readDelayMs) await new Promise((r) => setTimeout(r, c.readDelayMs))
       if ((c.denyReadPaths ?? []).some((d) => String(a.file_path ?? '').endsWith(d))) return { deny: 'Permission to read ' + String(a.file_path) + ' has been denied.' }
       if (c.readRewrite !== undefined) return ok(c.readRewrite)
       if (c.denyReadFrom !== undefined && Number(a.offset ?? 1) >= c.denyReadFrom) return { deny: 'Read of this range is denied by policy' }
@@ -128,6 +132,7 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
       }
       seen.set(key, statSync(p).mtimeMs)
       readTimes.set(p, statSync(p).mtimeMs)
+      if (typeof a.limit === 'number' && c.changeAfterPage === offset) setTimeout(() => writeFileSync(p, text + 'changed meanwhile\n'), 0)
       return ok(numbered(part, offset), { type: 'text', file: { filePath: p, content: part.join('\n'), numLines: part.length, startLine: offset, totalLines: lines.length, ...(cut ? { truncatedByTokenCap: true } : {}) } })
     }
     case 'Write': {
@@ -233,18 +238,37 @@ const fake = async (tool: string, a: Record<string, unknown>) => {
   return err('unhandled tool ' + tool)
 }
 
-const handlers: Record<string, (...x: unknown[]) => Promise<unknown>> = {}
+const hooks: Record<string, (...x: unknown[]) => Promise<unknown>> = {}
+const catches: Record<string, (...x: unknown[]) => Promise<unknown>> = {}
 mod.register((name: string, h: (...x: unknown[]) => Promise<unknown>) => {
-  handlers[name] = h
-  return { catch: () => {} }
+  hooks[name] = h
+  return { catch: (f: (...x: unknown[]) => Promise<unknown>) => { catches[name] = f } }
 })
+const handlers: Record<string, (...x: unknown[]) => Promise<unknown>> = Object.fromEntries(
+  Object.keys(hooks).map((name) => [
+    name,
+    async ($: unknown, e: unknown, next: (x: unknown) => Promise<unknown>) => {
+      try {
+        return await hooks[name]!($, e, next)
+      } catch (error) {
+        const f = catches[name]
+        if (!f) throw error
+        return f($, e, Object.assign((x: unknown) => next(x), next, { error, called: false }))
+      }
+    },
+  ]),
+)
+let listing = true
 
 const registered: Record<string, unknown>[] = []
 let started = Date.now()
 const $ = {
   plugin: { root: join(root, 'codemode') },
   tool: {
-    list: async () => names.map((n) => ({ name: n, description: DESCRIPTIONS[n] ?? n, mcp: n.startsWith('mcp__') })),
+    list: async () => {
+      if (!listing) throw new Error('$.tool.list failed')
+      return names.map((n) => ({ name: n, description: DESCRIPTIONS[n] ?? n, mcp: n.startsWith('mcp__') }))
+    },
     register: async (d: Record<string, unknown>) => {
       registered.push(d)
       return { tool: 'mcp__codemode__' + d.name }
@@ -331,6 +355,7 @@ const startSession = async () => {
   out.description = String(registered.at(-1)?.description ?? '')
 }
 await startSession()
+if (c.listThrows) listing = false
 for (const s of c.steps) {
   started = Date.now()
   if (s.setDenied) { c.denied = s.setDenied; continue }

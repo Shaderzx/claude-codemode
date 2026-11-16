@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { compact?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean };
+type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean };
 type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
 
 const made: string[] = [];
@@ -750,13 +750,13 @@ test('TEXT can be returned and stringified like any object', () => {
   expect(one('// @text a\nhello\n// @end\nconst t = TEXT\nreturn t')).toBe('{\n  "a": "hello"\n}');
 });
 
-test('A patch-tool write over a file with CRLF line endings says read() gave them back as \\n', () => {
+test('A patch-tool write replaces a file with CRLF line endings that read() gave back with \\n', () => {
   const dir = scratch();
   const f = join(dir, 'crlf.txt');
   writeFileSync(f, 'x\r\ny\r\n');
-  const text = one('await read(' + JSON.stringify(f) + ')\nawait write(' + JSON.stringify(f) + ', "z")', { tools: NO_BASH });
-  expect(text).toContain('CRLF');
-  expect(readFileSync(f, 'utf8')).toBe('x\r\ny\r\n');
+  const text = one('await read(' + JSON.stringify(f) + ')\nreturn await write(' + JSON.stringify(f) + ', "z")', { tools: NO_BASH });
+  expect(text).toBe('wrote ' + f);
+  expect(readFileSync(f, 'utf8')).toBe('z');
 });
 
 test('sh() runs in the foreground even when the tool defaults ask for the background', () => {
@@ -1326,4 +1326,71 @@ test('A tight cut of very long lines still names how to read them back', () => {
   const text = one('// @options: {"max_output_chars": 9000}\nfor (let i = 0; i < 30; i++) text(String(i).repeat(60000))');
   expect(text).toContain('tail -c +');
   expect(text.length).toBeLessThanOrEqual(9000);
+});
+
+
+test('A patch edit of a read file changed outside since the read stops counting it as read', () => {
+  for (const tools of [undefined, NO_BASH]) {
+    const dir = scratch();
+    const f = join(dir, 'c.txt');
+    writeFileSync(f, 'inside\n');
+    const text = one('await read(' + JSON.stringify(f) + ')\nawait sh("echo outside > ' + f + '")\nawait tools.mcp__lean_ctx__ctx_patch({ op: "replace_unique", path: ' + JSON.stringify(f) + ', old_text: "outside", new_text: "x" })\nreturn await write(' + JSON.stringify(f) + ', "clobbered\\n").then(() => "wrote", (e) => e.message)', tools ? { tools } : {});
+    expect(text).not.toBe('wrote');
+    expect(readFileSync(f, 'utf8')).toBe('x\n');
+  }
+});
+
+test('A file that changes while it is read in pages is not taken as read', () => {
+  const dir = scratch();
+  const f = join(dir, 'big.txt');
+  writeFileSync(f, Array.from({ length: 3000 }, (_, i) => 'line ' + i + ' ' + 'x'.repeat(60)).join('\n') + '\n');
+  const text = one('const r = await call("Read", { file_path: ' + JSON.stringify(f) + ' })\nreturn (r.ok ? "read" : r.error) + " | " + await edit(' + JSON.stringify(f) + ', "line 1 ", "X ").then(() => "edited", (e) => e.message)', { tools: NO_BASH, changeAfterPage: 1 });
+  expect(text).toContain('changed while');
+  expect(text).toContain('has not been read');
+});
+
+test('read() of a file of exactly 2000 lines counts as read in the same script', () => {
+  const dir = scratch();
+  const f = join(dir, 'exact.txt');
+  writeFileSync(f, Array.from({ length: 2000 }, (_, i) => 'row ' + i).join('\n'));
+  expect(one('await read(' + JSON.stringify(f) + ')\nreturn await edit(' + JSON.stringify(f) + ', "row 1999", "LAST")', { tools: NO_BASH })).toBe('edited ' + f);
+});
+
+test('An async function expression before a division keeps the template whole', () => {
+  expect(one('const n = async function () {} / 2; const t = `\n// @text KEEP\nx\n`\nreturn t')).toBe('\n// @text KEEP\nx\n');
+});
+
+test('An object key named class does not change how a later block is read', () => {
+  expect(one('const o = { a: 1, class: 1 }\nif (true) {}\n/`/.test("a")\n// @text a\nhi\n// @end\nreturn TEXT.a')).toBe('hi');
+});
+
+test('A run that times out while a big Read is read in pages names the Read as still running', () => {
+  const dir = scratch();
+  const f = join(dir, 'big.txt');
+  writeFileSync(f, Array.from({ length: 3000 }, (_, i) => 'line ' + i + ' ' + 'x'.repeat(60)).join('\n') + '\n');
+  const text = one('// @options: {"timeout_ms": 1500}\nawait tools.Read({ file_path: ' + JSON.stringify(f) + ' })', { readDelayMs: 400 });
+  expect(text).toMatch(/still running[^\n]*Read \(/);
+});
+
+test('A command whose output starts like a background notice still passes', () => {
+  expect(one('const r = await sh("echo \'Command was moved to the background (ID: x)\'")\nreturn r.exitCode + " " + String(r).trim()')).toBe('0 Command was moved to the background (ID: x)');
+});
+
+test('A change that keeps the modification time still counts as a change', () => {
+  const dir = scratch();
+  const f = join(dir, 'same-time.txt');
+  writeFileSync(f, 'one\n');
+  const text = one('await read(' + JSON.stringify(f) + ')\nawait sh("touch -r ' + f + ' ' + f + '.ref; printf \'longer text\\\\n\' > ' + f + '; touch -r ' + f + '.ref ' + f + '")\nreturn await write(' + JSON.stringify(f) + ', "mine\\n").then(() => "wrote", (e) => e.message)', { tools: NO_BASH });
+  expect(text).toContain('changed since');
+  expect(readFileSync(f, 'utf8')).toBe('longer text\n');
+});
+
+test('waitFor() takes a timeout given as a string of digits', () => {
+  expect(one('return await waitFor(() => false, { timeout: "300", every: 50 }).then(() => "done", (e) => e.message)')).toContain('timed out after 300ms');
+});
+
+test('A failure inside codemode\'s own hook comes back as a failed run, not a crash or a skipped guard', () => {
+  const text = one('return 1', { listThrows: true });
+  expect(text).toContain('[runner]');
+  expect(text).toContain('$.tool.list failed');
 });

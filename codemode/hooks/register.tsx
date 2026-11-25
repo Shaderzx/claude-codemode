@@ -1679,6 +1679,7 @@ const writeTargets = (m: Request, cwd: string | undefined, home: string, default
 const expire = (j: Job) => {
   j.cancelledBy = 'its start deadline'
   j.stopKind = 'cancelled'
+  j.stopped = true
   settle(j, format(Date.now() - j.started, { items: [], logs: [], kind: 'runner', failure: 'the run never started its runner within its time; none of its tool calls ran, and it will not start now.' }))
   j.exited = true
   j.onPid()
@@ -1712,9 +1713,9 @@ const LATER_ROOM = 300
 const promoteReads = (j: Job) => {
   if (j.stopped || j.gen !== sessionGen) return
   for (const [p, v] of j.reads) {
-    readPaths.add(p)
     const at = j.readAt.get(p) ?? 0
     if (at < (versionAt.get(p) ?? 0)) continue
+    readPaths.add(p)
     versionAt.set(p, at)
     if (v === undefined) readVersions.delete(p)
     else readVersions.set(p, v)
@@ -1819,9 +1820,11 @@ const stopJobs = async ($: Dollar, jobs: Job[], by: string, kind: 'cancelled' | 
     if (j.pid) continue
     j.stopped = true
     j.exited = true
+    j.onPid()
     const why = kind === 'aborted' ? 'stopped because its turn was interrupted before its runner started' : `stopped by cancel() from ${by} before its runner started`
     settle(j, format(Date.now() - j.started, { items: [], logs: [], kind, failure: `${why}; none of its tool calls ran.` }))
   }
+  if (stopping.some((j) => j.settled && j.agent === MAIN && !j.quiet)) void wake($)
   const pids = stopping.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
   await Promise.all(pids.map((p) => $.process.run(['kill', '-9', String(p)]).catch(() => undefined)))
   return stopping.length
@@ -1900,6 +1903,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
 
   const handle = async (m: Request): Promise<Record<string, unknown>> => {
     const p = m.payload
+    if (late()) return { ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this request started` }
     if (m.kind === 'store') {
       const key = `script:${String(p.key)}`
       if (p.value === undefined) await $.store.delete(key)
@@ -2139,9 +2143,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           job.readAt.set(o.path, ++readClock)
           readNow.push(o.path)
         } else {
-          if (job.gen === sessionGen) readPaths.delete(o.path)
           job.reads.delete(o.path)
-          if (job.gen === sessionGen) readVersions.delete(o.path)
+          if (job.gen === sessionGen) {
+            readPaths.delete(o.path)
+            readVersions.delete(o.path)
+            versionAt.set(o.path, ++readClock)
+          }
         }
       }
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
@@ -2294,12 +2301,18 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     return kept
   }
   const pictures: Picture[] = []
+  const realpath = (p: string) => $.process.run(['realpath', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : undefined), () => undefined)
+  const realOf = async (p: string) => {
+    const whole = await realpath(p)
+    if (whole) return whole
+    const slash = p.lastIndexOf('/')
+    const folder = slash > 0 ? await realpath(p.slice(0, slash)) : undefined
+    return folder ? folder.replace(/\/$/, '') + p.slice(slash) : p
+  }
   const respond = async (m: Request) => {
     let out: Record<string, unknown>
     const unlocks: (() => void)[] = []
-    const real = await Promise.all(
-      writeTargets(m, cwd, home, defaults).map((p) => $.process.run(['realpath', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : p), () => p)),
-    )
+    const real = await Promise.all(writeTargets(m, cwd, home, defaults).map(realOf))
     for (const path of [...new Set(real)].sort()) unlocks.push(await lockFile(path))
     try {
       out = await handle(m)
@@ -2317,12 +2330,15 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (receipt) {
       const had = job.reads.has(receipt.file)
       const before = job.reads.get(receipt.file)
+      const beforeAt = job.readAt.get(receipt.file)
       const progress = job.progress.get(receipt.file)
       const after = receipt.whole ? receipt.version : before
       undo = () => {
         if (job.reads.get(receipt.file) !== after) return
         if (had) job.reads.set(receipt.file, before)
         else job.reads.delete(receipt.file)
+        if (beforeAt === undefined) job.readAt.delete(receipt.file)
+        else job.readAt.set(receipt.file, beforeAt)
         if (progress === undefined) job.progress.delete(receipt.file)
         else job.progress.set(receipt.file, progress)
       }
@@ -2536,7 +2552,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     if (failedScripts.size > 20) failedScripts.delete(failedScripts.keys().next().value as string)
   } else if (!ended.failure && current) failedScripts.delete(raw)
-  const room = Math.max(200, maxChars - 400)
+  const room = maxChars - 400
   let parts = sections(now - started, ended)
   let full = parts.join('\n')
   if (full.length > room) {
@@ -2622,6 +2638,7 @@ export const register: Register = (on) => {
       readProgress.clear()
       progressAt.clear()
       readVersions.clear()
+      versionAt.clear()
     }
     return r
   }).catch(($, e, next) => next(e))
@@ -2656,7 +2673,7 @@ export const register: Register = (on) => {
           for (const j of jobs) j.quiet = true
           await stopJobs($, jobs, 'the interrupt', 'aborted')
         }
-        if (current && turnSeq === seq && (!mainTurnId || !turnId || turnId === mainTurnId)) {
+        if (current && turnSeq === seq) {
           mainTurn = false
           mainTurnId = undefined
           await wake($)

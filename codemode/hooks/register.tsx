@@ -729,9 +729,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     for (let tries = 0; ; tries++) {
       const now = await read(file)
       if (!now) throw empty()
-      r = await replaceWhole(now, await req('fresh', { path: file }))
+      const check = await req('fresh', { path: file })
+      r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
-      if (!unreadWrite(r) || tries >= 4) break
+      const readWhileChanging = typeof check.version !== 'string' && /not found/i.test(String(r.error))
+      if (tries >= 4 || !(unreadWrite(r) || readWhileChanging)) break
     }
     throw toolError('write: ' + r.error + endings(r.error), r)
   }
@@ -2471,8 +2473,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   let killed = false
   // The child's own timer cannot fire while a script spins synchronously, so
   // the mod kills it a little after the deadline.
+  let gone = false
   const killRunner = () => {
-    if (job.exited) return
+    if (gone) return
     killed = true
     if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
   }
@@ -2480,7 +2483,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const armWatchdog = (ms: number) => {
     watchdog = $.clock.after(ms, async () => {
       const now = await clockNow($)
-      if (job.exited || pid === undefined) return
+      if (gone || pid === undefined) return
       const left = started + timeout + 5_000 - now
       if (left > 0) armWatchdog(Math.max(50, left))
       else killRunner()
@@ -2564,6 +2567,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if ((err as Error)?.name === 'AbortError' || /\$\.process\.spawn\([^)]*\) aborted|AbortError/.test(msg)) aborted = true
     else stderr += `\n${msg}`
   }
+  gone = true
   job.exited = true
   job.pid = undefined
   watchdog.cancel()

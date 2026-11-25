@@ -1079,7 +1079,7 @@ export const sections = (ms: number, d: Ended, split = false): string[] => {
   parts.push(...(d.notes ?? []))
   if (d.failure)
     parts.push(
-      d.kind === 'aborted' ? `Script stopped after ${ms}ms [aborted]: ${d.failure}` : `Script failed after ${ms}ms [${d.kind ?? 'script'}]: ${d.failure}`,
+      d.kind === 'aborted' || d.kind === 'cancelled' ? `Script stopped after ${ms}ms [${d.kind}]: ${d.failure}` : `Script failed after ${ms}ms [${d.kind ?? 'script'}]: ${d.failure}`,
     )
   return parts.length ? parts : ['(no output)']
 }
@@ -1409,14 +1409,13 @@ const failedScripts = new Map<string, { first: string; at: number }>()
 const READ = Symbol('read')
 const readProgress = new Map<string, { next: number; version?: string }>()
 const readVersions = new Map<string, string>()
-const pageStart = new Map<string, string | undefined>()
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
 const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number) => {
   for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
   for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
   return 0
 }
-type Receipt = { file: string; whole: boolean; next?: number; version?: string }
+type Receipt = { file: string; key: string; whole: boolean; next?: number; version?: string }
 type FileInfo = { startLine?: unknown; numLines?: unknown; totalLines?: unknown; truncatedByTokenCap?: unknown }
 const infoOf = (result: unknown): FileInfo | undefined => {
   const f = result && typeof result === 'object' ? (result as { file?: unknown }).file : undefined
@@ -1424,7 +1423,7 @@ const infoOf = (result: unknown): FileInfo | undefined => {
 }
 const reachesEnd = (info: FileInfo | undefined) =>
   !!info && typeof info.startLine === 'number' && typeof info.numLines === 'number' && typeof info.totalLines === 'number' && info.startLine + info.numLines - 1 >= info.totalLines
-const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, version: string | undefined): Receipt | undefined => {
+const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, version: string | undefined, key = file): Receipt | undefined => {
   if (version === undefined) return undefined
   if (isStub(text)) return undefined
   const info = infoOf(result)
@@ -1432,11 +1431,11 @@ const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, 
   const rows = text.split('\n').filter((l) => /^\s*\d+\t/.test(l)).length
   if (!rows && !NOTICE.test(text)) return undefined
   const from = typeof offset === 'number' ? offset : 1
-  const chain = readProgress.get(file)
+  const chain = readProgress.get(key)
   if (from !== 1 && (!chain || chain.next !== from || chain.version !== version)) return undefined
-  if (!rows) return { file, whole: true, version }
+  if (!rows) return { file, key, whole: true, version }
   if (!info || rows !== info.numLines) return undefined
-  return reachesEnd(info) ? { file, whole: true, version } : { file, whole: false, next: from + rows, version }
+  return reachesEnd(info) ? { file, key, whole: true, version } : { file, key, whole: false, next: from + rows, version }
 }
 const PERSISTED = /^(\s*(?:<tool_use_error>)?(?:Exit code \d+\n)?)<persisted-output>\n(?:[^\n]*\n){0,5}?Output too large \([^)\n]*\)\. Full output saved to: ([^\n]+)\n\nPreview \([^)\n]*\):\n([\s\S]*?)\n?<\/persisted-output>(\s*(?:<\/tool_use_error>)?\s*)$/
 const isLow = (c: number) => c >= 0xdc00 && c < 0xe000
@@ -1625,8 +1624,11 @@ type Job = {
 }
 const MAIN = 'main'
 const jobsById = new Map<string, Job>()
+const deliveredIds = new Map<string, string>()
 let jobSeq = 0
 let mainTurn = false
+let mainTurnId: string | undefined
+const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string): Job => {
   const job: Job = { id: `r${++jobSeq}`, agent, started: Date.now(), exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Set(), done: Promise.resolve() }
   jobsById.set(job.id, job)
@@ -1653,8 +1655,9 @@ const deliver = (agent: string): { text: string; blocks: { type: string }[] } =>
   const later: string[] = []
   let used = 0
   for (const j of readyJobs(agent)) {
-    const section = `[${j.id} ${j.stopped ? 'stopped' : 'finished'} after ${seconds(j.ms)}]\n${j.text}`
-    if (texts.length && used + section.length > DEFAULT_MAX_CHARS) {
+    const attached = j.blocks.length ? `, ${j.blocks.length} attachment${j.blocks.length === 1 ? '' : 's'}` : ''
+    const section = `[${j.id} ${j.stopped ? 'stopped' : 'finished'} after ${seconds(j.ms)}${attached}]\n${j.text}`
+    if (texts.length && (used + section.length > DEFAULT_MAX_CHARS || blocks.length + j.blocks.length > MAX_PICTURES)) {
       later.push(j.id)
       continue
     }
@@ -1664,6 +1667,8 @@ const deliver = (agent: string): { text: string; blocks: { type: string }[] } =>
     j.delivered = true
     if (!j.stopped) for (const p of j.reads) readPaths.add(p)
     jobsById.delete(j.id)
+    deliveredIds.set(j.id, j.agent)
+    if (deliveredIds.size > 500) deliveredIds.delete(deliveredIds.keys().next().value as string)
   }
   if (later.length) texts.push(`${later.join(', ')} finished too; ${later.length === 1 ? 'its' : 'their'} output comes with the reply to your next run.`)
   return { text: texts.join('\n\n'), blocks }
@@ -1704,15 +1709,18 @@ const stopJobs = async ($: Dollar, jobs: Job[], by: string, kind: 'cancelled' | 
 const RUNNERS_GONE = '[ "$#" = 0 ] && exec sleep 0.1; for i in $(seq 25); do alive=0; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done; [ "$alive" = 0 ] && exit 0; sleep 0.2; done'
 const holdTurn = async ($: Dollar, agent: string, signal: AbortSignal | undefined) => {
   const aborted = new Promise<void>((r) => signal?.addEventListener('abort', () => r(), { once: true }))
+  let failures = 0
   for (;;) {
     const open = openJobs(agent)
-    if (!open.length || signal?.aborted) break
+    if (!open.length || signal?.aborted || failures >= 3) break
     const pids = open.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
-    const pause = $.process.run(['bash', '-c', RUNNERS_GONE, 'runners', ...pids.map(String)], { timeoutMs: 30_000 }).catch(() => undefined)
-    const settled = Promise.all(open.map((j) => j.done)).then(() => true)
-    const first = await Promise.race([settled, pause.then(() => false), aborted.then(() => false)])
-    if (first) await Promise.race([pause, aborted])
+    const pause = $.process.run(['bash', '-c', RUNNERS_GONE, 'runners', ...pids.map(String)], { timeoutMs: 30_000 }).then((r) => r.exitCode === 0, () => false)
+    const settled = Promise.all(open.map((j) => j.done)).then(() => 'settled' as const)
+    const first = await Promise.race([settled, pause.then((ok) => (ok ? ('paused' as const) : ('failed' as const))), aborted.then(() => 'aborted' as const)])
+    failures = first === 'failed' ? failures + 1 : 0
+    if (first === 'settled') await Promise.race([pause, aborted])
   }
+  if (signal?.aborted) return ''
   const ready = readyJobs(agent).filter((j) => !j.noticed)
   for (const j of ready) j.noticed = true
   return ready.length ? notice(ready) : ''
@@ -1724,6 +1732,7 @@ const withHeld = (r: unknown, held: string) => {
 }
 const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: Record<string, string>, timeout: number, maxChars: number): Promise<{ result: RunResult }> => {
 const thisRun = job
+const pagesStarted = new Map<string, string | undefined>()
   const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
   const all = listing.map((t) => ({ name: t.name, description: t.description }))
   const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
@@ -1779,6 +1788,7 @@ const thisRun = job
     if (m.kind === 'jobs') return { ok: true, value: running(job) }
     if (m.kind === 'cancel') {
       const target = jobsById.get(String(p.id))
+      if (!target && deliveredIds.get(String(p.id)) === job.agent) return { ok: true, value: false }
       if (!target || target.agent !== job.agent) return { ok: false, error: `there is no run ${String(p.id)} here; jobs() lists the runs still going` }
       if (target === job) return { ok: false, error: 'a run cannot cancel itself; exit() ends it' }
       if (target.settled || target.exited) return { ok: true, value: false }
@@ -2001,18 +2011,17 @@ const thisRun = job
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
         const from = typeof args.offset === 'number' ? args.offset : 1
-        const first = pageStart.get(args.file_path)
-        if (from === 1) pageStart.set(args.file_path, readBefore)
+        const first = pagesStarted.get(args.file_path)
+        if (from === 1) pagesStarted.set(args.file_path, readBefore)
         else if (first !== undefined && (readBefore !== first || readAfter !== first)) {
           tally.ok--
           tally.failed++
           return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
         }
-        if (pageStart.size > 200) pageStart.delete(pageStart.keys().next().value as string)
       }
       const receipt =
         tool === 'Read' && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined)
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined, p.handled === true ? `${thisRun.id}:${args.file_path}` : args.file_path)
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
             : undefined
@@ -2164,23 +2173,23 @@ const thisRun = job
     if (receipt) {
       const had = job.reads.has(receipt.file)
       const version = readVersions.get(receipt.file)
-      const progress = readProgress.get(receipt.file)
+      const progress = readProgress.get(receipt.key)
       undo = () => {
-        if (readVersions.get(receipt.file) !== receipt.version || readProgress.get(receipt.file)?.next !== (receipt.whole ? undefined : receipt.next)) return
+        if (readVersions.get(receipt.file) !== receipt.version || readProgress.get(receipt.key)?.next !== (receipt.whole ? undefined : receipt.next)) return
         if (!had) job.reads.delete(receipt.file)
         if (version === undefined) readVersions.delete(receipt.file)
         else readVersions.set(receipt.file, version)
-        if (progress === undefined) readProgress.delete(receipt.file)
-        else readProgress.set(receipt.file, progress)
+        if (progress === undefined) readProgress.delete(receipt.key)
+        else readProgress.set(receipt.key, progress)
       }
       if (receipt.whole) {
-        readProgress.delete(receipt.file)
+        readProgress.delete(receipt.key)
         job.reads.add(receipt.file)
         if (receipt.version !== undefined) readVersions.set(receipt.file, receipt.version)
         if (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
         if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
       } else if (receipt.next !== undefined) {
-        readProgress.set(receipt.file, { next: receipt.next, version: receipt.version })
+        readProgress.set(receipt.key, { next: receipt.next, version: receipt.version })
         if (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
       }
     }
@@ -2213,6 +2222,10 @@ const thisRun = job
   }
 
   // The child may only touch its own run dir, so it has to exist before the child starts.
+  if (job.cancelledBy) {
+    job.stopped = true
+    return { result: format(0, { items: [], logs: [], kind: job.stopKind ?? 'cancelled', failure: `stopped before it started, by ${job.cancelledBy}; none of its tool calls ran.` }) }
+  }
   await $.fs.write(`${dir}/.keep`, '')
 
   const started = Date.now()
@@ -2275,7 +2288,7 @@ const thisRun = job
             keys.push(t === whole ? parts : undefined)
           }
         }
-        else if (!done && Number.isSafeInteger(m.id) && (m.id as number) > 0 && KINDS.has(m.kind as string) && m.payload && typeof m.payload === 'object') {
+        else if (!done && !killed && !job.cancelledBy && Number.isSafeInteger(m.id) && (m.id as number) > 0 && KINDS.has(m.kind as string) && m.payload && typeof m.payload === 'object') {
           const reply = respond(m as Request)
           replies.add(reply)
           void reply.finally(() => replies.delete(reply))
@@ -2310,12 +2323,13 @@ const thisRun = job
       : killed
         ? { items, keys, logs, kind: 'timeout', failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
         : { items, keys, logs, kind: 'runner', failure: `script runner exited without a result.\n${stderr.trim()}` }
-  job.stopped = !!job.cancelledBy && !done
+  job.stopped = (!!job.cancelledBy && !done) || ended.kind === 'aborted'
   const first = ended.failure?.split('\n')[0] ?? ''
-  if (ended.failure && ended.kind === 'timeout' && open.size) {
+  if (ended.failure && (ended.kind === 'timeout' || job.stopped) && open.size) {
     const now = Date.now()
     const still = [...open.values()].map((o) => `${o.tool} (${((now - o.at) / 1000).toFixed(1)}s${o.arg ? `, ${o.arg}` : ''})`)
-    ended = { ...ended, failure: `${ended.failure}\nstill running when it timed out (abandoned, not stopped: they may still finish, so do not repeat them blind): ${still.join('; ')}` }
+    const when = ended.kind === 'timeout' ? 'when it timed out' : 'when it was stopped'
+    ended = { ...ended, failure: `${ended.failure}\nstill running ${when} (abandoned, not stopped: they may still finish, so do not repeat them blind): ${still.join('; ')}` }
   }
   const notes = [
     ...(stubs.size
@@ -2349,7 +2363,7 @@ const thisRun = job
       failure: `${ended.failure}\n${alongside} call${alongside === 1 ? '' : 's'} that ran alongside it had succeeded or were still running; their results are lost with this failure: use call(), which never throws, or Promise.allSettled to keep them.`,
     }
   const before = failedScripts.get(raw)
-  if (ended.failure && ended.kind !== 'aborted') {
+  if (ended.failure && ended.kind !== 'aborted' && ended.kind !== 'cancelled') {
     if (before)
       ended = {
         ...ended,
@@ -2401,8 +2415,7 @@ export const register: Register = (on) => {
     readPaths.clear()
     readProgress.clear()
     readVersions.clear()
-    pageStart.clear()
-    failedScripts.clear()
+        failedScripts.clear()
     for (const [n, v] of Object.entries(kept && typeof kept === 'object' ? kept : {}))
       if (v && Date.now() - Number(v.at ?? 0) < DENIED_MS && (names.size === 0 || (typeof v.alt === 'string' && names.has(v.alt)))) deniedTools.set(n, { alt: v.alt, at: Number(v.at) })
     await $.tool.register({
@@ -2425,47 +2438,52 @@ export const register: Register = (on) => {
       readPaths.clear()
       readProgress.clear()
       readVersions.clear()
-      pageStart.clear()
-    }
+          }
     return r
   }).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {
-    if ((e as { agentId?: unknown }).agentId === undefined) mainTurn = true
+    if (agentOf((e as { agentId?: unknown }).agentId) === MAIN) {
+      mainTurn = true
+      mainTurnId = String((e as { turnId?: unknown }).turnId ?? '') || undefined
+    }
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
-    const r = await next(e)
-    const agent = (e as { agentId?: unknown }).agentId
-    if (typeof agent === 'string' && agent) {
-      const jobs = agentJobs(agent)
-      await stopJobs($, jobs, 'the end of its agent\'s turn', 'cancelled')
-      for (const j of jobs) jobsById.delete(j.id)
-      return r
+    const agent = agentOf((e as { agentId?: unknown }).agentId)
+    const turnId = String((e as { turnId?: unknown }).turnId ?? '') || undefined
+    try {
+      return await next(e)
+    } finally {
+      if (agent !== MAIN) {
+        const jobs = agentJobs(agent)
+        await stopJobs($, jobs, 'the end of its agent\'s turn', 'cancelled')
+        for (const j of jobs) jobsById.delete(j.id)
+      } else if (!mainTurnId || !turnId || turnId === mainTurnId) {
+        mainTurn = false
+        mainTurnId = undefined
+        if ((e as { isAborted?: unknown }).isAborted === true) {
+          const jobs = agentJobs(MAIN)
+          for (const j of jobs) j.quiet = true
+          await stopJobs($, jobs, 'the interrupt', 'aborted')
+        } else await wake($)
+      }
     }
-    mainTurn = false
-    if ((e as { isAborted?: unknown }).isAborted === true) {
-      const jobs = agentJobs(MAIN)
-      for (const j of jobs) j.quiet = true
-      await stopJobs($, jobs, 'the interrupt', 'aborted')
-      return r
-    }
-    await wake($)
-    return r
   })
 
   on('classic.Stop', async ($, e, next) => {
-    const watched = (await $.session.surfaces().catch(() => [])).length > 0
+    const surfaces: unknown = await $.session.surfaces().catch(() => [])
+    const watched = Array.isArray(surfaces) && surfaces.length > 0
     if (watched) return next(e)
     const held = await holdTurn($, MAIN, (next as { signal?: AbortSignal }).signal)
     return withHeld(await next(e), held) as never
   }).catch(($, e, next) => next(e))
 
   on('classic.SubagentStop', async ($, e, next) => {
-    const agent = (e as { agent_id?: unknown }).agent_id
-    if (typeof agent !== 'string' || !agent) return next(e)
-    const held = await holdTurn($, agent, (next as { signal?: AbortSignal }).signal)
+    const id = (e as { agent_id?: unknown }).agent_id
+    if (typeof id !== 'string' || !id) return next(e)
+    const held = await holdTurn($, agentOf(id), (next as { signal?: AbortSignal }).signal)
     return withHeld(await next(e), held) as never
   }).catch(($, e, next) => next(e))
 
@@ -2515,7 +2533,7 @@ export const register: Register = (on) => {
     }
 
     const raw = String((e as unknown as { script?: unknown }).script ?? '')
-    const caller = String((e as { agentId?: unknown }).agentId ?? MAIN)
+    const caller = agentOf((e as { agentId?: unknown }).agentId)
     if (caller === MAIN) mainTurn = true
     if (!raw.trim()) return { result: collectReply(caller) as never }
     const { options, error } = parseOptions(raw)
@@ -2530,7 +2548,7 @@ export const register: Register = (on) => {
       (r) => settle(job, r.result),
       (err: unknown) => settle(job, format(0, { items: [], logs: [], failure: `codemode's own hook failed: ${(err as Error)?.message ?? String(err)}`, kind: 'runner' })),
     )
-    void job.done.then(() => wake($))
+    if (job.agent === MAIN) void job.done.then(() => wake($))
     return { result: startedReply(job) as never }
   }).catch(($, e, next) => {
     const why = next.error?.message ?? next.error?.kind ?? 'unknown failure'

@@ -11,6 +11,7 @@ type Case = {
   statDelayMs?: number
   hangListMs?: number
   hangListCount?: number
+  loadDelayMs?: number
   failReplyAfter?: { fail: number; after: number }
   surfaces?: string[]
   submitDelayMs?: number
@@ -609,7 +610,10 @@ const $ = {
     },
   },
   store: {
-    get: async (k: string) => store[k],
+    get: async (k: string) => {
+      if (c.loadDelayMs && k.startsWith('script:')) await new Promise((r) => setTimeout(r, c.loadDelayMs))
+      return store[k]
+    },
     set: async (k: string, v: unknown) => { store[k] = v },
     delete: async (k: string) => { delete store[k] },
   },

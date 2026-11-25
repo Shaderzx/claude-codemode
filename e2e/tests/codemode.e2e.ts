@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'e2e';
@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
@@ -2562,10 +2562,15 @@ test('Two runs writing one file through the patch tool at once never both write 
   expect(readFileSync(file, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
 });
 
-test('A load at the very end of a run returns the stored value or ends the run as timed out, never an empty value', () => {
-  const out = run({ store: { 'script:k': 'saved-value' }, steps: [{ script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 25) {}\nconst v = await load("k")\nreturn "loaded=" + String(v)', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
-  expect(out.collected[0]).not.toContain('loaded=undefined');
-  expect(out.collected[0]).toMatch(/loaded=saved-value|\[timeout\]/);
+test('A load near the end of a run, with time left, returns the stored value', () => {
+  const out = run({ store: { 'script:k': 'saved-value' }, steps: [{ script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 300) {}\nconst v = await load("k")\nreturn "loaded=" + String(v)', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('loaded=saved-value');
+});
+
+test('A load whose answer comes after the time is up ends the run as timed out, never with an empty value', () => {
+  const out = run({ loadDelayMs: 1500, store: { 'script:k': 'saved-value' }, steps: [{ script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 300) {}\nconst v = await load("k")\ntext("loaded=" + String(v))\nreturn 1', keepTurn: true }, { untilRunsDone: true }, { untilQuiet: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('[timeout]');
+  expect(out.collected[0]).not.toContain('loaded=');
 });
 
 test('A helper called once the time is up ends the run as timed out', () => {
@@ -2577,4 +2582,15 @@ test('A helper called once the time is up ends the run as timed out', () => {
 test('A run that exits after a call refused for time still comes back timed out', () => {
   const out = run({ steps: [{ script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 0) {}\nconst r = await call("Bash", { command: "echo late" })\nif (!r.ok) exit()\nreturn 1', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
   expect(out.collected[0]).toContain('[timeout]');
+});
+
+test('A run whose runner is slow to start gets its whole time before the mod kills it', () => {
+  const dir = scratch();
+  const shim = join(dir, 'slow-node');
+  writeFileSync(shim, '#!/bin/sh\nsleep 6\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n');
+  chmodSync(shim, 0o755);
+  const out = run({ env: { CODEMODE_NODE: shim }, steps: [{ script: '// @options: {"timeout_ms": 3000}\nwhile (deadline() > 300) {}\nreturn "finished"', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('finished');
+  expect(out.collected[0]).not.toContain('[timeout]');
+  expect(out.kills).toHaveLength(0);
 });

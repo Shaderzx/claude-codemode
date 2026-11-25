@@ -2807,7 +2807,7 @@ test('Forced patch writes whose reads overlap the other write keep the file coun
   const go = join(dir, 'go');
   const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
   const writer = (mine: string, marker: string, lag: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nawait sh("sleep ' + lag + '")\ntry { await write(' + f + ', "' + mine + '\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }';
-  const out = run({ tools: NO_BASH, readDelayMs: 250, steps: [{ script: writer('from-a', a, '0'), keepTurn: true }, { script: writer('from-b', b, '0.18'), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }, { script: 'const now = await read(' + f + ')\ntry { await edit(' + f + ', now.trim(), "after"); return "edited-again" } catch (e) { return String(e.message) }' }] });
+  const out = run({ tools: NO_BASH, readDelayMs: 250, steps: [{ script: writer('from-a', a, '0'), keepTurn: true }, { script: writer('from-b', b, '0.18'), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }, { script: 'const now = String(await sh("cat ' + file + '"))\ntry { await edit(' + f + ', now.trim(), "after"); return "edited-again" } catch (e) { return String(e.message) }' }] });
   expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['wrote', 'wrote']);
   expect(out.results[2]!.text).toBe('edited-again');
   expect(readFileSync(file, 'utf8')).toBe('after\n');
@@ -2864,9 +2864,9 @@ for (const [label, tools] of [['the patch tool', NO_BASH], ['Write', undefined]]
 test('A kill timer still waiting on a slow clock when the runner starts kills that runner only once', () => {
   const dir = scratch();
   const shim = join(dir, 'late-node');
-  writeFileSync(shim, '#!/bin/sh\nsleep 6.5\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n');
+  writeFileSync(shim, '#!/bin/sh\nsleep 0.8\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n');
   chmodSync(shim, 0o755);
-  const out = run({ clockNowDelayMs: 2000, env: { CODEMODE_NODE: shim }, steps: [{ script: '// @options: {"timeout_ms": 1000}\nwhile (true) {}', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  const out = run({ clockEarlyMs: 5500, clockNowDelayMs: 1500, killDelayMs: 1600, env: { CODEMODE_NODE: shim }, steps: [{ script: '// @options: {"timeout_ms": 1000}\nwhile (true) {}', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
   expect(out.collected[0]).toContain('never yielded');
   expect(out.kills).toHaveLength(1);
 });
@@ -2924,4 +2924,27 @@ test('Two paged reads of one file in a run never stitch an old first page to a n
   const f = JSON.stringify(file);
   const out = run({ readLagMs: 400, steps: [{ script: 'const first = read(' + f + ').then((t) => (t.includes("old 0") && t.includes("new 2399") ? "stitched" : "clean"), (e) => "refused: " + e.message)\nawait sh("cp ' + newer + ' ' + file + '")\nawait read(' + f + ')\nreturn await first' }] });
   expect(out.results[0]!.text).not.toBe('stitched');
+});
+
+test('A forced patch edit in a short run whose read races a change retries and keeps the file counted as read', () => {
+  const dir = scratch();
+  const file = join(dir, 'p.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const out = run({ tools: NO_BASH, rewriteDuringFirstRead: 'alpha\nBETA_EXTERNAL\n', steps: [{ script: '// @options: {"timeout_ms": 1500}\ntry { await edit(' + f + ', "alpha", "ALPHA", { force: true }); await edit(' + f + ', "BETA_EXTERNAL", "FINAL"); return "both" } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toBe('both');
+  expect(readFileSync(file, 'utf8')).toBe('ALPHA\nFINAL\n');
+});
+
+test('A forced patch write never takes an older read of the file as current', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'v0\n');
+  const f = JSON.stringify(file);
+  const out = run({ tools: NO_BASH, rewriteDuringFirstRead: 'v3\n', statDelayMs: 200, steps: [
+    { script: 'await write(' + f + ', "v1\\n", { force: true })\nawait sh("printf v2 > ' + file + '")\nreturn "prepared"' },
+    { script: '// @options: {"timeout_ms": 2700}\ntry { await write(' + f + ', "from-codemode\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[1]!.text).toBe('wrote');
+  expect(readFileSync(file, 'utf8')).toBe('from-codemode\n');
 });

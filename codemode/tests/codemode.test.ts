@@ -26,14 +26,12 @@ const runTool = async ($: Runs, script: string) => {
   const started = await $.tool.call({ tool: RUN, script } as never)
   const id = /^Started (r\d+) in the background/.exec(String(started.result))?.[1]
   if (!id) return started
-  const held = (await $.classic.Stop({ stop_hook_active: false } as never)) as { block?: string } | undefined
-  const text = sectionOf(String(held?.block ?? ''), id) ?? ''
-  const later = new RegExp('\\n\\(\\d+ attachments? of ' + id + ' come with the reply to your next run\\)$')
-  if (!later.test(text)) return { ...started, result: text }
-  const next = await $.tool.call({ tool: RUN, script: 'return 0' } as never)
   await $.classic.Stop({ stop_hook_active: false } as never)
-  const blocks = Array.isArray(next.result) ? (next.result as { type: string }[]).filter((b) => b.type !== 'text') : []
-  return { ...started, result: [{ type: 'text', text: text.replace(later, '') }, ...blocks] }
+  const read = await $.tool.call({ tool: RUN, script: '' } as never)
+  const parts = Array.isArray(read.result) ? (read.result as { type: string; text?: string }[]) : [{ type: 'text', text: String(read.result) }]
+  const text = sectionOf(parts.filter((p) => p.type === 'text').map((p) => p.text ?? '').join('\n'), id) ?? ''
+  const blocks = parts.filter((p) => p.type !== 'text')
+  return { ...started, result: blocks.length ? [{ type: 'text', text }, ...blocks] : text }
 }
 const ran = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 

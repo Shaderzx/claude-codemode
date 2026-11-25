@@ -3,7 +3,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mode="${1:---full}"
 case "$mode" in --fast|--full) ;; *) echo "usage: ci/verify [--fast|--full]" >&2; exit 2 ;; esac
+claude_pinned() { npx --yes @anthropic-ai/claude-code@2.1.325 "$@"; }
 (cd e2e && npm ci --silent && npx tsrs --noEmit -p .)
-for mod in codemode codemode-agents; do (cd "$mod" && claude plugin validate . >/dev/null && claude plugin test); done
+for mod in codemode codemode-agents; do (cd "$mod" && claude_pinned plugin validate . >/dev/null && claude_pinned plugin test); done
 if [ "$mode" = "--full" ]; then (cd e2e && npx e2e run); fi
 echo "ci/verify $mode: passed"

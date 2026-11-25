@@ -58,7 +58,7 @@ export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<stri
   return [
     'Run a JavaScript script that calls tools. It is the only tool that does work: every other tool is called from inside a script, and a direct call is refused. Only what the script outputs reaches you.',
     '',
-    'Every run goes to the background: the call answers at once with the run\'s id (r1, r2, ...), and you can start other runs meanwhile. A run\'s output comes back with the reply to your next run once it has finished, or when you end your turn, which waits for the runs still going and hands their output back. Never wait or poll for a run: start the next piece of work that does not need its output, or end your turn.',
+    'Every run goes to the background: the call answers at once with the run\'s id (r1, r2, ...), and you can start other runs meanwhile. A finished run\'s output comes back with the reply to your next run. When you end your turn with runs still going, a notice names them once they finish (where nobody is watching, the turn waits for them); then call this tool with an empty script, which runs nothing and answers with the finished output. Never wait or poll for a run: do other work that does not need its output, or end your turn. Interrupting the turn stops its runs.',
     '',
     'Each run is a round trip that re-sends the whole conversation, so do a whole step in one script: start every call you can already name at once with Promise.all, and chain the steps that need no judgment in between (search, then read the hits, then filter) inside the script. Return when the next step needs your judgment, with only what you need.',
     '',
@@ -1609,14 +1609,18 @@ type Job = {
   agent: string
   started: number
   pid?: number
+  exited: boolean
   cancelledBy?: string
-  stopped?: boolean
+  stopKind?: 'cancelled' | 'aborted'
+  stopped: boolean
   settled: boolean
-  text?: string
+  text: string
   blocks: { type: string }[]
   ms: number
   delivered: boolean
-  shown: boolean
+  noticed: boolean
+  quiet: boolean
+  reads: Set<string>
   done: Promise<void>
 }
 const MAIN = 'main'
@@ -1624,7 +1628,7 @@ const jobsById = new Map<string, Job>()
 let jobSeq = 0
 let mainTurn = false
 const startJob = (agent: string): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, started: Date.now(), settled: false, blocks: [], ms: 0, delivered: false, shown: false, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, started: Date.now(), exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Set(), done: Promise.resolve() }
   jobsById.set(job.id, job)
   return job
 }
@@ -1632,62 +1636,93 @@ const settle = (job: Job, result: RunResult) => {
   const parts = typeof result === 'string' ? [{ type: 'text', text: result }] : result
   job.text = parts.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n')
   job.blocks = parts.filter((b) => b.type !== 'text')
-  job.shown = job.blocks.length === 0
   job.ms = Date.now() - job.started
   job.settled = true
 }
 const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`
+const agentJobs = (agent: string) => [...jobsById.values()].filter((j) => j.agent === agent)
+const openJobs = (agent: string) => agentJobs(agent).filter((j) => !j.settled)
+const readyJobs = (agent: string) => agentJobs(agent).filter((j) => j.settled && !j.delivered)
 const running = (asker: Job) =>
-  [...jobsById.values()].filter((j) => j.agent === asker.agent && j !== asker && !j.settled).map((j) => ({ id: j.id, state: 'running', seconds: Math.round((Date.now() - j.started) / 1000) }))
-const forget = () => {
-  for (const [id, j] of jobsById) if (j.delivered && j.shown) jobsById.delete(id)
-}
-const takeFinished = (agent: string, withBlocks: boolean): { text: string; blocks: { type: string }[] } => {
+  openJobs(asker.agent)
+    .filter((j) => j !== asker)
+    .map((j) => ({ id: j.id, state: j.exited ? 'finishing' : 'running', seconds: Math.round((Date.now() - j.started) / 1000) }))
+const deliver = (agent: string): { text: string; blocks: { type: string }[] } => {
   const texts: string[] = []
   const blocks: { type: string }[] = []
-  for (const j of jobsById.values()) {
-    if (j.agent !== agent || !j.settled) continue
-    if (!j.delivered) {
-      const later = !withBlocks && j.blocks.length ? `\n(${j.blocks.length} attachment${j.blocks.length === 1 ? '' : 's'} of ${j.id} come with the reply to your next run)` : ''
-      texts.push(`[${j.id} ${j.stopped ? 'stopped' : 'finished'} after ${seconds(j.ms)}]\n${j.text ?? ''}${later}`)
-      j.delivered = true
+  const later: string[] = []
+  let used = 0
+  for (const j of readyJobs(agent)) {
+    const section = `[${j.id} ${j.stopped ? 'stopped' : 'finished'} after ${seconds(j.ms)}]\n${j.text}`
+    if (texts.length && used + section.length > DEFAULT_MAX_CHARS) {
+      later.push(j.id)
+      continue
     }
-    if (withBlocks && !j.shown) {
-      blocks.push(...j.blocks)
-      j.shown = true
-    }
+    texts.push(section)
+    used += section.length
+    blocks.push(...j.blocks)
+    j.delivered = true
+    if (!j.stopped) for (const p of j.reads) readPaths.add(p)
+    jobsById.delete(j.id)
   }
-  forget()
+  if (later.length) texts.push(`${later.join(', ')} finished too; ${later.length === 1 ? 'its' : 'their'} output comes with the reply to your next run.`)
   return { text: texts.join('\n\n'), blocks }
 }
-const startedReply = (job: Job): RunResult => {
-  const others = [...jobsById.values()].filter((j) => j.agent === job.agent && j !== job && !j.settled)
-  const still = others.length ? ` Still running: ${others.map((j) => `${j.id} (${seconds(Date.now() - j.started)})`).join(', ')}.` : ''
-  const finished = takeFinished(job.agent, true)
-  const text = `Started ${job.id} in the background.${still}${finished.text ? `\n\n${finished.text}` : ''}`
-  return finished.blocks.length ? [{ type: 'text', text }, ...finished.blocks] : text
+const stillRunning = (agent: string, except?: Job) => {
+  const others = openJobs(agent).filter((j) => j !== except)
+  return others.length ? ` Still running: ${others.map((j) => `${j.id} (${seconds(Date.now() - j.started)})`).join(', ')}.` : ''
 }
-const FINISHED = 'Your background runs finished; their output follows.'
+const withBlocks = (text: string, blocks: { type: string }[]): RunResult => (blocks.length ? [{ type: 'text', text }, ...blocks] : text)
+const startedReply = (job: Job): RunResult => {
+  const still = stillRunning(job.agent, job)
+  const finished = deliver(job.agent)
+  return withBlocks(`Started ${job.id} in the background.${still}${finished.text ? `\n\n${finished.text}` : ''}`, finished.blocks)
+}
+const collectReply = (agent: string): RunResult => {
+  const finished = deliver(agent)
+  const still = stillRunning(agent).trim()
+  return withBlocks(finished.text ? `${finished.text}${still ? `\n\n${still}` : ''}` : `No run has finished output waiting.${still ? ` ${still}` : ''}`, finished.blocks)
+}
+const notice = (jobs: Job[]) =>
+  `Background run${jobs.length === 1 ? '' : 's'} ${jobs.map((j) => j.id).join(', ')} finished. Call ${FULL} with an empty script to read the output.`
 const wake = async ($: Dollar) => {
   if (mainTurn) return
-  const { text } = takeFinished(MAIN, false)
-  if (text) await $.prompt.submit({ text: `${FINISHED}\n\n${text}` }).catch(() => {})
+  const ready = readyJobs(MAIN).filter((j) => !j.noticed && !j.quiet)
+  if (!ready.length) return
+  const sent = await $.prompt.submit({ text: notice(ready) }).then(() => true, () => false)
+  if (sent) for (const j of ready) j.noticed = true
 }
-const holdTurn = async ($: Dollar, agent: string, signal: AbortSignal | undefined) => {
-  for (;;) {
-    const open = [...jobsById.values()].filter((j) => j.agent === agent && !j.settled)
-    if (!open.length || signal?.aborted) break
-    await Promise.race([Promise.all(open.map((j) => j.done)), $.process.run(['sleep', '10']).catch(() => undefined)])
+const stopJobs = async ($: Dollar, jobs: Job[], by: string, kind: 'cancelled' | 'aborted') => {
+  for (const j of jobs) {
+    if (j.settled || j.exited) continue
+    j.cancelledBy = by
+    j.stopKind = kind
+    if (j.pid) await $.process.run(['kill', '-9', String(j.pid)]).catch(() => undefined)
   }
-  return takeFinished(agent, false).text
+}
+const RUNNERS_GONE = '[ "$#" = 0 ] && exec sleep 0.1; for i in $(seq 25); do alive=0; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done; [ "$alive" = 0 ] && exit 0; sleep 0.2; done'
+const holdTurn = async ($: Dollar, agent: string, signal: AbortSignal | undefined) => {
+  const aborted = new Promise<void>((r) => signal?.addEventListener('abort', () => r(), { once: true }))
+  for (;;) {
+    const open = openJobs(agent)
+    if (!open.length || signal?.aborted) break
+    const pids = open.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
+    const pause = $.process.run(['bash', '-c', RUNNERS_GONE, 'runners', ...pids.map(String)], { timeoutMs: 30_000 }).catch(() => undefined)
+    const settled = Promise.all(open.map((j) => j.done)).then(() => true)
+    const first = await Promise.race([settled, pause.then(() => false), aborted.then(() => false)])
+    if (first) await Promise.race([pause, aborted])
+  }
+  const ready = readyJobs(agent).filter((j) => !j.noticed)
+  for (const j of ready) j.noticed = true
+  return ready.length ? notice(ready) : ''
 }
 const withHeld = (r: unknown, held: string) => {
   if (!held) return r
   const base = r && typeof r === 'object' ? (r as { block?: unknown }) : {}
-  const ours = `${FINISHED}\n\n${held}`
-  return { ...base, block: typeof base.block === 'string' && base.block ? `${base.block}\n\n${ours}` : ours }
+  return { ...base, block: typeof base.block === 'string' && base.block ? `${base.block}\n\n${held}` : held }
 }
 const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: Record<string, string>, timeout: number, maxChars: number): Promise<{ result: RunResult }> => {
+const thisRun = job
   const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
   const all = listing.map((t) => ({ name: t.name, description: t.description }))
   const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
@@ -1745,9 +1780,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const target = jobsById.get(String(p.id))
       if (!target || target.agent !== job.agent) return { ok: false, error: `there is no run ${String(p.id)} here; jobs() lists the runs still going` }
       if (target === job) return { ok: false, error: 'a run cannot cancel itself; exit() ends it' }
-      if (target.settled) return { ok: true, value: false }
-      target.cancelledBy = job.id
-      if (target.pid) await $.process.run(['kill', '-9', String(target.pid)]).catch(() => {})
+      if (target.settled || target.exited) return { ok: true, value: false }
+      await stopJobs($, [target], job.id, 'cancelled')
       return { ok: true, value: true }
     }
     if (m.kind === 'cut') {
@@ -1813,7 +1847,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const path = normal(expanded)
       args.file_path = path
       const exists = await $.fs.exists(path).catch(() => true)
-      if (!readPaths.has(path) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
+      if (!readPaths.has(path) && !job.reads.has(path) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
       if (exists) {
         const was = readVersions.get(path)
         const now = await versionOf(path)
@@ -1849,7 +1883,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const patchFresh = new Map<string, boolean>()
     for (const o of patchOps)
       if (o.op !== 'create' && !patchFresh.has(o.path))
-        patchFresh.set(o.path, readPaths.has(o.path) && readVersions.get(o.path) !== undefined && readVersions.get(o.path) === (await versionOf(o.path)))
+        patchFresh.set(o.path, (readPaths.has(o.path) || job.reads.has(o.path)) && readVersions.get(o.path) !== undefined && readVersions.get(o.path) === (await versionOf(o.path)))
     let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
       tally.open--
       tally.failed++
@@ -1953,12 +1987,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       for (const o of patchOps) {
         if (created.has(o.path) || patchFresh.get(o.path) === true) {
           const version = await versionOf(o.path)
-          readPaths.add(o.path)
+          thisRun.reads.add(o.path)
           if (version === undefined) readVersions.delete(o.path)
           else readVersions.set(o.path, version)
           readNow.push(o.path)
         } else {
           readPaths.delete(o.path)
+          thisRun.reads.delete(o.path)
           readVersions.delete(o.path)
         }
       }
@@ -2126,12 +2161,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const receipt = out[READ as never] as Receipt | undefined
     let undo: (() => void) | undefined
     if (receipt) {
-      const had = readPaths.has(receipt.file)
+      const had = job.reads.has(receipt.file)
       const version = readVersions.get(receipt.file)
       const progress = readProgress.get(receipt.file)
       undo = () => {
         if (readVersions.get(receipt.file) !== receipt.version || readProgress.get(receipt.file)?.next !== (receipt.whole ? undefined : receipt.next)) return
-        if (!had) readPaths.delete(receipt.file)
+        if (!had) job.reads.delete(receipt.file)
         if (version === undefined) readVersions.delete(receipt.file)
         else readVersions.set(receipt.file, version)
         if (progress === undefined) readProgress.delete(receipt.file)
@@ -2139,7 +2174,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       if (receipt.whole) {
         readProgress.delete(receipt.file)
-        readPaths.add(receipt.file)
+        job.reads.add(receipt.file)
         if (receipt.version !== undefined) readVersions.set(receipt.file, receipt.version)
         if (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
         if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
@@ -2252,6 +2287,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if ((err as Error)?.name === 'AbortError' || /\$\.process\.spawn\([^)]*\) aborted|AbortError/.test(msg)) aborted = true
     else stderr += `\n${msg}`
   }
+  job.exited = true
+  job.pid = undefined
   if (done?.failure && done.kind !== 'timeout' && open.size)
   {
     const grace: { handle?: { cancel: () => unknown } } = {}
@@ -2264,7 +2301,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   await Promise.allSettled([...writes])
   await $.process.run(['rm', '-rf', dir]).catch(() => {})
   let ended: Ended = job.cancelledBy && !done
-    ? { items, keys, logs, kind: 'cancelled', failure: `stopped by cancel() from ${job.cancelledBy}; what it printed is above, and its tool calls may have run.` }
+    ? { items, keys, logs, kind: job.stopKind ?? 'cancelled', failure: job.stopKind === 'aborted' ? 'stopped because its turn was interrupted; what it printed is above, and its tool calls may have run.' : `stopped by cancel() from ${job.cancelledBy}; what it printed is above, and its tool calls may have run.` }
     : done
     ? { items, keys, logs, failure: done.failure, kind: done.kind }
     : aborted
@@ -2272,7 +2309,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       : killed
         ? { items, keys, logs, kind: 'timeout', failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
         : { items, keys, logs, kind: 'runner', failure: `script runner exited without a result.\n${stderr.trim()}` }
-  job.stopped = ended.kind === 'cancelled'
+  job.stopped = !!job.cancelledBy && !done
   const first = ended.failure?.split('\n')[0] ?? ''
   if (ended.failure && ended.kind === 'timeout' && open.size) {
     const now = Date.now()
@@ -2356,6 +2393,9 @@ export const register: Register = (on) => {
     const cwd = (e as { cwd?: unknown }).cwd
     sessionCwd = typeof cwd === 'string' && cwd ? cwd : undefined
     const kept = (await $.store.get('denied').catch(() => undefined)) as Record<string, { alt?: string; at?: number }> | undefined
+    await stopJobs($, [...jobsById.values()], 'a new session', 'aborted')
+    jobsById.clear()
+    mainTurn = false
     deniedTools.clear()
     readPaths.clear()
     readProgress.clear()
@@ -2396,10 +2436,21 @@ export const register: Register = (on) => {
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if ((e as { agentId?: unknown }).agentId === undefined) {
-      mainTurn = false
-      await wake($)
+    const agent = (e as { agentId?: unknown }).agentId
+    if (typeof agent === 'string' && agent) {
+      const jobs = agentJobs(agent)
+      await stopJobs($, jobs, 'the end of its agent\'s turn', 'cancelled')
+      for (const j of jobs) jobsById.delete(j.id)
+      return r
     }
+    mainTurn = false
+    if ((e as { isAborted?: unknown }).isAborted === true) {
+      const jobs = agentJobs(MAIN)
+      for (const j of jobs) j.quiet = true
+      await stopJobs($, jobs, 'the interrupt', 'aborted')
+      return r
+    }
+    await wake($)
     return r
   })
 
@@ -2411,7 +2462,9 @@ export const register: Register = (on) => {
   }).catch(($, e, next) => next(e))
 
   on('classic.SubagentStop', async ($, e, next) => {
-    const held = await holdTurn($, String((e as { agent_id?: unknown }).agent_id ?? ''), (next as { signal?: AbortSignal }).signal)
+    const agent = (e as { agent_id?: unknown }).agent_id
+    if (typeof agent !== 'string' || !agent) return next(e)
+    const held = await holdTurn($, agent, (next as { signal?: AbortSignal }).signal)
     return withHeld(await next(e), held) as never
   }).catch(($, e, next) => next(e))
 
@@ -2461,6 +2514,9 @@ export const register: Register = (on) => {
     }
 
     const raw = String((e as unknown as { script?: unknown }).script ?? '')
+    const caller = String((e as { agentId?: unknown }).agentId ?? MAIN)
+    if (caller === MAIN) mainTurn = true
+    if (!raw.trim()) return { result: collectReply(caller) as never }
     const { options, error } = parseOptions(raw)
     if (error) return { result: format(0, { items: [], logs: [], failure: error, kind: 'syntax' }) }
     const pre = extractText(raw)
@@ -2468,8 +2524,7 @@ export const register: Register = (on) => {
     const script = pre.script
     const timeout = num(options.timeout_ms, DEFAULT_TIMEOUT_MS, 1_000, 3_600_000)
     const maxChars = num(options.max_output_chars, DEFAULT_MAX_CHARS, 1_000, 1_000_000)
-    const job = startJob(String((e as { agentId?: unknown }).agentId ?? MAIN))
-    if (job.agent === MAIN) mainTurn = true
+    const job = startJob(caller)
     job.done = execute($, job, raw, script, pre.texts, timeout, maxChars).then(
       (r) => settle(job, r.result),
       (err: unknown) => settle(job, format(0, { items: [], logs: [], failure: `codemode's own hook failed: ${(err as Error)?.message ?? String(err)}`, kind: 'runner' })),

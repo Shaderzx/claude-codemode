@@ -56,7 +56,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -527,10 +527,10 @@ const $ = {
         }
       })()
     },
-    run: (argv: string[]) =>
+    run: (argv: string[], _init?: unknown) =>
       (argv[0] === 'kill' ? kills.push([...argv]) : 0, new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
         const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
-        if (argv[0] === 'sleep' && p.pid) {
+        if (p.pid) {
           waits.add(p.pid)
           p.on('close', () => waits.delete(p.pid as number))
         }
@@ -595,7 +595,6 @@ const endTurn = async (agentId: string | undefined, interrupt: boolean) => {
     await handlers['turn.complete']?.($, { turnId: 'turn', isAborted: true }, engine(async () => ({})))
     return Date.now() - t0
   }
-  const waking = wakeAttempts
   const hook = agentId ? handlers['classic.SubagentStop'] : handlers['classic.Stop']
   const e = agentId ? { hook_event_name: 'SubagentStop', agent_id: agentId, stop_hook_active: false } : { hook_event_name: 'Stop', stop_hook_active: false, background_tasks: [] }
   const r = (await hook?.($, e, engine(async () => ({})))) as { block?: string } | undefined
@@ -612,10 +611,6 @@ const endTurn = async (agentId: string | undefined, interrupt: boolean) => {
   if (!agentId) {
     inTurn = false
     await handlers['turn.complete']?.($, { turnId: 'turn' }, engine(async () => ({})))
-    if (c.surfaces?.length) {
-      await until(() => wakeAttempts > waking, 30_000)
-      if (submitted.length && /empty script/.test(submitted.at(-1) as string)) await collect()
-    }
   }
   return stopped
 }
@@ -641,6 +636,11 @@ for (const s of c.steps) {
   }
   if (s.stop) {
     await endTurn(s.agentId, !!s.interrupt)
+    continue
+  }
+  if (s.untilWake) {
+    const before = wakeAttempts
+    await until(() => wakeAttempts > before || wakeAttempts > 0, 30_000)
     continue
   }
   if (s.collect) {

@@ -6,7 +6,7 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
 type Case = { surfaces?: string[]; submitRefusals?: number; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number };
 
@@ -1827,7 +1827,7 @@ test('cancel() of a run that has exited but not yet come back returns false', ()
 });
 
 test('Interrupting the turn stops its runs, which come back marked aborted with the next run\'s reply, and wakes nothing', () => {
-  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await sh("sleep 30; echo never-printed")\nreturn 1', interrupt: true }, { untilRunsDone: true }, { script: 'return "after"' }] });
+  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await sh("sleep 30; echo never-printed")\nreturn 1', interrupt: true }, { untilRunsDone: true }, { script: 'return "after"', keepTurn: true }] });
   expect(out.wakeAttempts).toBe(0);
   expect(out.results[1]!.immediate).toContain('[' + out.results[0]!.id + ' stopped after');
   expect(out.results[0]!.text).toContain('[aborted]');
@@ -1837,7 +1837,7 @@ test('Interrupting the turn stops its runs, which come back marked aborted with 
 test('In a session a person is watching, ending the turn does not wait for a run, and a wake prompt names it once it finishes', () => {
   const dir = scratch();
   const gate = join(dir, 'gate');
-  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "watched-output"', keepTurn: true }, { stop: true }, { touch: gate }, { untilRunsDone: true }, { collect: true }] });
+  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "watched-output"', keepTurn: true }, { stop: true }, { touch: gate }, { untilWake: true }, { collect: true }] });
   expect(out.stops).toHaveLength(0);
   expect(out.submitted).toHaveLength(1);
   expect(out.submitted[0]).toContain(out.results[0]!.id!);
@@ -1846,7 +1846,7 @@ test('In a session a person is watching, ending the turn does not wait for a run
 });
 
 test('A wake prompt the engine refuses leaves the output for the next run\'s reply', () => {
-  const out = run({ surfaces: ['terminal'], submitRefusals: 1, steps: [{ script: 'await sh("sleep 1")\nreturn "kept-output"' }, { script: 'return 2' }] });
+  const out = run({ surfaces: ['terminal'], submitRefusals: 1, steps: [{ script: 'await sh("sleep 1")\nreturn "kept-output"' }, { untilWake: true }, { script: 'return 2', keepTurn: true }] });
   expect(out.wakeAttempts).toBeGreaterThanOrEqual(1);
   expect(out.submitted).toHaveLength(0);
   expect(out.results[1]!.immediate).toContain('kept-output');

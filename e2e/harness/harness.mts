@@ -8,7 +8,6 @@ type Case = {
   clockFrozen?: boolean
   killDelayMs?: number
   writeDelayMs?: number
-  skillDelayMs?: number
   statDelayMs?: number
   hangListMs?: number
   surfaces?: string[]
@@ -65,7 +64,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilCleaned?: number; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -362,7 +361,6 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       return ok('No matching deferred tools found')
     }
     case 'Skill':
-      if (c.skillDelayMs) await new Promise((r) => setTimeout(r, c.skillDelayMs))
       return ok('Launching skill: ' + a.skill)
     case 'mcp__lean-ctx__ctx_expand': {
       if (jobs.get(String(a.id))?.done && !jobArchive.has(String(a.id))) return ok("Background job '" + String(a.id) + "' finished (exit " + jobs.get(String(a.id))!.done!.code + ') without output.')
@@ -458,7 +456,6 @@ const kills: string[][] = []
 const waits = new Set<number>()
 let runsStarted = 0
 let inflight = 0
-let runsCleanedAll = 0
 const until = async (check: () => boolean, ms: number, what = 'a harness wait') => {
   const end = Date.now() + ms
   while (!check()) {
@@ -586,9 +583,6 @@ const $ = {
         p.stderr.setEncoding('utf8').on('data', (t: string) => { stderr += t })
         p.on('error', (e) => done({ exitCode: 127, stdout, stderr: stderr + String(e.message) }))
         p.on('close', (code) => {
-          if (argv[0] === 'rm' && argv.some((a) => a.includes('/codemode/runs/'))) {
-            runsCleanedAll++
-          }
           done({ exitCode: code ?? 1, stdout, stderr })
         })
       }))),
@@ -738,10 +732,6 @@ for (const s of c.steps) {
   }
   if (s.untilQuiet) {
     await until(() => listsHanging === 0 && inflight === 0 && fakesPending === 0 && statsPending === 0 && Date.now() - lastActivity > 500, 60_000, 'the mod going quiet')
-    continue
-  }
-  if (s.untilCleaned) {
-    await until(() => runsCleanedAll >= (s.untilCleaned as number) && inflight === 0, 60_000, s.untilCleaned + ' run folders removed')
     continue
   }
   if (s.untilFile) {

@@ -1622,6 +1622,7 @@ type Job = {
   noticed: boolean
   quiet: boolean
   reads: Map<string, string | undefined>
+  readAt: Map<string, number>
   progress: Map<string, { next: number; version?: string }>
   gen: number
   spill?: string
@@ -1634,6 +1635,8 @@ const MAIN = 'main'
 const jobsById = new Map<string, Job>()
 const deliveredIds = new Map<string, string>()
 const handedSpills = new Map<string, number>()
+const versionAt = new Map<string, number>()
+let readClock = 0
 let jobSeq = 0
 let mainTurn = false
 let mainTurnId: string | undefined
@@ -1674,11 +1677,12 @@ const expire = (j: Job) => {
   j.stopKind = 'cancelled'
   settle(j, format(Date.now() - j.started, { items: [], logs: [], kind: 'runner', failure: 'the run never started its runner within its time; none of its tool calls ran, and it will not start now.' }))
   j.exited = true
+  j.onPid()
 }
 export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string, timeout: number): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), progress: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), progress: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
   job.pidKnown = new Promise<void>((r) => (job.onPid = r))
   jobsById.set(job.id, job)
   return job
@@ -1705,9 +1709,13 @@ const promoteReads = (j: Job) => {
   if (j.stopped || j.gen !== sessionGen) return
   for (const [p, v] of j.reads) {
     readPaths.add(p)
+    const at = j.readAt.get(p) ?? 0
+    if (at < (versionAt.get(p) ?? 0)) continue
+    versionAt.set(p, at)
     if (v === undefined) readVersions.delete(p)
     else readVersions.set(p, v)
   }
+  while (versionAt.size > 2000) versionAt.delete(versionAt.keys().next().value as string)
   for (const [p, chain] of j.progress) readProgress.set(p, chain)
   while (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
   while (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
@@ -1787,7 +1795,7 @@ const wake = async ($: Dollar) => {
 }
 const expireLater = ($: Dollar, job: Job) => {
   job.expiry = $.clock.after(Math.max(0, job.deadline - Date.now()), () => {
-    if (job.settled || job.pid || job.exited) return
+    if (job.settled || job.pid || job.exited || job.cancelledBy) return
     if (Date.now() < job.deadline) return expireLater($, job)
     expire(job)
     if (job.agent === MAIN) void wake($)
@@ -1815,7 +1823,7 @@ const holdTurn = async ($: Dollar, agent: string, signal: AbortSignal | undefine
   let failures = 0
   for (let round = 0; ; round++) {
     for (const j of openJobs(agent))
-      if (!j.pid && !j.exited && Date.now() > j.deadline) expire(j)
+      if (!j.pid && !j.exited && !j.cancelledBy && Date.now() > j.deadline) expire(j)
     const open = openJobs(agent)
     if (!open.length || signal?.aborted || failures >= 3) break
     const pids = open.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
@@ -1981,7 +1989,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const key = skillKey(String(args.skill ?? ''))
     // Calls to one skill take turns, so each gets its own expansion (its args may
     // differ); only text expanded after this call started counts.
-    if (job.cancelledBy || killed) return { ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this call started` }
+    if (over || job.cancelledBy || killed) return { ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this call started` }
     const timer: { handle?: { cancel: () => unknown } } = {}
     const release =
       tool === 'Skill' ? await skillTurn(key, new Promise((r) => (timer.handle = $.clock.after(60_000, () => r(undefined))))) : undefined
@@ -2007,7 +2015,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const was = job.reads.has(o.path) ? job.reads.get(o.path) : readPaths.has(o.path) ? readVersions.get(o.path) : undefined
         patchFresh.set(o.path, was !== undefined && was === (await versionOf(o.path)))
       }
-    if (job.cancelledBy || killed) {
+    if (over || job.cancelledBy || killed) {
       release?.()
       tally.open--
       if (counted && tally.ok + tally.failed + tally.open === 0) calls.delete(tool)
@@ -2046,7 +2054,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     } else tally.ok++
     const saveDenied = () =>
       $.store.set('denied', Object.fromEntries([...deniedTools].map(([n, v]) => [n, { alt: v.alt, at: v.at }])) as never).catch(() => {})
-    if (!failed && deniedTools.delete(tool)) await saveDenied()
+    if (!failed && job.gen === sessionGen && deniedTools.delete(tool)) await saveDenied()
     const said = String(r.deny ?? (r.isError ? (r.text ?? show(r.result)) : ''))
     const refused = r.deny !== undefined || (r.isError === true && HOOK_RE.test(said) && !(SHELL_RE.test(tool) && exitOf(said, false, tool).code !== undefined))
     if (refused) {
@@ -2056,8 +2064,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const fits = (n: string) => (tool === 'Bash' ? /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(n) : /^(?:Write|Edit)$/.test(tool) && /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(n))
       const alt = wants.length === 1 && fits(wants[0] as string) ? wants[0] : undefined
       if (!alt) return { ok: false, error: plain, refused: true }
-      if (!deniedTools.has(tool)) {
-        if (job.gen === sessionGen) deniedTools.set(tool, { alt, at: Date.now() })
+      if (!deniedTools.has(tool) && job.gen === sessionGen) {
+        deniedTools.set(tool, { alt, at: Date.now() })
         await saveDenied()
       }
       return { ok: false, error: `${plain}\n${tool} is denied by a hook in this session; use tools.${ident(alt)}({...}) instead.`, denied: true, alt }
@@ -2118,6 +2126,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (created.has(o.path) || patchFresh.get(o.path) === true) {
           const version = await versionOf(o.path)
           job.reads.set(o.path, version)
+          job.readAt.set(o.path, ++readClock)
           readNow.push(o.path)
         } else {
           if (job.gen === sessionGen) readPaths.delete(o.path)
@@ -2161,7 +2170,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const near: string[] = []
       for (const n of nearNames(args.file_path.slice(at + 1), listed)) {
         const path = `${folder === '/' ? '' : folder}/${n}`
-        const probe = job.cancelledBy || killed ? undefined : await $.tool.call({ file_path: path, limit: 1, tool: 'Read' } as never).catch(() => undefined)
+        const probe = over || job.cancelledBy || killed ? undefined : await $.tool.call({ file_path: path, limit: 1, tool: 'Read' } as never).catch(() => undefined)
         const said = String(probe?.text ?? '')
         if (probe && probe.deny === undefined && (probe.isError !== true || /exceeds maximum allowed/i.test(said))) near.push(path)
       }
@@ -2184,7 +2193,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const viaBytes = async (shell: string, path: string): Promise<string | undefined> => {
     const step = 21000
     const extra = shell === 'Bash' ? {} : { raw: true }
-    const ask = (command: string) => (job.cancelledBy || killed ? Promise.resolve(undefined) : $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined))
+    const ask = (command: string) => (over || job.cancelledBy || killed ? Promise.resolve(undefined) : $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined))
     const sized = await ask('wc -c < ' + shellQuote(path))
     const size = Number(String(sized?.text ?? '').trim())
     if (!sized || sized.isError || sized.deny !== undefined || !Number.isInteger(size)) return undefined
@@ -2214,7 +2223,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const moved = async () => version === undefined || (await versionOf(file)) !== version
     for (let guard = 0; guard < 10_000; guard++) {
       if (over) return undefined
-      const r = job.cancelledBy || killed ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
+      const r = over || job.cancelledBy || killed ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
       if (r && !r.isError && r.deny === undefined && (await moved())) return { error: `${file} changed while it was read in pages; read it again` }
       if (!r) return undefined
       if (r.deny !== undefined) return { error: `Reading ${file} in pages stopped at line ${offset}: ${r.deny}` }
@@ -2309,6 +2318,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (receipt.whole) {
         job.progress.delete(receipt.file)
         job.reads.set(receipt.file, receipt.version)
+        job.readAt.set(receipt.file, ++readClock)
       } else if (receipt.next !== undefined) job.progress.set(receipt.file, { next: receipt.next, version: receipt.version })
     }
     // Tracked whole, fallbacks included, so the run dir is removed only after it.
@@ -2341,9 +2351,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
 
   // The child may only touch its own run dir, so it has to exist before the child starts.
   if (job.cancelledBy) {
-    job.stopped = true
+    if (!job.settled) job.stopped = true
     return { result: format(0, { items: [], logs: [], kind: job.stopKind ?? 'cancelled', failure: `stopped before it started, by ${job.cancelledBy}; none of its tool calls ran.` }) }
   }
+  const shellPref = await $.env.get('CODEMODE_SHELL')
   await $.fs.write(`${dir}/.keep`, '')
 
   const started = Date.now()
@@ -2359,7 +2370,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     killed = true
     if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
   })
-  const shellPref = await $.env.get('CODEMODE_SHELL')
   try {
     if (!job.cancelledBy && !job.pid && Date.now() > job.deadline) expire(job)
     if (job.cancelledBy) throw new Error('codemode: stopped before its runner started')
@@ -2388,13 +2398,17 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           pid = Number.isSafeInteger(m.pid) && (m.pid as number) > 1 ? m.pid : 0
           job.pid = pid || undefined
           job.onPid()
-          if ((killed || job.cancelledBy) && pid) {
+          if (killed || job.cancelledBy) {
             discard = true
-            void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
+            if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
           }
           continue
         }
         if (discard) continue
+        if (m.done === true && job.cancelledBy) {
+          over = true
+          continue
+        }
         if (m.done === true) {
           job.exited = true
           done = { done: true, failure: m.failure, kind: m.kind, failedId: (m as { failedId?: number }).failedId, alongside: Number((m as { alongside?: unknown }).alongside) || 0 }
@@ -2431,6 +2445,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   }
   job.exited = true
   job.pid = undefined
+  watchdog.cancel()
   if (done?.failure && done.kind !== 'timeout' && open.size)
   {
     const grace: { handle?: { cancel: () => unknown } } = {}
@@ -2442,7 +2457,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   // A reply already being written could recreate the dir after it is removed.
   await Promise.allSettled([...writes])
   await $.process.run(['rm', '-rf', dir]).catch(() => {})
-  let ended: Ended = job.cancelledBy && !done
+  let ended: Ended = job.cancelledBy
     ? { items, keys, logs, kind: job.stopKind ?? 'cancelled', failure: job.stopKind === 'aborted' ? 'stopped because its turn was interrupted; what it printed is above, and its tool calls may have run.' : `stopped by cancel() from ${job.cancelledBy}; what it printed is above, and its tool calls may have run.` }
     : done
     ? { items, keys, logs, failure: done.failure, kind: done.kind }
@@ -2451,7 +2466,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       : killed
         ? { items, keys, logs, kind: 'timeout', failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
         : { items, keys, logs, kind: 'runner', failure: `script runner exited without a result.\n${stderr.trim()}` }
-  job.stopped = (!!job.cancelledBy && !done) || ended.kind === 'aborted'
+  if (!job.settled) job.stopped = !!job.cancelledBy || ended.kind === 'aborted'
   const first = ended.failure?.split('\n')[0] ?? ''
   if (ended.failure && (ended.kind === 'timeout' || job.stopped) && open.size) {
     const now = Date.now()
@@ -2565,6 +2580,8 @@ export const register: Register = (on) => {
     void stopJobs($, jobs, 'the end of its session', 'aborted')
     jobsById.clear()
     deliveredIds.clear()
+    versionAt.clear()
+    for (const j of jobs) j.expiry?.cancel()
     mainTurn = false
     mainTurnId = undefined
     readPaths.clear()
@@ -2603,7 +2620,10 @@ export const register: Register = (on) => {
       if (agent !== MAIN) {
         const jobs = agentJobs(agent)
         await stopJobs($, jobs, 'the end of its agent\'s turn', 'cancelled')
-        for (const j of jobs) jobsById.delete(j.id)
+        for (const j of jobs) {
+          j.expiry?.cancel()
+          jobsById.delete(j.id)
+        }
       } else {
         const current = !mainTurnId || !turnId || turnId === mainTurnId
         if ((e as { isAborted?: unknown }).isAborted === true) {

@@ -1903,3 +1903,10 @@ test('The run tool tells the model its runs go to the background and how their o
   expect(out.description).toContain('jobs()');
   expect(out.description).toContain('cancel(id)');
 });
+
+test('An empty script while runs are still going tells the model to end its turn instead of asking again', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 3")\nreturn 1', keepTurn: true }, { untilTool: 'Bash' }, { collect: true }, { stop: true }] });
+  expect(out.collected[0]).toContain('Still running: ' + out.results[0]!.id);
+  expect(out.collected[0]).toContain('end your turn');
+  expect(out.collected[0]).toContain('do not call again to check');
+});

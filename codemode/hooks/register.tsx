@@ -58,7 +58,7 @@ export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<stri
   return [
     'Run a JavaScript script that calls tools. It is the only tool that does work: every other tool is called from inside a script, and a direct call is refused. Only what the script outputs reaches you.',
     '',
-    'Every run goes to the background: the call answers at once with the run\'s id (r1, r2, ...), and you can start other runs meanwhile. A finished run\'s output comes back with the reply to your next run. When you end your turn with runs still going, a notice names them once they finish (where nobody is watching, the turn waits for them); then call this tool with an empty script, which runs nothing and answers with the finished output. Never wait or poll for a run: do other work that does not need its output, or end your turn. Interrupting the turn stops its runs.',
+    'Every run goes to the background: the call answers at once with the run\'s id (r1, r2, ...), and you can start other runs meanwhile. A finished run\'s output comes back with the reply to your next run. When you end your turn with runs still going, a notice names them once they finish (where nobody is watching, the turn waits for them); then call this tool with an empty script, which runs nothing and answers with the finished output. Never wait or poll for a run, with an empty script, jobs() or a waiting script: do other work that does not need its output, or end your turn, and the notice comes when it finishes. jobs() and cancel() return promises. Interrupting the turn stops its runs.',
     '',
     'Each run is a round trip that re-sends the whole conversation, so do a whole step in one script: start every call you can already name at once with Promise.all, and chain the steps that need no judgment in between (search, then read the hits, then filter) inside the script. Return when the next step needs your judgment, with only what you need.',
     '',
@@ -1681,7 +1681,8 @@ const startedReply = (job: Job): RunResult => {
 const collectReply = (agent: string): RunResult => {
   const finished = deliver(agent)
   const still = stillRunning(agent).trim()
-  return withBlocks(finished.text ? `${finished.text}${still ? `\n\n${still}` : ''}` : `No run has finished output waiting.${still ? ` ${still}` : ''}`, finished.blocks)
+  const advice = still ? ` ${still} If you need their output before you can go on, end your turn: a notice comes when they finish, so do not call again to check.` : ''
+  return withBlocks(finished.text ? `${finished.text}${still ? `\n\n${still}` : ''}` : `No run has finished output waiting.${advice}`, finished.blocks)
 }
 const notice = (jobs: Job[]) =>
   `Background run${jobs.length === 1 ? '' : 's'} ${jobs.map((j) => j.id).join(', ')} finished. Call ${FULL} with an empty script to read the output.`

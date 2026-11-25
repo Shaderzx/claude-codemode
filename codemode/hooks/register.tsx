@@ -683,6 +683,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     seen.add(file)
     return verb + ' ' + file
   }
+  const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version } : {})
   const unreadWrite = (r) => !r.ok && !r.refused && !r.denied && UNREAD.test(String(r.error))
   const write = async (path, content, opts) => {
     const file = absOnly(path, 'write')
@@ -706,22 +707,31 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.ok) return wrote(file)
     if (r.refused || r.denied || !/already exists/i.test(String(r.error))) throw toolError('write: ' + r.error, r)
     const moved = () => toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
-    let guard = {}
+    const empty = () => toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
+    const replaceWhole = async (now, check) => {
+      const guard = guardOf(check)
+      const once = (old) => req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: old, new_text: body }, ...guard })
+      const first = await once(now)
+      const crlf = !first.ok && !first.refused && !first.denied && !unreadWrite(first) && /not found/i.test(String(first.error)) && !now.includes('\r')
+      return crlf ? once(now.split('\n').join('\r\n')) : first
+    }
     if (!force) {
       const check = await req('fresh', { path: file })
       if (!check.read) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
       if (check.fresh === false) throw moved()
-      if (typeof check.version === 'string') guard = { expectedVersion: check.version }
-    }
-    const now = await readText(file, !force)
-    if (!now) throw toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
-    r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now, new_text: body }, ...guard })
-    if (r.ok) return wrote(file)
-    if (unreadWrite(r)) throw moved()
-    if (!r.refused && !r.denied && /not found/i.test(String(r.error)) && !now.includes('\r')) {
-      r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now.split('\n').join('\r\n'), new_text: body }, ...guard })
+      const now = await readText(file, true)
+      if (!now) throw empty()
+      r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
       if (unreadWrite(r)) throw moved()
+      throw toolError('write: ' + r.error + endings(r.error), r)
+    }
+    for (let tries = 0; ; tries++) {
+      const now = await read(file)
+      if (!now) throw empty()
+      r = await replaceWhole(now, await req('fresh', { path: file }))
+      if (r.ok) return wrote(file)
+      if (!unreadWrite(r) || tries >= 4) break
     }
     throw toolError('write: ' + r.error + endings(r.error), r)
   }
@@ -747,16 +757,18 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const patch = patcher()
     if (!patch) throw toolError('edit: this session has no Edit tool and no patch tool')
     const moved = (r) => toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
-    let guard = {}
-    const check = await req('fresh', { path: file })
-    if (!check.read) {
-      if (!force) throw unread()
+    let check = await req('fresh', { path: file })
+    if (!check.read || check.fresh === false) {
+      if (!force) throw check.read ? moved() : unread()
       await read(file)
-    } else if (check.fresh === false) {
-      if (!force) throw moved()
+      check = await req('fresh', { path: file })
+    }
+    const args = { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }
+    let r = await req('call', { tool: patch, args, ...guardOf(check) })
+    for (let tries = 0; force && unreadWrite(r) && tries < 4; tries++) {
       await read(file)
-    } else if (!force && typeof check.version === 'string') guard = { expectedVersion: check.version }
-    const r = await req('call', { tool: patch, args: { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }, ...guard })
+      r = await req('call', { tool: patch, args, ...guardOf(await req('fresh', { path: file })) })
+    }
     if (r.ok) return wrote(file, 'edited')
     if (unreadWrite(r)) throw moved(r)
     throw toolError('edit: ' + r.error + endings(r.error), r)
@@ -2354,7 +2366,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const found = await realpath(head)
       if (found) return { done: true, path: found.replace(/\/$/, '') + missing }
       const target = await readlink(head)
-      if (target) return { done: false, path: normal((target.startsWith('/') ? target : head.slice(0, head.lastIndexOf('/')) + '/' + target) + missing) }
+      if (target) {
+        const parent = head.slice(0, head.lastIndexOf('/')) || '/'
+        const base = target.startsWith('/') ? '' : ((await realpath(parent)) ?? parent).replace(/\/$/, '') + '/'
+        return { done: false, path: normal(base + target + missing) }
+      }
       const slash = head.lastIndexOf('/')
       if (slash <= 0) return { done: true, path: p }
       missing = head.slice(slash) + missing

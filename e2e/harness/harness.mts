@@ -46,6 +46,7 @@ type Case = {
   abortStyle?: string
   engineForgets?: boolean
   changeAfterPage?: number
+  rewriteDuringFirstRead?: string
   readDelayMs?: number
   listThrows?: boolean
   detachAfterMs?: number
@@ -215,6 +216,10 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       seen.set(key, statSync(p).mtimeMs)
       readTimes.set(p, statSync(p).mtimeMs)
       if (typeof a.limit === 'number' && c.changeAfterPage === offset) writeFileSync(p, text + 'changed meanwhile\n')
+      if (c.rewriteDuringFirstRead !== undefined && !rewrittenDuringRead) {
+        rewrittenDuringRead = true
+        writeFileSync(p, c.rewriteDuringFirstRead)
+      }
       return ok(numbered(part, offset), { type: 'text', file: { filePath: p, content: part.join('\n'), numLines: part.length, startLine: offset, totalLines: lines.length, ...(cut ? { truncatedByTokenCap: true } : {}) } })
     }
     case 'Write': {
@@ -454,6 +459,7 @@ let wakesSeen = 0
 let statsPending = 0
 let bashWaits = 0
 let listsHanging = 0
+let rewrittenDuringRead = false
 let clockNowCalls = 0
 const writtenReplies = new Set<string>()
 const failedReplies = new Set<string>()

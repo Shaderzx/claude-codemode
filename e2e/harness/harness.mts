@@ -71,7 +71,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -463,6 +463,7 @@ let bashWaits = 0
 let listsHanging = 0
 let rewrittenDuringRead = false
 let clockNowCalls = 0
+const clockMarks: number[] = []
 const writtenReplies = new Set<string>()
 const failedReplies = new Set<string>()
 let listsHung = 0
@@ -664,7 +665,7 @@ const flatten = (r: unknown): { text: string; attachments: number } => {
   return { text: JSON.stringify(v), attachments: 0 }
 }
 
-const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; bashWaits?: number; runnersSpawned?: number } = { results: [], calls, store, submitted, stops, collected: [], collectedAttachments: [], kills, waitsAlive: 0, wakeAttempts: 0 }
+const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; clockMarks?: number[]; bashWaits?: number; runnersSpawned?: number } = { results: [], calls, store, submitted, stops, collected: [], collectedAttachments: [], kills, waitsAlive: 0, wakeAttempts: 0 }
 const collect = async (agentId?: string) => {
   const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: '', ...(agentId ? { agentId } : {}) }, engine(async () => ({})))
   const flat = flatten(r)
@@ -751,6 +752,10 @@ for (const s of c.steps) {
     const spills = join(home, '.claude', 'codemode', 'out')
     const old = (Date.now() - 3 * 86_400_000) / 1000
     for (const n of existsSync(spills) ? readdirSync(spills) : []) utimesSync(join(spills, n), old, old)
+    continue
+  }
+  if (s.clockMark) {
+    clockMarks.push(clockNowCalls)
     continue
   }
   if (s.abortDuringNext) {
@@ -871,4 +876,5 @@ out.bashWaits = bashWaits
 out.runnersSpawned = runsStarted
 out.wakeAttempts = wakeAttempts
 out.clockNowCalls = clockNowCalls
+out.clockMarks = clockMarks
 process.stdout.write(JSON.stringify(out), () => process.exit(0))

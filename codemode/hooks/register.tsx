@@ -629,8 +629,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.alt) denied.add(order[0])
     throw toolError('sh: ' + r.error, r)
   }
+  let readSeq = 0
   const read = (path) => readText(path, false)
   const readText = async (path, internal) => {
+    const readId = ++readSeq
     if (!names.has('Read')) throw toolError('read: this session has no Read tool')
     const file = abs(path)
     const rows = []
@@ -641,7 +643,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let cap = 2000
     let whole = false
     for (;;) {
-      const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true, ...(internal ? { internal: true } : {}) })
+      const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true, readId, ...(internal ? { internal: true } : {}) })
       const cutAtCap = r.ok && r.result && r.result.file && r.result.file.truncatedByTokenCap === true
       if (!r.ok || cutAtCap) {
         if (cutAtCap || /exceeds maximum allowed/i.test(String(r.error))) {
@@ -684,17 +686,22 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     return verb + ' ' + file
   }
   const timeToRetry = () => started + timeout - Date.now() > 2000
-  const forcedRead = async (file) => {
-    for (;;) {
+  const pause = (n) => sleep(Math.min(500, 10 * 2 ** n) * (1 + Math.random()))
+  const forcedRead = async (file, what) => {
+    const settleBy = Date.now() + 5000
+    for (let n = 0; ; n++) {
+      if (n) await pause(n)
       let text
       try {
         text = await read(file)
       } catch (err) {
-        if (timeToRetry() && /changed while it was read/i.test(String(err && err.message))) continue
-        throw err
+        if (!/changed while it was read/i.test(String(err && err.message))) throw err
       }
-      const check = await req('fresh', { path: file })
-      if (typeof check.version === 'string' || !timeToRetry()) return { text, check }
+      if (text !== undefined) {
+        const check = await req('fresh', { path: file })
+        if (typeof check.version === 'string') return { text, check }
+      }
+      if (Date.now() >= settleBy || !timeToRetry()) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
     }
   }
   const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version } : {})
@@ -707,9 +714,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       let r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
       if (unreadWrite(r) && !force && MOVED.test(String(r.error))) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
       if (unreadWrite(r) && !force) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace it unread', r)
-      while (unreadWrite(r) && timeToRetry()) {
-        await forcedRead(file)
+      for (let n = 0; unreadWrite(r); n++) {
+        if (n) await pause(n)
+        await forcedRead(file, 'write')
         r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
+        if (!timeToRetry()) break
       }
       if (r.ok) return wrote(file)
       if (r.denied && r.alt) denied.add('Write')
@@ -740,10 +749,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (unreadWrite(r)) throw moved()
       throw toolError('write: ' + r.error + endings(r.error), r)
     }
-    for (;;) {
-      const { text: now, check } = await forcedRead(file)
+    for (let n = 0; ; n++) {
+      if (n) await pause(n)
+      const { text: now, check } = await forcedRead(file, 'write')
       if (!now) throw empty()
-      if (typeof check.version !== 'string') throw moved()
       r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
       if (!unreadWrite(r) || !timeToRetry()) break
@@ -761,9 +770,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       let r = await req('call', { tool: 'Edit', args })
       if (unreadWrite(r) && !force && MOVED.test(String(r.error))) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
       if (unreadWrite(r) && !force) throw unread(r)
-      while (unreadWrite(r) && timeToRetry()) {
-        await forcedRead(file)
+      for (let n = 0; unreadWrite(r); n++) {
+        if (n) await pause(n)
+        await forcedRead(file, 'edit')
         r = await req('call', { tool: 'Edit', args })
+        if (!timeToRetry()) break
       }
       if (r.ok) return wrote(file, 'edited')
       if (r.denied && r.alt) denied.add('Edit')
@@ -775,12 +786,13 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let check = await req('fresh', { path: file })
     if (!check.read || check.fresh === false) {
       if (!force) throw check.read ? moved() : unread()
-      check = (await forcedRead(file)).check
+      check = (await forcedRead(file, 'edit')).check
     }
     const args = { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }
     let r = await req('call', { tool: patch, args, ...guardOf(check) })
-    while (force && unreadWrite(r) && timeToRetry()) {
-      r = await req('call', { tool: patch, args, ...guardOf((await forcedRead(file)).check) })
+    for (let n = 1; force && unreadWrite(r) && timeToRetry(); n++) {
+      await pause(n)
+      r = await req('call', { tool: patch, args, ...guardOf((await forcedRead(file, 'edit')).check) })
     }
     if (r.ok) return wrote(file, 'edited')
     if (unreadWrite(r)) throw moved(r)
@@ -1855,11 +1867,14 @@ const wake = async ($: Dollar) => {
   }
 }
 const clockNow = async ($: Dollar): Promise<number> => {
+  const fallback: { handle?: { cancel: () => unknown } } = {}
   try {
-    const now = await $.clock.now()
+    const now = await Promise.race([$.clock.now(), new Promise<undefined>((r) => (fallback.handle = $.clock.after(1000, () => r(undefined))))])
     return typeof now === 'number' ? now : Date.now()
   } catch {
     return Date.now()
+  } finally {
+    fallback.handle?.cancel()
   }
 }
 const expireLater = ($: Dollar, job: Job) => {
@@ -2214,8 +2229,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
         const from = typeof args.offset === 'number' ? args.offset : 1
-        const first = pagesStarted.get(args.file_path)
-        if (from === 1) pagesStarted.set(args.file_path, readBefore)
+        const pages = typeof p.readId === 'number' ? `${args.file_path}#${p.readId}` : args.file_path
+        const first = pagesStarted.get(pages)
+        if (from === 1) pagesStarted.set(pages, readBefore)
         else if (first !== undefined && (readBefore !== first || readAfter !== first)) {
           tally.ok--
           tally.failed++

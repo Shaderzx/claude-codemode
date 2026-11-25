@@ -1830,7 +1830,7 @@ test('cancel() right after a run starts still stops it', () => {
 test('A stopped run names the tool calls still running when it was stopped', () => {
   const out = run({ steps: [{ script: 'return String(await sh("sleep 20"))', keepTurn: true }, { untilTool: 'Bash' }, { script: 'return String(await cancel("r1"))' }] });
   expect(out.results[0]!.text).toContain('still running when it was stopped');
-  expect(out.results[0]!.text).toContain('sleep 20');
+  expect(out.results[0]!.text).toMatch(/still running when it was stopped[^\n]*Bash \(/);
 });
 
 test('A run cannot cancel itself', () => {
@@ -2894,18 +2894,21 @@ test('A forced write through Write in the last seconds of a run still lands', ()
   expect(readFileSync(file, 'utf8')).toBe('mine\n');
 });
 
-for (const [label, tools, op] of [['Write', undefined, 'write'], ['the patch tool', NO_BASH, 'write'], ['the patch tool', NO_BASH, 'edit']] as const) {
-  test('A forced ' + op + ' through ' + label + ' of a file that never stops changing fails within seconds and says so', () => {
-    const dir = scratch();
-    const file = join(dir, 'f.txt');
-    writeFileSync(file, 'original\n');
-    const f = JSON.stringify(file);
-    const call = op === 'write' ? 'await write(' + f + ', "mine\\n", { force: true })' : 'await edit(' + f + ', "original", "mine", { force: true })';
-    const out = run({ ...(tools ? { tools: [...tools] } : {}), changeEveryRead: true, readDelayMs: 100, steps: [{ script: '// @options: {"timeout_ms": 30000}\ntry { ' + call + '; return "landed" } catch (x) { return String(x.message) }' }] });
-    expect(out.results[0]!.text).toContain('keeps changing while it is read');
-    expect(out.calls.filter((c) => c.tool === 'Read').length).toBeLessThanOrEqual(20);
-  });
-}
+const neverSettles = (tools: readonly string[] | undefined, op: 'write' | 'edit') => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const f = JSON.stringify(file);
+  const call = op === 'write' ? 'await write(' + f + ', "mine\\n", { force: true })' : 'await edit(' + f + ', "original", "mine", { force: true })';
+  const out = run({ ...(tools ? { tools: [...tools] } : {}), changeEveryRead: true, readDelayMs: 100, steps: [{ script: '// @options: {"timeout_ms": 30000}\ntry { ' + call + '; return "landed" } catch (x) { return String(x.message) }' }] });
+  expect(out.results[0]!.text).toContain('keeps changing while it is read');
+  expect(out.calls.filter((c) => c.tool === 'Read').length).toBeLessThanOrEqual(20);
+};
+
+test('A forced write through Write of a file that never stops changing fails within seconds and says so', () => neverSettles(undefined, 'write'));
+test('A forced edit through Edit of a file that never stops changing fails within seconds and says so', () => neverSettles(undefined, 'edit'));
+test('A forced write through the patch tool of a file that never stops changing fails within seconds and says so', () => neverSettles(NO_BASH, 'write'));
+test('A forced edit through the patch tool of a file that never stops changing fails within seconds and says so', () => neverSettles(NO_BASH, 'edit'));
 
 test('A kill timer whose clock never answers still kills a spinning run within seconds', () => {
   const out = run({ clockNowDelayMs: 30000, steps: [{ script: '// @options: {"timeout_ms": 1000}\nwhile (true) {}', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
@@ -2983,4 +2986,75 @@ test('A file read by its plain path can be written through a path that climbs ou
   ] });
   expect(out.results[0]!.text).toBe('wrote');
   expect(readFileSync(join(dir, 'w', 'B', 'other', 'f.txt'), 'utf8')).toBe('mine\n');
+});
+
+const climbingFolder = () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'x', 'y'), { recursive: true });
+  writeFileSync(join(dir, 'x', 'real.txt'), 'INTENDED\n');
+  writeFileSync(join(dir, 'real.txt'), 'DECOY\n');
+  return dir;
+};
+
+test('A relative Read path whose .. climbs out of a symlinked folder reaches the file the disk names', () => {
+  const dir = climbingFolder();
+  const out = run({ cwd: dir, steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'return String(await tools.Read({ file_path: "sub/../real.txt" }))' }] });
+  expect(out.results[0]!.text).toContain('INTENDED');
+});
+
+test('A climbing path given by tool defaults reaches the file the disk names', () => {
+  const dir = climbingFolder();
+  const out = run({ env: { CODEMODE_TOOL_DEFAULTS: JSON.stringify({ Read: { file_path: join(dir, 'sub') + '/../real.txt' } }) }, steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'return String(await tools.Read({}))' }] });
+  expect(out.results[0]!.text).toContain('INTENDED');
+});
+
+test('A file read through a climbing path can be edited by its plain path, and the other way round', () => {
+  const dir = climbingFolder();
+  const climbing = JSON.stringify(join(dir, 'sub') + '/../real.txt');
+  const plain = JSON.stringify(join(dir, 'x', 'real.txt'));
+  const out = run({ steps: [
+    { link: { from: join(dir, 'sub'), to: 'x/y' } },
+    { script: 'await read(' + climbing + ')\ntry { await edit(' + plain + ', "INTENDED", "E1"); return "edited" } catch (e) { return String(e.message) }' },
+    { script: 'await read(' + plain + ')\ntry { await edit(' + climbing + ', "E1", "E2"); return "edited" } catch (e) { return String(e.message) }' },
+  ] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['edited', 'edited']);
+  expect(readFileSync(join(dir, 'x', 'real.txt'), 'utf8')).toBe('E2\n');
+});
+
+test('A file read by its plain path can be written through a climbing path whose link names it another way', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'w', 'B', 'other', 'deep'), { recursive: true });
+  mkdirSync(join(dir, 'w', 'B', 'real'), { recursive: true });
+  writeFileSync(join(dir, 'w', 'B', 'other', 'f.txt'), 'theirs\n');
+  const plain = join(dir, 'w', 'A', 'other', 'f.txt');
+  const climbing = join(dir, 'w', 'A', 'real', 'L') + '/../f.txt';
+  const out = run({ steps: [
+    { link: { from: join(dir, 'w', 'A'), to: join(dir, 'w', 'B') } },
+    { link: { from: join(dir, 'w', 'B', 'real', 'L'), to: join(dir, 'w', 'B', 'other', 'deep') } },
+    { script: 'await read(' + JSON.stringify(plain) + ')\ntry { await write(' + JSON.stringify(climbing) + ', "mine\\n"); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[0]!.text).toBe('wrote');
+  expect(readFileSync(join(dir, 'w', 'B', 'other', 'f.txt'), 'utf8')).toBe('mine\n');
+});
+
+test('Two forced patch edits in two-second runs that read the file first both land', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const go = join(dir, 'go');
+  const [a, b] = ['a-read', 'b-read'].map((n) => join(dir, n));
+  const editor = (from: string, to: string, marker: string) => '// @options: {"timeout_ms": 2000}\nawait read(' + f + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 1500 })\ntry { await edit(' + f + ', "' + from + '", "' + to + '", { force: true }); return "edited" } catch (e) { return String(e.message) }';
+  const out = run({ tools: NO_BASH, statDelayMs: 120, steps: [{ script: editor('alpha', 'ALPHA', a), keepTurn: true }, { script: editor('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['edited', 'edited']);
+  expect(readFileSync(file, 'utf8')).toBe('ALPHA\nBETA\n');
+});
+
+test('A Read the mod pages that a failing call beside it cuts off is named as cut off, not still running', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  writeFileSync(big, Array.from({ length: 15000 }, (_, i) => 'line ' + i + ' ' + 'x'.repeat(60)).join('\n') + '\n');
+  const text = one('await Promise.all([tools.Read({ file_path: ' + JSON.stringify(big) + ' }), tools.Bash({ command: "exit 1" })])', { readDelayMs: 120 });
+  expect(text).toMatch(/Read 1 cut off/);
+  expect(text).not.toMatch(/Read 1 still running/);
 });

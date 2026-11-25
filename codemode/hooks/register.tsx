@@ -106,7 +106,8 @@ process.stdin.on('data', (d) => { input += d })
 process.stdin.on('end', () => { main(JSON.parse(input)) })
 const send = (o, cb) => process.stdout.write(MARK + JSON.stringify(o) + '\n', cb)
 for (const k of Object.keys(process.env)) delete process.env[k]
-send({ pid: process.pid })
+const booted = Date.now()
+send({ pid: process.pid, started: booted })
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const thenable = (v) => {
   try { return v !== null && (typeof v === 'object' || typeof v === 'function') && typeof v.then === 'function' } catch { return false }
@@ -250,7 +251,7 @@ const isDedup = (t) => {
 }
 async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied: deniedList, shell: shellPref, seen: seenList }) {
   fs.mkdirSync(dir, { recursive: true })
-  const started = Date.now()
+  const started = booted
   let room = 1000000
   const keep = (out, s, v) => {
     if (room <= 0) return
@@ -285,7 +286,12 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (failure && failure.length > 100000) failure = failure.slice(0, safeEnd(failure, 100000)) + '…'
     send({ done: true, failure, kind, failedId, alongside: failedId ? alongsideOf(failedId) : 0 }, () => process.exit(0))
   }
-  setTimeout(() => finish('timed out after ' + timeout + 'ms', 'timeout'), timeout)
+  const timedOut = () => finish('timed out after ' + timeout + 'ms', 'timeout')
+  const endTimedOut = () => {
+    timedOut()
+    return new Promise(() => {})
+  }
+  setTimeout(timedOut, Math.max(0, started + timeout - Date.now()))
   const unhandled = new Map()
   process.on('unhandledRejection', (err, p) => { unhandled.set(p, err) })
   process.on('rejectionHandled', (p) => { unhandled.delete(p) })
@@ -304,7 +310,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const id = ++seq
     // The mod drops a line this long, which would leave the call waiting forever.
     if (JSON.stringify(payload).length > 7000000) return { ok: false, error: 'The request is too large to pass to the mod.', id }
-    if (kind === 'call' && Date.now() >= started + timeout) return { ok: false, error: 'The run is out of time, so this call did not start.', id }
+    if (Date.now() >= started + timeout) return endTimedOut()
     const t = { sent: ++tick }
     if (kind === 'call') timing.set(id, t)
     send({ id, kind, payload })
@@ -314,6 +320,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       let res
       try { res = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { continue }
       try { fs.unlinkSync(file) } catch {}
+      if (res && res.timedOut === true) return endTimedOut()
       t.answered = ++tick
       t.ok = !!(res && res.ok)
       if (res && typeof res === 'object') {
@@ -623,7 +630,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.alt) denied.add(order[0])
     throw toolError('sh: ' + r.error, r)
   }
-  const read = async (path) => {
+  const read = (path) => readText(path, false)
+  const readText = async (path, internal) => {
     if (!names.has('Read')) throw toolError('read: this session has no Read tool')
     const file = abs(path)
     const rows = []
@@ -634,7 +642,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let cap = 2000
     let whole = false
     for (;;) {
-      const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true })
+      const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true, ...(internal ? { internal: true } : {}) })
       const cutAtCap = r.ok && r.result && r.result.file && r.result.file.truncatedByTokenCap === true
       if (!r.ok || cutAtCap) {
         if (cutAtCap || /exceeds maximum allowed/i.test(String(r.error))) {
@@ -667,7 +675,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       limit = Math.min(2000, limit * 2)
       stubbed = 0
     }
-    if (whole) seen.add(file)
+    if (whole && !internal) seen.add(file)
     return rows.join('\n')
   }
   const UNREAD = /read it first|has not been read|modified since read|changed since (?:it was )?last read/i
@@ -698,15 +706,23 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let r = await req('call', { tool: patch, args: { op: 'create', path: file, new_text: body } })
     if (r.ok) return wrote(file)
     if (r.refused || r.denied || !/already exists/i.test(String(r.error))) throw toolError('write: ' + r.error, r)
-    if (!force && !seen.has(file)) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
-    if (!force && (await req('fresh', { path: file })).fresh === false) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it')
-    const now = await read(file)
+    const moved = () => toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
+    let guard = {}
+    if (!force) {
+      if (!seen.has(file)) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
+      const check = await req('fresh', { path: file })
+      if (check.fresh === false) throw moved()
+      if (typeof check.version === 'string') guard = { expectedVersion: check.version }
+    }
+    const now = await readText(file, !force)
     if (!now) throw toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
-    r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now, new_text: body } })
+    r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now, new_text: body }, ...guard })
     if (r.ok) return wrote(file)
+    if (unreadWrite(r)) throw moved()
     if (!r.refused && !r.denied && /not found/i.test(String(r.error)) && !now.includes('\r')) {
-      r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now.split('\n').join('\r\n'), new_text: body } })
+      r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now.split('\n').join('\r\n'), new_text: body }, ...guard })
       if (r.ok) return wrote(file)
+      if (unreadWrite(r)) throw moved()
     }
     throw toolError('write: ' + r.error + endings(r.error), r)
   }
@@ -731,15 +747,21 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     }
     const patch = patcher()
     if (!patch) throw toolError('edit: this session has no Edit tool and no patch tool')
+    const moved = (r) => toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
+    let guard = {}
     if (!seen.has(file)) {
       if (!force) throw unread()
       await read(file)
-    } else if ((await req('fresh', { path: file })).fresh === false) {
-      if (!force) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }')
-      await read(file)
+    } else {
+      const check = await req('fresh', { path: file })
+      if (check.fresh === false) {
+        if (!force) throw moved()
+        await read(file)
+      } else if (typeof check.version === 'string') guard = { expectedVersion: check.version }
     }
-    const r = await req('call', { tool: patch, args: { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) } })
+    const r = await req('call', { tool: patch, args: { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }, ...guard })
     if (r.ok) return wrote(file, 'edited')
+    if (unreadWrite(r)) throw moved(r)
     throw toolError('edit: ' + r.error + endings(r.error), r)
   }
   const deadline = () => Math.max(0, started + timeout - Date.now())
@@ -810,7 +832,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     btoa, atob, TextEncoder, TextDecoder, Buffer,
     text: (v) => { keep('item', show(v), v) },
     console: { log, info: log, warn: log, error: log, debug: log },
-    describeTool: async (name) => (await req('describe', { tool: resolve(name) })).value,
+    describeTool: async (name) => { const r = await req('describe', { tool: resolve(name) }); if (!r.ok) throw new Error('describeTool: ' + r.error); return r.value },
     ask: async (prompt, opts) => {
       const o = opts && typeof opts === 'object' ? opts : {}
       const r = await req('ask', { prompt: String(prompt), model: o.model, system: o.system, maxTokens: o.maxTokens, effort: o.effort })
@@ -818,8 +840,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       return r.text
     },
     store: async (key, value) => { const r = await req('store', { key: String(key), value }); if (!r.ok) throw new Error('store: ' + r.error) },
-    load: async (key) => (await req('load', { key: String(key) })).value,
-    jobs: async () => (await req('jobs', {})).value,
+    load: async (key) => { const r = await req('load', { key: String(key) }); if (!r.ok) throw new Error('load: ' + r.error); return r.value },
+    jobs: async () => { const r = await req('jobs', {}); if (!r.ok) throw new Error('jobs: ' + r.error); return r.value },
     cancel: async (id) => { const r = await req('cancel', { id: String(id) }); if (!r.ok) throw new Error('cancel: ' + r.error); return r.value },
     exit: () => { throw new Exit() },
   })
@@ -847,7 +869,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       failedId = err && err.codemodeId
     }
   }
-  finish(failure, kind, failedId)
+  if (Date.now() >= started + timeout) timedOut()
+  else finish(failure, kind, failedId)
 }
 
 `
@@ -1903,7 +1926,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
 
   const handle = async (m: Request): Promise<Record<string, unknown>> => {
     const p = m.payload
-    if (late()) return { ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this request started` }
+    if (late()) return refusal('request')
     if (m.kind === 'store') {
       const key = `script:${String(p.key)}`
       if (p.value === undefined) await $.store.delete(key)
@@ -1914,7 +1937,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const path = normal(String(p.path))
       const was = job.reads.has(path) ? job.reads.get(path) : readVersions.get(path)
       const now = was === undefined ? undefined : await versionOf(path)
-      return { ok: true, fresh: was !== undefined && now !== undefined && now === was }
+      return { ok: true, fresh: was !== undefined && now !== undefined && now === was, version: was }
     }
     if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
     if (m.kind === 'jobs') return { ok: true, value: running(job) }
@@ -1997,13 +2020,17 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
       }
     }
+    if (typeof p.expectedVersion === 'string' && /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && typeof args.path === 'string') {
+      const path = normal(absolute(args.path.trim(), cwd, home))
+      if ((await versionOf(path)) !== p.expectedVersion) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+    }
     if (tool === 'Read' && typeof args.file_path === 'string') args.file_path = absolute(args.file_path.trim(), cwd, home)
     // Plugins cannot run the Agent tool; codemode-agents spawns instead.
     const target = tool === 'Agent' || tool === 'Task' ? AGENTS_TOOL : tool
     const key = skillKey(String(args.skill ?? ''))
     // Calls to one skill take turns, so each gets its own expansion (its args may
     // differ); only text expanded after this call started counts.
-    if (late()) return { ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this call started` }
+    if (late()) return refusal('call')
     const timer: { handle?: { cancel: () => unknown } } = {}
     const release =
       tool === 'Skill' ? await skillTurn(key, new Promise((r) => (timer.handle = $.clock.after(60_000, () => r(undefined))))) : undefined
@@ -2034,7 +2061,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       tally.open--
       if (counted && tally.ok + tally.failed + tally.open === 0) calls.delete(tool)
       open.delete(m.id)
-      return { ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this call started` }
+      return refusal('call')
     }
     let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
       tally.open--
@@ -2163,7 +2190,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         }
       }
       const receipt =
-        tool === 'Read' && typeof args.file_path === 'string'
+        tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
           ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined, [job.progress.get(args.file_path), readProgress.get(args.file_path)])
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
@@ -2286,6 +2313,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
 
   let over = false
   const late = () => over || !!job.cancelledBy || killed || Date.now() >= started + timeout
+  const refusal = (what: string) => ({ ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this ${what} started`, ...(over || job.cancelledBy || killed ? {} : { timedOut: true }) })
   const writes = new Set<Promise<unknown>>()
   const replies = new Set<Promise<unknown>>()
   const items: string[] = []
@@ -2398,7 +2426,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const shellPref = await $.env.get('CODEMODE_SHELL')
   await $.fs.write(`${dir}/.keep`, '')
 
-  const started = Date.now()
+  let started = Date.now()
   let done: Done | undefined
   let stderr = ''
   let buf = ''
@@ -2437,6 +2465,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         // The pid is the runner's first line, before any script code runs.
         if (pid === undefined) {
           pid = Number.isSafeInteger(m.pid) && (m.pid as number) > 1 ? m.pid : 0
+          const childStarted = (m as { started?: unknown }).started
+          if (typeof childStarted === 'number' && childStarted >= started && childStarted <= Date.now()) started = childStarted
           job.pid = pid || undefined
           job.onPid()
           if (killed || job.cancelledBy) {

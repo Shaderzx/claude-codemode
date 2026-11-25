@@ -450,6 +450,7 @@ let wakesSeen = 0
 let statsPending = 0
 let bashWaits = 0
 let listsHanging = 0
+let fakesPending = 0
 let lastActivity = Date.now()
 let wakeAttempts = 0
 let refusals = c.submitRefusals ?? 0
@@ -486,7 +487,11 @@ const $ = {
     },
     call: async (args: Record<string, unknown>) => {
       const { tool, ...rest } = args
-      const r = await fake(String(tool), rest)
+      fakesPending++
+      const r = await fake(String(tool), rest).finally(() => {
+        fakesPending--
+        lastActivity = Date.now()
+      })
       const t = typeof r.text === 'string' ? r.text : undefined
       if (r.isError !== true && t !== undefined && t.length > 50000 && String(tool).startsWith('mcp__') && !c.noSwap) {
         const saved = join(c.env?.CLAUDE_CONFIG_DIR ?? join(home, '.claude'), 'projects', 'p', 's', 'tool-results', String(tool).slice(5).replace(/__/g, '-') + '-' + Date.now() + '-' + ++swapped + '.txt')
@@ -732,7 +737,7 @@ for (const s of c.steps) {
     continue
   }
   if (s.untilQuiet) {
-    await until(() => listsHanging === 0 && inflight === 0 && Date.now() - lastActivity > 500, 60_000, 'the mod going quiet')
+    await until(() => listsHanging === 0 && inflight === 0 && fakesPending === 0 && statsPending === 0 && Date.now() - lastActivity > 500, 60_000, 'the mod going quiet')
     continue
   }
   if (s.untilCleaned) {

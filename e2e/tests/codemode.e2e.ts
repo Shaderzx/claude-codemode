@@ -2144,7 +2144,8 @@ test('Esc on an older turn stops that turn\'s runs even after a newer turn start
 
 test('A cancelled run makes no follow-up tool call after cancel() returns', () => {
   const dir = scratch();
-  const out = run({ readDelayMs: 1500, steps: [{ script: 'return await read(' + JSON.stringify(join(dir, 'nope.txt')) + ').catch((e) => e.message)', keepTurn: true }, { untilTool: 'Read' }, { script: 'return String(await cancel("r1"))', keepTurn: true }, { untilRunsDone: true }, { collect: true }, { untilQuiet: true }] });
+  writeFileSync(join(dir, 'nope.text'), 'near miss\n');
+  const out = run({ cwd: dir, home: dir, readDelayMs: 1500, steps: [{ script: 'return await read(' + JSON.stringify(join(dir, 'nope.txt')) + ').catch((e) => e.message)', keepTurn: true }, { untilTool: 'Read' }, { script: 'return String(await cancel("r1"))', keepTurn: true }, { untilRunsDone: true }, { collect: true }, { untilQuiet: true }] });
   expect(out.results[1]!.text).toBe('true');
   expect(out.calls.filter((x) => x.tool === 'Read')).toHaveLength(1);
 });
@@ -2269,4 +2270,30 @@ test('Esc on a run still stuck before its runner starts brings it back at once a
   expect(out.collected[0]).toContain('[aborted]');
   expect(out.runnersSpawned).toBe(0);
   expect(existsSync(mark)).toBe(false);
+});
+
+test('A run that timed out makes no tool call afterwards', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const f = JSON.stringify(file);
+  const out = run({ statDelayMs: 2000, steps: [{ script: '// @options: {"timeout_ms": 5000}\nawait read(' + f + ')\nawait call("Write", { file_path: ' + f + ', content: "late\\n" })\nreturn 1', keepTurn: true }, { untilRunsDone: true }, { untilQuiet: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('[timeout]');
+  expect(readFileSync(file, 'utf8')).toBe('original\n');
+});
+
+test('A slow run that read an older version of a file cannot make a newer read count as stale', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'v1\n');
+  const f = JSON.stringify(file);
+  const [gate, read1] = ['gate', 'read1'].map((n) => join(dir, n));
+  const out = run({ steps: [
+    { script: 'await read(' + f + ')\nawait sh("touch ' + read1 + '")\nawait waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "slow"', keepTurn: true },
+    { untilFile: read1 },
+    { script: 'await read(' + f + ')\nawait write(' + f + ', "v2\\n")\nreturn "wrote-v2"', keepTurn: true },
+    { untilRunDone: 'r2' }, { collect: true }, { touch: gate }, { untilRunDone: 'r1' }, { collect: true },
+    { script: 'const r = await call("Write", { file_path: ' + f + ', content: "v3\\n" })\nreturn r.ok ? "wrote-v3" : r.error', keepTurn: true }, { untilRunsDone: true }, { collect: true },
+  ] });
+  expect(out.results[2]!.text).toBe('wrote-v3');
 });

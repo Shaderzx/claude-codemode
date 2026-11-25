@@ -2435,10 +2435,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   let killed = false
   // The child's own timer cannot fire while a script spins synchronously, so
   // the mod kills it a little after the deadline.
-  const watchdog = $.clock.after(timeout + 5_000, () => {
+  const killRunner = () => {
     killed = true
     if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
-  })
+  }
+  let watchdog = $.clock.after(timeout + 5_000, killRunner)
   try {
     if (!job.cancelledBy && !job.pid && Date.now() > job.deadline) expire(job)
     if (job.cancelledBy) throw new Error('codemode: stopped before its runner started')
@@ -2466,7 +2467,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (pid === undefined) {
           pid = Number.isSafeInteger(m.pid) && (m.pid as number) > 1 ? m.pid : 0
           const childStarted = (m as { started?: unknown }).started
-          if (typeof childStarted === 'number' && childStarted >= started && childStarted <= Date.now()) started = childStarted
+          if (typeof childStarted === 'number' && childStarted >= started && childStarted <= Date.now()) {
+            started = childStarted
+            watchdog.cancel()
+            watchdog = $.clock.after(Math.max(0, started + timeout + 5_000 - Date.now()), killRunner)
+          }
           job.pid = pid || undefined
           job.onPid()
           if (killed || job.cancelledBy) {

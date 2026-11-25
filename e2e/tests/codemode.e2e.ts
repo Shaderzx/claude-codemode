@@ -2716,6 +2716,7 @@ test('A kill timer whose clock answers slowly never arms a kill past a run that 
   expect(out.collected[0]).toContain('completed-in-time');
   expect(out.results[1]!.text).toBe('later');
   expect(out.kills).toHaveLength(0);
+  expect(out.clockNowCalls).toBeLessThanOrEqual(5);
 });
 
 test('Two runs creating one new file through a relative dangling symlink inside a symlinked folder never both write it', () => {
@@ -2770,4 +2771,77 @@ test('A forced write through the patch tool lands when the file changes while it
   const out = run({ tools: NO_BASH, rewriteDuringFirstRead: 'external\n', steps: [{ script: 'try { await write(' + JSON.stringify(file) + ', "from-codemode\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }' }] });
   expect(out.results[0]!.text).toBe('wrote');
   expect(readFileSync(file, 'utf8')).toBe('from-codemode\n');
+});
+
+test('Two forced writes through Write at once both land', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const f = JSON.stringify(file);
+  const go = join(dir, 'go');
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const writer = (mine: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await write(' + f + ', "' + mine + '\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }';
+  const out = run({ statDelayMs: 250, steps: [{ script: writer('from-a', a), keepTurn: true }, { script: writer('from-b', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['wrote', 'wrote']);
+  expect(['from-a\n', 'from-b\n']).toContain(readFileSync(file, 'utf8'));
+});
+
+test('Two forced edits through Edit at once both land', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const go = join(dir, 'go');
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const editor = (from: string, to: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await edit(' + f + ', "' + from + '", "' + to + '", { force: true }); return "edited" } catch (e) { return String(e.message) }';
+  const out = run({ statDelayMs: 250, steps: [{ script: editor('alpha', 'ALPHA', a), keepTurn: true }, { script: editor('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['edited', 'edited']);
+  expect(readFileSync(file, 'utf8')).toBe('ALPHA\nBETA\n');
+});
+
+test('Forced patch writes whose reads overlap the other write keep the file counted as read', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const go = join(dir, 'go');
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const writer = (mine: string, marker: string, lag: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nawait sh("sleep ' + lag + '")\ntry { await write(' + f + ', "' + mine + '\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }';
+  const out = run({ tools: NO_BASH, readDelayMs: 250, steps: [{ script: writer('from-a', a, '0'), keepTurn: true }, { script: writer('from-b', b, '0.18'), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }, { script: 'const now = await read(' + f + ')\ntry { await edit(' + f + ', now.trim(), "after"); return "edited-again" } catch (e) { return String(e.message) }' }] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['wrote', 'wrote']);
+  expect(out.results[2]!.text).toBe('edited-again');
+  expect(readFileSync(file, 'utf8')).toBe('after\n');
+});
+
+test('Forced patch edits of a file read in pages both land while the other one writes', () => {
+  const dir = scratch();
+  const file = join(dir, 'big.txt');
+  writeFileSync(file, 'alpha\nbeta\n' + Array.from({ length: 2400 }, (_, n) => 'filler ' + n).join('\n') + '\n');
+  const f = JSON.stringify(file);
+  const go = join(dir, 'go');
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const editor = (from: string, to: string, marker: string, lag: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nawait sh("sleep ' + lag + '")\ntry { await edit(' + f + ', "' + from + '\\n", "' + to + '\\n", { force: true }); return "edited" } catch (e) { return String(e.message) }';
+  const out = run({ tools: NO_BASH, readDelayMs: 200, steps: [{ script: editor('alpha', 'ALPHA', a, '0'), keepTurn: true }, { script: editor('beta', 'BETA', b, '0.3'), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['edited', 'edited']);
+  expect(readFileSync(file, 'utf8').startsWith('ALPHA\nBETA\n')).toBe(true);
+});
+
+test('Two runs creating one new file through a dangling symlink whose target climbs out of a symlinked folder never both write it', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'x', 'y'), { recursive: true });
+  const real = join(dir, 'x', 'real.txt');
+  const link = join(dir, 'link.txt');
+  const go = join(dir, 'go');
+  const writer = (path: string, mine: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(path) + ', content: "' + mine + '\\n" })\nreturn r.ok ? "wrote" : r.error';
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const out = run({ strictRealpath: true, engineForgets: true, writeDelayMs: 800, steps: [
+    { link: { from: join(dir, 'sub'), to: 'x/y' } },
+    { link: { from: link, to: 'sub/../real.txt' } },
+    { script: writer(real, 'from-a', a), keepTurn: true }, { script: writer(link, 'from-b', b), keepTurn: true },
+    { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true },
+  ] });
+  const texts = [out.results[0]!.text, out.results[1]!.text];
+  expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
+  expect(texts.find((x) => x !== 'wrote')).toContain('has not been read yet');
+  expect(readFileSync(real, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
 });

@@ -304,6 +304,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const id = ++seq
     // The mod drops a line this long, which would leave the call waiting forever.
     if (JSON.stringify(payload).length > 7000000) return { ok: false, error: 'The request is too large to pass to the mod.', id }
+    if (kind === 'call' && Date.now() >= started + timeout) return { ok: false, error: 'The run is out of time, so this call did not start.', id }
     const t = { sent: ++tick }
     if (kind === 'call') timing.set(id, t)
     send({ id, kind, payload })
@@ -1624,6 +1625,7 @@ type Job = {
   reads: Map<string, string | undefined>
   readAt: Map<string, number>
   progress: Map<string, { next: number; version?: string }>
+  progressAt: Map<string, number>
   gen: number
   spill?: string
   pidKnown: Promise<void>
@@ -1635,6 +1637,8 @@ const MAIN = 'main'
 const jobsById = new Map<string, Job>()
 const deliveredIds = new Map<string, string>()
 const handedSpills = new Map<string, number>()
+const ownSpills = new Set<string>()
+const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
 let readClock = 0
 let jobSeq = 0
@@ -1669,7 +1673,7 @@ const writeTargets = (m: Request, cwd: string | undefined, home: string, default
       : /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
         ? [args.path, ...ops.map((o) => o?.path ?? args.path)]
         : []
-  const paths = raws.filter((r): r is string => typeof r === 'string' && !!r.trim() && !r.trim().startsWith('~')).map((r) => normal(absolute(r.trim(), cwd, home)))
+  const paths = raws.filter((r): r is string => typeof r === 'string' && !!r.trim()).map((r) => normal(absolute(r.trim(), cwd, home)))
   return [...new Set(paths)].sort()
 }
 const expire = (j: Job) => {
@@ -1682,7 +1686,7 @@ const expire = (j: Job) => {
 export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string, timeout: number): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), progress: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
   job.pidKnown = new Promise<void>((r) => (job.onPid = r))
   jobsById.set(job.id, job)
   return job
@@ -1716,7 +1720,13 @@ const promoteReads = (j: Job) => {
     else readVersions.set(p, v)
   }
   while (versionAt.size > 2000) versionAt.delete(versionAt.keys().next().value as string)
-  for (const [p, chain] of j.progress) readProgress.set(p, chain)
+  for (const [p, chain] of j.progress) {
+    const at = j.progressAt.get(p) ?? 0
+    if (at < (progressAt.get(p) ?? 0)) continue
+    progressAt.set(p, at)
+    readProgress.set(p, chain)
+  }
+  while (progressAt.size > 2000) progressAt.delete(progressAt.keys().next().value as string)
   while (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
   while (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
   while (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
@@ -1989,7 +1999,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const key = skillKey(String(args.skill ?? ''))
     // Calls to one skill take turns, so each gets its own expansion (its args may
     // differ); only text expanded after this call started counts.
-    if (over || job.cancelledBy || killed) return { ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this call started` }
+    if (late()) return { ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this call started` }
     const timer: { handle?: { cancel: () => unknown } } = {}
     const release =
       tool === 'Skill' ? await skillTurn(key, new Promise((r) => (timer.handle = $.clock.after(60_000, () => r(undefined))))) : undefined
@@ -2015,7 +2025,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const was = job.reads.has(o.path) ? job.reads.get(o.path) : readPaths.has(o.path) ? readVersions.get(o.path) : undefined
         patchFresh.set(o.path, was !== undefined && was === (await versionOf(o.path)))
       }
-    if (over || job.cancelledBy || killed) {
+    if (late()) {
       release?.()
       tally.open--
       if (counted && tally.ok + tally.failed + tally.open === 0) calls.delete(tool)
@@ -2170,7 +2180,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const near: string[] = []
       for (const n of nearNames(args.file_path.slice(at + 1), listed)) {
         const path = `${folder === '/' ? '' : folder}/${n}`
-        const probe = over || job.cancelledBy || killed ? undefined : await $.tool.call({ file_path: path, limit: 1, tool: 'Read' } as never).catch(() => undefined)
+        const probe = late() ? undefined : await $.tool.call({ file_path: path, limit: 1, tool: 'Read' } as never).catch(() => undefined)
         const said = String(probe?.text ?? '')
         if (probe && probe.deny === undefined && (probe.isError !== true || /exceeds maximum allowed/i.test(said))) near.push(path)
       }
@@ -2193,7 +2203,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const viaBytes = async (shell: string, path: string): Promise<string | undefined> => {
     const step = 21000
     const extra = shell === 'Bash' ? {} : { raw: true }
-    const ask = (command: string) => (over || job.cancelledBy || killed ? Promise.resolve(undefined) : $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined))
+    const ask = (command: string) => (late() ? Promise.resolve(undefined) : $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined))
     const sized = await ask('wc -c < ' + shellQuote(path))
     const size = Number(String(sized?.text ?? '').trim())
     if (!sized || sized.isError || sized.deny !== undefined || !Number.isInteger(size)) return undefined
@@ -2223,7 +2233,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const moved = async () => version === undefined || (await versionOf(file)) !== version
     for (let guard = 0; guard < 10_000; guard++) {
       if (over) return undefined
-      const r = over || job.cancelledBy || killed ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
+      const r = late() ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
       if (r && !r.isError && r.deny === undefined && (await moved())) return { error: `${file} changed while it was read in pages; read it again` }
       if (!r) return undefined
       if (r.deny !== undefined) return { error: `Reading ${file} in pages stopped at line ${offset}: ${r.deny}` }
@@ -2268,6 +2278,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   }
 
   let over = false
+  const late = () => over || !!job.cancelledBy || killed || Date.now() >= started + timeout
   const writes = new Set<Promise<unknown>>()
   const replies = new Set<Promise<unknown>>()
   const items: string[] = []
@@ -2319,7 +2330,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.progress.delete(receipt.file)
         job.reads.set(receipt.file, receipt.version)
         job.readAt.set(receipt.file, ++readClock)
-      } else if (receipt.next !== undefined) job.progress.set(receipt.file, { next: receipt.next, version: receipt.version })
+      } else if (receipt.next !== undefined) {
+        job.progress.set(receipt.file, { next: receipt.next, version: receipt.version })
+        job.progressAt.set(receipt.file, ++readClock)
+      }
     }
     // Tracked whole, fallbacks included, so the run dir is removed only after it.
     const delivered = (async () => {
@@ -2535,12 +2549,20 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const spills = `${home}/.claude/codemode/out`
     const path = `${spills}/${dir.slice(root.length + 1)}.txt`
     job.spill = `${dir.slice(root.length + 1)}.txt`
+    ownSpills.add(job.spill)
+    while (ownSpills.size > 1000) ownSpills.delete(ownSpills.values().next().value as string)
     const waiting = new Set([...jobsById.values()].filter((j) => !j.delivered && j.spill).map((j) => j.spill))
     file = await $.fs.write(path, full).then(() => path, () => undefined)
+    let mine = 0
     const old = ((await $.fs.list(spills).catch(() => [])) ?? [])
       .filter((x) => x.name.endsWith('.txt'))
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .filter((x, i) => !waiting.has(x.name) && Date.now() - (handedSpills.get(x.name) ?? 0) > SPILL_AGE_MS && (i >= KEEP_SPILLS || Date.now() - x.mtimeMs > SPILL_AGE_MS))
+      .filter((x) => {
+        const aged = Date.now() - x.mtimeMs > SPILL_AGE_MS
+        if (!ownSpills.has(x.name)) return aged
+        const extra = mine++ >= KEEP_SPILLS
+        return !waiting.has(x.name) && Date.now() - (handedSpills.get(x.name) ?? 0) > SPILL_AGE_MS && (extra || aged)
+      })
     if (old.length) await $.process.run(['rm', '-f', ...old.map((x) => `${spills}/${x.name}`)]).catch(() => {})
   }
   const out = fit(parts, room, file, (ended.notes?.length ?? 0) + (ended.failure ? 1 : 0))
@@ -2586,6 +2608,7 @@ export const register: Register = (on) => {
     mainTurnId = undefined
     readPaths.clear()
     readProgress.clear()
+    progressAt.clear()
     readVersions.clear()
     failedScripts.clear()
     return next(e)
@@ -2597,6 +2620,7 @@ export const register: Register = (on) => {
     if (!e.agentId && e.trigger !== 'precompute' && !skipped) {
       readPaths.clear()
       readProgress.clear()
+      progressAt.clear()
       readVersions.clear()
     }
     return r
@@ -2614,6 +2638,7 @@ export const register: Register = (on) => {
   on('turn.complete', async ($, e, next) => {
     const agent = agentOf((e as { agentId?: unknown }).agentId)
     const turnId = String((e as { turnId?: unknown }).turnId ?? '') || undefined
+    const seq = turnSeq
     try {
       return await next(e)
     } finally {
@@ -2631,7 +2656,7 @@ export const register: Register = (on) => {
           for (const j of jobs) j.quiet = true
           await stopJobs($, jobs, 'the interrupt', 'aborted')
         }
-        if (current && (!mainTurnId || !turnId || turnId === mainTurnId)) {
+        if (current && turnSeq === seq && (!mainTurnId || !turnId || turnId === mainTurnId)) {
           mainTurn = false
           mainTurnId = undefined
           await wake($)

@@ -2402,14 +2402,28 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
   }
   const climbs = (v: unknown) => typeof v === 'string' && /(^|\/)\.\.(\/|$)/.test(v.trim())
+  const climb = async (p: string, hops = 0): Promise<string> => {
+    const segs = p.split('/').filter((seg) => seg !== '' && seg !== '.')
+    const kept: string[] = []
+    for (let i = 0; i < segs.length; i++) {
+      if (segs[i] !== '..') {
+        kept.push(segs[i] as string)
+        continue
+      }
+      const link = kept.length && hops < 40 ? await readlink('/' + kept.join('/')) : undefined
+      if (link === undefined) {
+        kept.pop()
+        continue
+      }
+      const into = link.startsWith('/') ? link : '/' + kept.slice(0, -1).join('/') + '/' + link
+      return climb(into + '/' + segs.slice(i).join('/'), hops + 1)
+    }
+    return '/' + kept.join('/')
+  }
   const onDisk = async (v: string) => {
     const t = v.trim()
     const e = t === '~' || t.startsWith('~/') ? home + t.slice(1) : t
-    if (!e.startsWith('/')) return v
-    const lexical = normal(e)
-    const physical = await realOf(e.replace(/\/(?:\.?\/)+/g, '/'))
-    if (/(^|\/)\.\.(\/|$)/.test(physical)) return lexical
-    return (await realOf(lexical)) === physical ? lexical : physical
+    return e.startsWith('/') ? climb(e) : v
   }
   const resolveClimbs = async (m: Request) => {
     if (m.kind === 'fresh' && climbs(m.payload.path)) m.payload.path = await onDisk(String(m.payload.path))

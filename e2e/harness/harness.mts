@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 
 type Case = {
   statDelayMs?: number
+  hangListMs?: number
   surfaces?: string[]
   submitDelayMs?: number
   hangListDuringRuns?: boolean
@@ -59,7 +60,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilCleaned?: number; untilQuiet?: boolean; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -439,12 +440,16 @@ let inTurn = false
 let sessionStarted = false
 let wakesPending = 0
 let statsPending = 0
+let bashWaits = 0
+let listsHanging = 0
+let lastActivity = Date.now()
 let wakeAttempts = 0
 let refusals = c.submitRefusals ?? 0
 const kills: string[][] = []
 const waits = new Set<number>()
 let runsStarted = 0
 let inflight = 0
+let runsCleanedAll = 0
 let runsCleaned = 0
 const until = async (check: () => boolean, ms: number, what = 'a harness wait') => {
   const end = Date.now() + ms
@@ -460,6 +465,12 @@ const $ = {
     list: async () => {
       if (!listing) throw new Error('$.tool.list failed')
       if (c.hangListDuringRuns && sessionStarted) await new Promise(() => {})
+      if (c.hangListMs && sessionStarted) {
+        listsHanging++
+        await new Promise((r) => setTimeout(r, c.hangListMs))
+        listsHanging--
+        lastActivity = Date.now()
+      }
       return names.map((n) => ({ name: n, description: DESCRIPTIONS[n] ?? n, mcp: n.startsWith('mcp__') }))
     },
     register: async (d: Record<string, unknown>) => {
@@ -484,7 +495,7 @@ const $ = {
       return r
     },
   },
-  env: { get: async (k: string) => ({ HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },
+  env: { get: async (k: string) => (lastActivity = Date.now(), { HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },
   fs: {
     write: async (p: string, t: string) => {
       inflight++
@@ -552,6 +563,7 @@ const $ = {
       (argv[0] === 'kill' ? kills.push([...argv]) : 0, new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
         const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
         if (p.pid !== undefined) live.add(p.pid)
+        if (argv[0] === 'bash') bashWaits++
         if (p.pid) {
           waits.add(p.pid)
           p.on('close', () => waits.delete(p.pid as number))
@@ -562,7 +574,10 @@ const $ = {
         p.stderr.setEncoding('utf8').on('data', (t: string) => { stderr += t })
         p.on('error', (e) => done({ exitCode: 127, stdout, stderr: stderr + String(e.message) }))
         p.on('close', (code) => {
-          if (argv[0] === 'rm' && argv.some((a) => a.includes('/codemode/runs/'))) runsCleaned++
+          if (argv[0] === 'rm' && argv.some((a) => a.includes('/codemode/runs/'))) {
+            runsCleaned++
+            runsCleanedAll++
+          }
           done({ exitCode: code ?? 1, stdout, stderr })
         })
       })),
@@ -607,7 +622,7 @@ const flatten = (r: unknown): { text: string; attachments: number } => {
   return { text: JSON.stringify(v), attachments: 0 }
 }
 
-const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number } = { results: [], calls, store, submitted, stops, collected: [], collectedAttachments: [], kills, waitsAlive: 0, wakeAttempts: 0 }
+const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; bashWaits?: number; runnersSpawned?: number } = { results: [], calls, store, submitted, stops, collected: [], collectedAttachments: [], kills, waitsAlive: 0, wakeAttempts: 0 }
 const collect = async (agentId?: string) => {
   const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: '', ...(agentId ? { agentId } : {}) }, engine(async () => ({})))
   const flat = flatten(r)
@@ -688,6 +703,14 @@ for (const s of c.steps) {
   if (s.untilRunDone) {
     await until(() => !mod.openRunIds().includes(s.untilRunDone) && inflight === 0, 60_000, s.untilRunDone + ' settling')
     await new Promise((r) => setTimeout(r, 0))
+    continue
+  }
+  if (s.untilQuiet) {
+    await until(() => listsHanging === 0 && inflight === 0 && Date.now() - lastActivity > 500, 60_000, 'the mod going quiet')
+    continue
+  }
+  if (s.untilCleaned) {
+    await until(() => runsCleanedAll >= (s.untilCleaned as number) && inflight === 0, 60_000, s.untilCleaned + ' run folders removed')
     continue
   }
   if (s.untilFile) {
@@ -777,5 +800,7 @@ for (const s of c.steps) {
   }
 }
 out.waitsAlive = waits.size
+out.bashWaits = bashWaits
+out.runnersSpawned = runsStarted
 out.wakeAttempts = wakeAttempts
 process.stdout.write(JSON.stringify(out), () => process.exit(0))

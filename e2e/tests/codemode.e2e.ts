@@ -6,9 +6,9 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { statDelayMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
-type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number };
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilCleaned?: number; untilQuiet?: boolean; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Case = { statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
 test.afterAll(() => {
@@ -2088,4 +2088,28 @@ test('A stop interrupted in the middle of its wait leaves no waiting process and
   expect(out.stops[0]).toBe('');
   expect(out.collected[0]).toContain('kept-mid-wait');
   expect(out.waitsAlive).toBe(0);
+});
+
+test('A run reported as never started stays unstarted when its stall clears later', () => {
+  const dir = scratch();
+  const mark = join(dir, 'ran-anyway');
+  const out = run({ hangListMs: 13000, steps: [{ script: '// @options: {"timeout_ms": 1000}\nawait sh("touch ' + mark + '")\nreturn 1' }, { untilQuiet: true }] });
+  expect(out.results[0]!.text).toContain('never started its runner');
+  expect(out.runnersSpawned).toBe(0);
+  expect(existsSync(mark)).toBe(false);
+});
+
+test('Waiting at the turn\'s end for a run that has no runner yet starts only a few wait processes', () => {
+  const out = run({ hangListMs: 13000, steps: [{ script: '// @options: {"timeout_ms": 1000}\nreturn 1' }] });
+  expect(out.results[0]!.text).toContain('never started its runner');
+  expect(out.bashWaits).toBeLessThanOrEqual(4);
+});
+
+test('A run\'s reply names at most nine other runs still going', () => {
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const wait = { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 30000 })\nreturn 1', keepTurn: true };
+  const out = run({ steps: [...Array.from({ length: 12 }, () => wait), { touch: gate }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.results[11]!.immediate).toContain('and 2 more');
+  expect((out.results[11]!.immediate!.match(/\br\d+ \(/g) ?? []).length).toBe(9);
 });

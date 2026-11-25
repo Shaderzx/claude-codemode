@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 type Case = {
+  statDelayMs?: number
   surfaces?: string[]
   submitDelayMs?: number
   hangListDuringRuns?: boolean
@@ -58,7 +59,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; clear?: boolean; reload?: boolean; turnAborted?: string; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -437,6 +438,7 @@ const absorb = (text: string) => {
 let inTurn = false
 let sessionStarted = false
 let wakesPending = 0
+let statsPending = 0
 let wakeAttempts = 0
 let refusals = c.submitRefusals ?? 0
 const kills: string[][] = []
@@ -444,9 +446,12 @@ const waits = new Set<number>()
 let runsStarted = 0
 let inflight = 0
 let runsCleaned = 0
-const until = async (check: () => boolean, ms: number) => {
+const until = async (check: () => boolean, ms: number, what = 'a harness wait') => {
   const end = Date.now() + ms
-  while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 20))
+  while (!check()) {
+    if (Date.now() >= end) throw new Error(what + ' never happened within ' + ms + 'ms')
+    await new Promise((r) => setTimeout(r, 20))
+  }
 }
 let started = Date.now()
 const $ = {
@@ -497,6 +502,11 @@ const $ = {
     list: async (p: string) => readdirSync(p).map((n) => ({ name: n, mtimeMs: statSync(join(p, n)).mtimeMs })),
     exists: async (p: string) => existsSync(p),
     stat: async (p: string) => {
+      if (c.statDelayMs && sessionStarted) {
+        statsPending++
+        await new Promise((r) => setTimeout(r, c.statDelayMs))
+        statsPending--
+      }
       const s = statSync(p)
       return { kind: s.isDirectory() ? 'dir' : s.isFile() ? 'file' : 'other', size: s.size, mtimeMs: s.mtimeMs, isLink: false }
     },
@@ -667,7 +677,7 @@ for (const s of c.steps) {
     continue
   }
   if (s.untilRunsDone) {
-    await until(() => runsStarted > 0 && runsCleaned >= runsStarted && inflight === 0, 60_000)
+    await until(() => mod.openRunIds().length === 0 && inflight === 0, 60_000, 'every run settling')
     await new Promise((r) => setTimeout(r, 0))
     continue
   }
@@ -675,9 +685,25 @@ for (const s of c.steps) {
     await endTurn(s.agentId, !!s.interrupt)
     continue
   }
-  if (s.untilRunsCleaned) {
-    await until(() => runsCleaned >= (s.untilRunsCleaned as number) && inflight === 0, 60_000)
+  if (s.untilRunDone) {
+    await until(() => !mod.openRunIds().includes(s.untilRunDone) && inflight === 0, 60_000, s.untilRunDone + ' settling')
     await new Promise((r) => setTimeout(r, 0))
+    continue
+  }
+  if (s.untilFile) {
+    await until(() => existsSync(s.untilFile as string), 30_000, s.untilFile + ' appearing')
+    continue
+  }
+  if (s.untilStatPending) {
+    await until(() => statsPending > 0, 30_000, 'a file check starting')
+    continue
+  }
+  if (s.stopAbortAfterMs !== undefined) {
+    const ac = new AbortController()
+    setTimeout(() => ac.abort(), s.stopAbortAfterMs)
+    const r = (await handlers['classic.Stop']?.($, { hook_event_name: 'Stop', stop_hook_active: false }, Object.assign(engine(async () => ({})), { signal: ac.signal }))) as { block?: string } | undefined
+    stops.push(String(r?.block ?? ''))
+    await new Promise((r) => setTimeout(r, 400))
     continue
   }
   if (s.turnStart) {
@@ -698,7 +724,7 @@ for (const s of c.steps) {
   }
   if (s.untilWake) {
     const before = wakeAttempts
-    await until(() => (wakeAttempts > before || wakeAttempts > 0) && wakesPending === 0, 30_000)
+    await until(() => (wakeAttempts > before || wakeAttempts > 0) && wakesPending === 0, 30_000, 'a wake prompt')
     continue
   }
   if (s.collect) {
@@ -715,7 +741,7 @@ for (const s of c.steps) {
     continue
   }
   if (s.untilTool) {
-    await until(() => calls.some((x) => x.tool === s.untilTool), 30_000)
+    await until(() => calls.some((x) => x.tool === s.untilTool), 30_000, 'a ' + s.untilTool + ' call')
     continue
   }
   if (s.touch) {

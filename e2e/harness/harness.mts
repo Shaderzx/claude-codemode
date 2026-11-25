@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 type Case = {
+  clockEarlyMs?: number
   writeDelayMs?: number
   skillDelayMs?: number
   statDelayMs?: number
@@ -587,7 +588,7 @@ const $ = {
   },
   clock: {
     after: (ms: number, fn: () => void) => {
-      const h = setTimeout(fn, ms)
+      const h = setTimeout(fn, Math.max(0, ms - (c.clockEarlyMs ?? 0)))
       return { cancel: () => clearTimeout(h) }
     },
   },
@@ -689,9 +690,9 @@ for (const s of c.steps) {
     await startSession()
     continue
   }
-  if (s.turnAborted) {
+  if (s.turnAborted !== undefined) {
     inTurn = false
-    await handlers['turn.complete']?.($, { turnId: s.turnAborted, isAborted: true }, engine(async () => ({})))
+    await handlers['turn.complete']?.($, { ...(s.turnAborted ? { turnId: s.turnAborted } : {}), isAborted: true }, engine(async () => ({})))
     continue
   }
   if (s.untilRunsDone) {
@@ -732,13 +733,13 @@ for (const s of c.steps) {
     await new Promise((r) => setTimeout(r, 400))
     continue
   }
-  if (s.turnStart) {
+  if (s.turnStart !== undefined) {
     inTurn = true
-    await handlers['turn.start']?.($, { turnId: s.turnStart }, engine(async () => ({})))
+    await handlers['turn.start']?.($, s.turnStart ? { turnId: s.turnStart } : {}, engine(async () => ({})))
     continue
   }
-  if (s.turnComplete) {
-    await handlers['turn.complete']?.($, { turnId: s.turnComplete }, engine(async () => ({})))
+  if (s.turnComplete !== undefined) {
+    await handlers['turn.complete']?.($, s.turnComplete ? { turnId: s.turnComplete } : {}, engine(async () => ({})))
     continue
   }
   if (s.stopAborted) {

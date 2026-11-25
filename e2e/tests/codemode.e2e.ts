@@ -6,8 +6,8 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { surfaces?: string[]; submitRefusals?: number; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; clear?: boolean; reload?: boolean; turnAborted?: string; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Case = { surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number };
 
 const made: string[] = [];
@@ -1992,4 +1992,46 @@ test('The run tool\'s description fits in the 4,096 characters the engine hands 
   const out = run({ tools, store, steps: [] });
   expect(out.description).toContain('denied by a hook here');
   expect(out.description.length).toBeLessThanOrEqual(4096);
+});
+
+test('After /clear, a run from before is stopped and its output never reaches the new conversation', () => {
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const out = run({ steps: [{ script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "old-conversation-output"', keepTurn: true }, { untilTool: 'Bash' }, { clear: true }, { touch: gate }, { untilRunsDone: true }, { script: 'return "new"' }] });
+  expect(out.kills).toHaveLength(1);
+  expect(out.results[1]!.immediate).not.toContain('old-conversation-output');
+  expect(out.results[1]!.immediate).not.toContain(out.results[0]!.id! + ' ');
+});
+
+test('Reloading the mod in the middle of a session leaves its running runs alone', () => {
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const out = run({ steps: [{ script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "survived-reload"', keepTurn: true }, { untilTool: 'Bash' }, { reload: true }, { touch: gate }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.kills).toHaveLength(0);
+  expect(out.collected[0]).toContain('survived-reload');
+});
+
+test('Esc stops only the interrupted turn\'s runs, and a run from an earlier turn still finishes and wakes the session', () => {
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const out = run({ surfaces: ['terminal'], steps: [{ turnStart: 't1' }, { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "earlier-turn-output"', keepTurn: true }, { turnComplete: 't1' }, { turnStart: 't2' }, { script: 'return String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true }, { untilTool: 'Bash' }, { turnAborted: 't2' }, { touch: gate }, { untilWake: true }, { collect: true }] });
+  expect(out.submitted[0]).toContain(out.results[0]!.id!);
+  expect(out.submitted[0]).not.toContain(out.results[1]!.id!);
+  expect(out.collected[0]).toContain('[' + out.results[0]!.id + ' finished after');
+  expect(out.collected[0]).toContain('earlier-turn-output');
+  expect(out.collected[0]).toContain('[' + out.results[1]!.id + ' stopped after');
+});
+
+test('Runs finishing together while the session is idle are each named in exactly one wake prompt', () => {
+  const out = run({ surfaces: ['terminal'], submitDelayMs: 500, steps: [{ script: 'await sh("true")\nreturn 1', keepTurn: true }, { script: 'await sh("true")\nreturn 2', keepTurn: true }, { stop: true }, { untilRunsDone: true }, { untilWake: true }, { collect: true }] });
+  const named = out.submitted.join('\n');
+  const times = (id: string) => (named.match(new RegExp('\\b' + id + '\\b', 'g')) ?? []).length;
+  expect(times(out.results[0]!.id!)).toBe(1);
+  expect(times(out.results[1]!.id!)).toBe(1);
+});
+
+test('Ending the turn does not hang on a run that stalls before its runner starts, and that run comes back as never started', () => {
+  const out = run({ hangListDuringRuns: true, steps: [{ script: '// @options: {"timeout_ms": 1000}\nreturn 1' }] });
+  expect(out.stops[0]).toContain(out.results[0]!.id!);
+  expect(out.results[0]!.text).toContain('never started its runner');
 });

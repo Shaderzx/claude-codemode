@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path'
 
 type Case = {
   surfaces?: string[]
+  submitDelayMs?: number
+  hangListDuringRuns?: boolean
   submitRefusals?: number
   tools?: string[]
   denied?: string[]
@@ -56,7 +58,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; clear?: boolean; reload?: boolean; turnAborted?: string; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -433,6 +435,8 @@ const absorb = (text: string) => {
   })
 }
 let inTurn = false
+let sessionStarted = false
+let wakesPending = 0
 let wakeAttempts = 0
 let refusals = c.submitRefusals ?? 0
 const kills: string[][] = []
@@ -450,6 +454,7 @@ const $ = {
   tool: {
     list: async () => {
       if (!listing) throw new Error('$.tool.list failed')
+      if (c.hangListDuringRuns && sessionStarted) await new Promise(() => {})
       return names.map((n) => ({ name: n, description: DESCRIPTIONS[n] ?? n, mcp: n.startsWith('mcp__') }))
     },
     register: async (d: Record<string, unknown>) => {
@@ -567,6 +572,12 @@ const $ = {
   prompt: {
     submit: async (a: { text: string }) => {
       wakeAttempts++
+      wakesPending++
+      try {
+        if (c.submitDelayMs) await new Promise((r) => setTimeout(r, c.submitDelayMs))
+      } finally {
+        wakesPending--
+      }
       if (refusals > 0) {
         refusals--
         throw new Error('prompt.submit refused')
@@ -627,6 +638,7 @@ const startSession = async () => {
   out.description = String(registered.at(-1)?.description ?? '')
 }
 await startSession()
+sessionStarted = true
 if (c.listThrows) listing = false
 for (const s of c.steps) {
   started = Date.now()
@@ -636,7 +648,24 @@ for (const s of c.steps) {
     await handlers['session.compact']?.($, { trigger: 'manual', ...(s.compactAgent ? { agentId: s.compactAgent } : {}) }, engine(async () => (s.compactSkipped ? { skip: 'kept by a hook' } : { messages: [] })))
     continue
   }
-  if (s.newSession) { await startSession(); continue }
+  if (s.newSession) {
+    await handlers['session.end']?.($, { reason: 'clear' }, engine(async () => ({})))
+    await startSession()
+    continue
+  }
+  if (s.clear) {
+    await handlers['session.end']?.($, { reason: 'clear' }, engine(async () => ({})))
+    continue
+  }
+  if (s.reload) {
+    await startSession()
+    continue
+  }
+  if (s.turnAborted) {
+    inTurn = false
+    await handlers['turn.complete']?.($, { turnId: s.turnAborted, isAborted: true }, engine(async () => ({})))
+    continue
+  }
   if (s.untilRunsDone) {
     await until(() => runsStarted > 0 && runsCleaned >= runsStarted && inflight === 0, 60_000)
     await new Promise((r) => setTimeout(r, 0))
@@ -669,7 +698,7 @@ for (const s of c.steps) {
   }
   if (s.untilWake) {
     const before = wakeAttempts
-    await until(() => wakeAttempts > before || wakeAttempts > 0, 30_000)
+    await until(() => (wakeAttempts > before || wakeAttempts > 0) && wakesPending === 0, 30_000)
     continue
   }
   if (s.collect) {

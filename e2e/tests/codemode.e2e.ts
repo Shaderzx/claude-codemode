@@ -6,7 +6,7 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
 type Case = { surfaces?: string[]; submitRefusals?: number; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number };
 
@@ -1807,13 +1807,49 @@ test('A subagent stop with no agent id holds nothing', () => {
   expect(out.stops[0]).toBe('');
 });
 
-test('jobs() lists the caller\'s runs still going, and cancel(id) stops one, which comes back marked as cancelled', () => {
-  const out = run({ steps: [{ script: 'await sh("sleep 20; echo never-printed")\nreturn "unreached"', keepTurn: true }, { untilTool: 'Bash' }, { script: 'const list = await jobs()\nawait cancel(list[0].id)\nreturn list.map((j) => j.id + " " + j.state).join(",")' }, { stop: true }] });
+test('jobs() lists the caller\'s other runs still going', () => {
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const out = run({ steps: [{ script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn 1', keepTurn: true }, { untilTool: 'Bash' }, { script: 'return (await jobs()).map((j) => j.id + " " + j.state).join(",")', keepTurn: true }, { untilRunsDone: true }, { touch: gate }, { stop: true }] });
   expect(out.results[1]!.text).toBe(out.results[0]!.id + ' running');
+});
+
+test('cancel(id) stops a running run, which comes back marked as cancelled without its command\'s output', () => {
+  const out = run({ steps: [{ script: 'return String(await sh("sleep 20; printf never-%s printed"))', keepTurn: true }, { untilTool: 'Bash' }, { script: 'return String(await cancel("r1"))' }] });
+  expect(out.results[1]!.text).toBe('true');
   expect(out.results[0]!.text).toContain('[cancelled]');
   expect(out.results[0]!.text).not.toContain('never-printed');
 });
 
+test('cancel() right after a run starts still stops it', () => {
+  const out = run({ steps: [{ script: 'return String(await sh("sleep 20; echo never-printed"))', keepTurn: true }, { script: 'return String(await cancel("r1"))' }] });
+  expect(out.results[1]!.text).toBe('true');
+  expect(out.results[0]!.text).toContain('[cancelled]');
+});
+
+test('A stopped run names the tool calls still running when it was stopped', () => {
+  const out = run({ steps: [{ script: 'return String(await sh("timeout 20 tail -f /dev/null"))', keepTurn: true }, { untilTool: 'Bash' }, { script: 'return String(await cancel("r1"))' }] });
+  expect(out.results[0]!.text).toContain('still running when it was stopped');
+  expect(out.results[0]!.text).toContain('timeout 20 tail -f /dev/null');
+});
+
+test('A run cannot cancel itself', () => {
+  expect(run({ steps: [{ script: 'return await cancel("r1").catch((e) => e.message)' }] }).results[0]!.text).toContain('a run cannot cancel itself');
+});
+
+test('cancel() of a run whose output already came back returns false', () => {
+  const out = run({ steps: [{ script: 'return 1', keepTurn: true }, { untilRunsDone: true }, { script: 'return String(await cancel("r1"))' }] });
+  expect(out.results[1]!.text).toBe('false');
+});
+
+test('A cancelled run run again is not reported as the same failed script', () => {
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const script = 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "ran-again"';
+  const out = run({ steps: [{ script, keepTurn: true }, { untilTool: 'Bash' }, { script: 'return String(await cancel("r1"))', keepTurn: true }, { untilRunsDone: true }, { touch: gate }, { script }] });
+  expect(out.results[0]!.text).toContain('[cancelled]');
+  expect(out.results[2]!.text).toBe('ran-again');
+});
 test('cancel() refuses a run of another agent and an id that names no run', () => {
   const out = run({ steps: [{ script: 'await sh("sleep 20")\nreturn 1', agentId: 'a1', keepTurn: true }, { untilTool: 'Bash' }, { script: 'const mine = await cancel("r999").catch((e) => e.message)\nconst other = await cancel("' + 'r1' + '").catch((e) => e.message)\nreturn [mine, other].join(" | ")' }, { stop: true }] });
   expect(out.results[1]!.text).toContain('there is no run r999 here');
@@ -1909,4 +1945,43 @@ test('An empty script while runs are still going tells the model to end its turn
   expect(out.collected[0]).toContain('Still running: ' + out.results[0]!.id);
   expect(out.collected[0]).toContain('end your turn');
   expect(out.collected[0]).toContain('do not call again to check');
+});
+
+test('One reply attaches at most 10 pictures, and a run whose pictures do not fit waits for the next reply', () => {
+  const tools = ['Read', 'Bash', 'mcp__shots__snap'];
+  const six = 'const s = await Promise.all([1, 2, 3, 4, 5, 6].map(() => tools.mcp__shots__snap({})))\nreturn s.join(" ")';
+  const out = run({ tools, steps: [{ script: six, keepTurn: true }, { script: six, keepTurn: true }, { untilRunsDone: true }, { collect: true }, { collect: true }] });
+  expect(out.collectedAttachments).toEqual([6, 6]);
+  expect(out.collected[0]).toContain(', 6 attachments]');
+  expect(out.collected[0]).toContain('finished too');
+});
+
+test('A stop the session interrupts while it waits keeps finished output for the next run', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 1")\nreturn "kept-through-abort"', keepTurn: true }, { script: 'await sh("sleep 30")\nreturn 1', keepTurn: true }, { untilRunsCleaned: 1 }, { stopAborted: true }, { collect: true }] });
+  expect(out.stops[0]).toBe('');
+  expect(out.collected[0]).toContain('kept-through-abort');
+});
+
+test('A turn that ended earlier cannot mark a newer turn idle', () => {
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const out = run({ surfaces: ['terminal'], steps: [{ turnStart: 't1' }, { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn 1', keepTurn: true }, { turnStart: 't2' }, { turnComplete: 't1' }, { touch: gate }, { untilRunsDone: true }] });
+  expect(out.wakeAttempts).toBe(0);
+});
+
+test('A run that finishes during a watched turn wakes the session when that turn ends', () => {
+  const out = run({ surfaces: ['terminal'], steps: [{ script: 'return "early-output"', keepTurn: true }, { untilRunsDone: true }, { stop: true }, { untilWake: true }, { collect: true }] });
+  expect(out.submitted).toHaveLength(1);
+  expect(out.submitted[0]).toContain(out.results[0]!.id!);
+  expect(out.collected[0]).toContain('early-output');
+});
+
+test('Two runs reading the same long file at once each count it as read for their own writes', () => {
+  const dir = scratch();
+  const file = join(dir, 'long.txt');
+  writeFileSync(file, Array.from({ length: 5000 }, (_, i) => 'line ' + i).join('\n') + '\n');
+  const f = JSON.stringify(file);
+  const out = run({ readDelayMs: 30, steps: [{ script: 'await read(' + f + ')\nawait write(' + f + ', "first\\n")\nreturn "wrote"', keepTurn: true }, { script: 'await read(' + f + ')\nreturn "read"', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.results[0]!.text).toBe('wrote');
+  expect(out.results[1]!.text).toBe('read');
 });

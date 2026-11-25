@@ -56,7 +56,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -438,6 +438,7 @@ let refusals = c.submitRefusals ?? 0
 const kills: string[][] = []
 const waits = new Set<number>()
 let runsStarted = 0
+let inflight = 0
 let runsCleaned = 0
 const until = async (check: () => boolean, ms: number) => {
   const end = Date.now() + ms
@@ -476,11 +477,16 @@ const $ = {
   env: { get: async (k: string) => ({ HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },
   fs: {
     write: async (p: string, t: string) => {
-      if (Buffer.byteLength(t) > 4 * 1024 * 1024) throw new Error('fs.write: over the 4 MiB limit')
-      mkdirSync(dirname(p), { recursive: true })
-      writeFileSync(p, t)
-      if (c.slowWritesMs) await new Promise((r) => setTimeout(r, c.slowWritesMs))
-      return p
+      inflight++
+      try {
+        if (Buffer.byteLength(t) > 4 * 1024 * 1024) throw new Error('fs.write: over the 4 MiB limit')
+        mkdirSync(dirname(p), { recursive: true })
+        writeFileSync(p, t)
+        if (c.slowWritesMs) await new Promise((r) => setTimeout(r, c.slowWritesMs))
+        return p
+      } finally {
+        inflight--
+      }
     },
     read: async (p: string) => readFileSync(p, 'utf8'),
     list: async (p: string) => readdirSync(p).map((n) => ({ name: n, mtimeMs: statSync(join(p, n)).mtimeMs })),
@@ -530,6 +536,7 @@ const $ = {
     run: (argv: string[], _init?: unknown) =>
       (argv[0] === 'kill' ? kills.push([...argv]) : 0, new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
         const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
+        if (p.pid !== undefined) live.add(p.pid)
         if (p.pid) {
           waits.add(p.pid)
           p.on('close', () => waits.delete(p.pid as number))
@@ -631,11 +638,33 @@ for (const s of c.steps) {
   }
   if (s.newSession) { await startSession(); continue }
   if (s.untilRunsDone) {
-    await until(() => runsStarted > 0 && runsCleaned >= runsStarted, 60_000)
+    await until(() => runsStarted > 0 && runsCleaned >= runsStarted && inflight === 0, 60_000)
+    await new Promise((r) => setTimeout(r, 0))
     continue
   }
   if (s.stop) {
     await endTurn(s.agentId, !!s.interrupt)
+    continue
+  }
+  if (s.untilRunsCleaned) {
+    await until(() => runsCleaned >= (s.untilRunsCleaned as number) && inflight === 0, 60_000)
+    await new Promise((r) => setTimeout(r, 0))
+    continue
+  }
+  if (s.turnStart) {
+    inTurn = true
+    await handlers['turn.start']?.($, { turnId: s.turnStart }, engine(async () => ({})))
+    continue
+  }
+  if (s.turnComplete) {
+    await handlers['turn.complete']?.($, { turnId: s.turnComplete }, engine(async () => ({})))
+    continue
+  }
+  if (s.stopAborted) {
+    const ac = new AbortController()
+    ac.abort()
+    const r = (await handlers['classic.Stop']?.($, { hook_event_name: 'Stop', stop_hook_active: false }, Object.assign(engine(async () => ({})), { signal: ac.signal }))) as { block?: string } | undefined
+    stops.push(String(r?.block ?? ''))
     continue
   }
   if (s.untilWake) {

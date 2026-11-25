@@ -49,6 +49,7 @@ type Case = {
   rewriteDuringFirstRead?: string
   readDelayMs?: number
   readLagMs?: number
+  changeEveryRead?: boolean
   listThrows?: boolean
   detachAfterMs?: number
   slowWritesMs?: number
@@ -218,6 +219,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       seen.set(key, statSync(p).mtimeMs)
       readTimes.set(p, statSync(p).mtimeMs)
       if (typeof a.limit === 'number' && c.changeAfterPage === offset) writeFileSync(p, text + 'changed meanwhile\n')
+      if (c.changeEveryRead) writeFileSync(p, text + 'changed\n')
       if (c.rewriteDuringFirstRead !== undefined && !rewrittenDuringRead) {
         rewrittenDuringRead = true
         writeFileSync(p, c.rewriteDuringFirstRead)

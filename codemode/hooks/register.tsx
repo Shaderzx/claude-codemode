@@ -360,13 +360,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   }
   const norm = (s) => {
     if (!s.startsWith('/')) return s
-    const out = []
-    for (const seg of s.split('/')) {
-      if (seg === '' || seg === '.') continue
-      if (seg === '..') out.pop()
-      else out.push(seg)
-    }
-    return '/' + out.join('/')
+    return '/' + s.split('/').filter((seg) => seg !== '' && seg !== '.').join('/')
   }
   const abs = (p) => {
     const s = String(p).trim()
@@ -2407,7 +2401,25 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       head = head.slice(0, slash)
     }
   }
+  const climbs = (v: unknown) => typeof v === 'string' && /(^|\/)\.\.(\/|$)/.test(v.trim())
+  const onDisk = async (v: string) => {
+    const t = v.trim()
+    const e = t === '~' || t.startsWith('~/') ? home + t.slice(1) : t
+    if (!e.startsWith('/')) return v
+    const lexical = normal(e)
+    const physical = await realOf(e.replace(/\/(?:\.?\/)+/g, '/'))
+    if (/(^|\/)\.\.(\/|$)/.test(physical)) return lexical
+    return (await realOf(lexical)) === physical ? lexical : physical
+  }
+  const resolveClimbs = async (m: Request) => {
+    if (m.kind === 'fresh' && climbs(m.payload.path)) m.payload.path = await onDisk(String(m.payload.path))
+    const args = m.kind === 'call' ? (m.payload.args as Record<string, unknown> | undefined) : undefined
+    if (!args || typeof args !== 'object') return
+    for (const k of ['file_path', 'notebook_path', 'path']) if (climbs(args[k])) args[k] = await onDisk(String(args[k]))
+    if (Array.isArray(args.ops)) for (const o of args.ops as Record<string, unknown>[]) if (o && climbs(o.path)) o.path = await onDisk(String(o.path))
+  }
   const respond = async (m: Request) => {
+    await resolveClimbs(m)
     let out: Record<string, unknown>
     const unlocks: (() => void)[] = []
     const real = await Promise.all(writeTargets(m, cwd, home, defaults).map(realOf))

@@ -1624,6 +1624,7 @@ type Job = {
   reads: Map<string, string | undefined>
   progress: Map<string, { next: number; version?: string }>
   gen: number
+  spill?: string
   pidKnown: Promise<void>
   onPid: () => void
   expiry?: { cancel: () => unknown }
@@ -1632,6 +1633,7 @@ type Job = {
 const MAIN = 'main'
 const jobsById = new Map<string, Job>()
 const deliveredIds = new Map<string, string>()
+const handedSpills = new Map<string, number>()
 let jobSeq = 0
 let mainTurn = false
 let mainTurnId: string | undefined
@@ -1652,10 +1654,10 @@ const lockFile = async (path: string): Promise<() => void> => {
     if (fileLocks.get(path) === chained) fileLocks.delete(path)
   }
 }
-const writeTargets = (m: Request, cwd: string | undefined, home: string): string[] => {
+const writeTargets = (m: Request, cwd: string | undefined, home: string, defaults: Record<string, Record<string, unknown>>): string[] => {
   if (m.kind !== 'call') return []
   const tool = String(m.payload.tool)
-  const args = (m.payload.args ?? {}) as Record<string, unknown>
+  const args = { ...(defaults[tool] ?? {}), ...((m.payload.args ?? {}) as Record<string, unknown>) }
   const ops = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : []
   const raws = /^(?:Write|Edit|MultiEdit)$/.test(tool)
     ? [args.file_path]
@@ -1730,6 +1732,8 @@ const deliver = (agent: string, room: number): { text: string; blocks: { type: s
     j.delivered = true
     promoteReads(j)
     jobsById.delete(j.id)
+    if (j.spill) handedSpills.set(j.spill, Date.now())
+    while (handedSpills.size > 500) handedSpills.delete(handedSpills.keys().next().value as string)
     deliveredIds.set(j.id, j.agent)
     if (deliveredIds.size > 500) deliveredIds.delete(deliveredIds.keys().next().value as string)
   }
@@ -1794,6 +1798,11 @@ const stopJobs = async ($: Dollar, jobs: Job[], by: string, kind: 'cancelled' | 
   for (const j of stopping) {
     j.cancelledBy = by
     j.stopKind = kind
+    if (j.pid) continue
+    j.stopped = true
+    j.exited = true
+    const why = kind === 'aborted' ? 'stopped because its turn was interrupted before its runner started' : `stopped by cancel() from ${by} before its runner started`
+    settle(j, format(Date.now() - j.started, { items: [], logs: [], kind, failure: `${why}; none of its tool calls ran.` }))
   }
   const pids = stopping.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
   await Promise.all(pids.map((p) => $.process.run(['kill', '-9', String(p)]).catch(() => undefined)))
@@ -2268,7 +2277,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const respond = async (m: Request) => {
     let out: Record<string, unknown>
     const unlocks: (() => void)[] = []
-    for (const path of writeTargets(m, cwd, home)) unlocks.push(await lockFile(path))
+    const real = await Promise.all(
+      writeTargets(m, cwd, home, defaults).map((p) => $.process.run(['realpath', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : p), () => p)),
+    )
+    for (const path of [...new Set(real)].sort()) unlocks.push(await lockFile(path))
     try {
       out = await handle(m)
     } catch (err) {
@@ -2349,6 +2361,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   })
   const shellPref = await $.env.get('CODEMODE_SHELL')
   try {
+    if (!job.cancelledBy && !job.pid && Date.now() > job.deadline) expire(job)
     if (job.cancelledBy) throw new Error('codemode: stopped before its runner started')
     const child = $.process.spawn({
       argv: [node, '--permission', `--allow-fs-read=${dir}`, `--allow-fs-write=${dir}`, '-e', RUNNER],
@@ -2506,11 +2519,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   if (full.length > room) {
     const spills = `${home}/.claude/codemode/out`
     const path = `${spills}/${dir.slice(root.length + 1)}.txt`
+    job.spill = `${dir.slice(root.length + 1)}.txt`
+    const waiting = new Set([...jobsById.values()].filter((j) => !j.delivered && j.spill).map((j) => j.spill))
     file = await $.fs.write(path, full).then(() => path, () => undefined)
     const old = ((await $.fs.list(spills).catch(() => [])) ?? [])
       .filter((x) => x.name.endsWith('.txt'))
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .filter((x, i) => i >= KEEP_SPILLS || Date.now() - x.mtimeMs > SPILL_AGE_MS)
+      .filter((x, i) => !waiting.has(x.name) && Date.now() - (handedSpills.get(x.name) ?? 0) > SPILL_AGE_MS && (i >= KEEP_SPILLS || Date.now() - x.mtimeMs > SPILL_AGE_MS))
     if (old.length) await $.process.run(['rm', '-f', ...old.map((x) => `${spills}/${x.name}`)]).catch(() => {})
   }
   const out = fit(parts, room, file, (ended.notes?.length ?? 0) + (ended.failure ? 1 : 0))
@@ -2596,7 +2611,7 @@ export const register: Register = (on) => {
           for (const j of jobs) j.quiet = true
           await stopJobs($, jobs, 'the interrupt', 'aborted')
         }
-        if (current) {
+        if (current && (!mainTurnId || !turnId || turnId === mainTurnId)) {
           mainTurn = false
           mainTurnId = undefined
           await wake($)

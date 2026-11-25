@@ -817,6 +817,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     }).filter((x) => x.score > 0).sort((a, b) => b.score - a.score).slice(0, (opts && opts.limit) || 8).map((x) => x.t)
   }
   const log = (...a) => { keep('log', a.map(show).join(' ')) }
+  const answer = async (name, kind, payload) => {
+    const r = await req(kind, payload)
+    if (!r.ok) throw new Error(name + ': ' + r.error)
+    return r.value
+  }
   const ctx = vm.createContext({
     tools, call, ALL_TOOLS: listed, searchTools,
     TEXT: new Proxy(Object.freeze(Object.assign(Object.create(null), texts || {})), {
@@ -829,7 +834,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     btoa, atob, TextEncoder, TextDecoder, Buffer,
     text: (v) => { keep('item', show(v), v) },
     console: { log, info: log, warn: log, error: log, debug: log },
-    describeTool: async (name) => { const r = await req('describe', { tool: resolve(name) }); if (!r.ok) throw new Error('describeTool: ' + r.error); return r.value },
+    describeTool: (name) => answer('describeTool', 'describe', { tool: resolve(name) }),
     ask: async (prompt, opts) => {
       const o = opts && typeof opts === 'object' ? opts : {}
       const r = await req('ask', { prompt: String(prompt), model: o.model, system: o.system, maxTokens: o.maxTokens, effort: o.effort })
@@ -837,8 +842,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       return r.text
     },
     store: async (key, value) => { const r = await req('store', { key: String(key), value }); if (!r.ok) throw new Error('store: ' + r.error) },
-    load: async (key) => { const r = await req('load', { key: String(key) }); if (!r.ok) throw new Error('load: ' + r.error); return r.value },
-    jobs: async () => { const r = await req('jobs', {}); if (!r.ok) throw new Error('jobs: ' + r.error); return r.value },
+    load: (key) => answer('load', 'load', { key: String(key) }),
+    jobs: () => answer('jobs', 'jobs', {}),
     cancel: async (id) => { const r = await req('cancel', { id: String(id) }); if (!r.ok) throw new Error('cancel: ' + r.error); return r.value },
     exit: () => { throw new Exit() },
   })

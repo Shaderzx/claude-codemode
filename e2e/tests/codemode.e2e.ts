@@ -2371,9 +2371,13 @@ test('Esc with no turn ids while a newer turn starts never marks the newer turn 
     { touch: gate },
     { untilRunDone: 'r1' },
     { abortAndStart: { abort: '', start: '' } },
-    { untilRunDone: 'r2' },
+    { untilRunDone: 'r2' }, { collect: true },
   ] });
   expect(out.wakeAttempts).toBe(0);
+  expect(out.kills).toHaveLength(1);
+  expect(out.collected.join('')).toContain('[r2 stopped after');
+  expect(out.collected.join('')).toContain('[aborted]');
+  expect(out.collected.join('')).toContain('[r1 finished after');
 });
 
 test('An older run\'s partial read never moves a newer partial read\'s progress back', () => {

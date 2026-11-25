@@ -2480,7 +2480,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const armWatchdog = (ms: number) => {
     watchdog = $.clock.after(ms, async () => {
       const now = await clockNow($)
-      if (over || job.exited || pid === undefined) return
+      if (job.exited || pid === undefined) return
       const left = started + timeout + 5_000 - now
       if (left > 0) armWatchdog(Math.max(50, left))
       else killRunner()

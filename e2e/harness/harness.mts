@@ -11,6 +11,7 @@ type Case = {
   statDelayMs?: number
   hangListMs?: number
   hangListCount?: number
+  strictRealpath?: boolean
   clockNowDelayMs?: number
   loadDelayMs?: number
   failReplyAfter?: { fail: number; after: number }
@@ -453,6 +454,7 @@ let wakesSeen = 0
 let statsPending = 0
 let bashWaits = 0
 let listsHanging = 0
+let clockNowCalls = 0
 const writtenReplies = new Set<string>()
 const failedReplies = new Set<string>()
 let listsHung = 0
@@ -585,7 +587,9 @@ const $ = {
       })()
     },
     run: (argv: string[], _init?: unknown) =>
-      (argv[0] === 'kill' ? kills.push([...argv]) : 0, (argv[0] === 'kill' && c.killDelayMs ? new Promise((r) => setTimeout(r, c.killDelayMs)) : Promise.resolve()).then(() => new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
+      c.strictRealpath && argv[0] === 'realpath' && !existsSync(String(argv[1]))
+        ? Promise.resolve({ exitCode: 1, stdout: '', stderr: 'realpath: ' + argv[1] + ': No such file or directory' })
+        : (argv[0] === 'kill' ? kills.push([...argv]) : 0, (argv[0] === 'kill' && c.killDelayMs ? new Promise((r) => setTimeout(r, c.killDelayMs)) : Promise.resolve()).then(() => new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
         const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
         if (p.pid !== undefined) live.add(p.pid)
         if (argv[0] === 'bash') bashWaits++
@@ -605,6 +609,7 @@ const $ = {
   },
   clock: {
     now: async () => {
+      clockNowCalls++
       if (c.clockNowDelayMs) await new Promise((r) => setTimeout(r, c.clockNowDelayMs))
       return Date.now()
     },
@@ -651,7 +656,7 @@ const flatten = (r: unknown): { text: string; attachments: number } => {
   return { text: JSON.stringify(v), attachments: 0 }
 }
 
-const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; bashWaits?: number; runnersSpawned?: number } = { results: [], calls, store, submitted, stops, collected: [], collectedAttachments: [], kills, waitsAlive: 0, wakeAttempts: 0 }
+const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; bashWaits?: number; runnersSpawned?: number } = { results: [], calls, store, submitted, stops, collected: [], collectedAttachments: [], kills, waitsAlive: 0, wakeAttempts: 0 }
 const collect = async (agentId?: string) => {
   const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: '', ...(agentId ? { agentId } : {}) }, engine(async () => ({})))
   const flat = flatten(r)
@@ -857,4 +862,5 @@ out.waitsAlive = waits.size
 out.bashWaits = bashWaits
 out.runnersSpawned = runsStarted
 out.wakeAttempts = wakeAttempts
+out.clockNowCalls = clockNowCalls
 process.stdout.write(JSON.stringify(out), () => process.exit(0))

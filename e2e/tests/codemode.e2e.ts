@@ -1828,9 +1828,9 @@ test('cancel() right after a run starts still stops it', () => {
 });
 
 test('A stopped run names the tool calls still running when it was stopped', () => {
-  const out = run({ steps: [{ script: 'return String(await sh("timeout 20 tail -f /dev/null"))', keepTurn: true }, { untilTool: 'Bash' }, { script: 'return String(await cancel("r1"))' }] });
+  const out = run({ steps: [{ script: 'return String(await sh("sleep 20"))', keepTurn: true }, { untilTool: 'Bash' }, { script: 'return String(await cancel("r1"))' }] });
   expect(out.results[0]!.text).toContain('still running when it was stopped');
-  expect(out.results[0]!.text).toContain('timeout 20 tail -f /dev/null');
+  expect(out.results[0]!.text).toContain('sleep 20');
 });
 
 test('A run cannot cancel itself', () => {
@@ -1865,7 +1865,7 @@ test('cancel() of a run that has exited but not yet come back returns false', ()
 });
 
 test('Interrupting the turn stops its runs, which come back marked aborted with the next run\'s reply, and wakes nothing', () => {
-  const out = run({ surfaces: ['terminal'], steps: [{ script: 'return String(await sh("timeout 30 tail -f /dev/null; printf never-%s printed"))', keepTurn: true }, { untilTool: 'Bash' }, { stop: true, interrupt: true }, { untilRunsDone: true }, { script: 'return "after"', keepTurn: true }] });
+  const out = run({ surfaces: ['terminal'], steps: [{ script: 'return String(await sh("sleep 30; printf never-%s printed"))', keepTurn: true }, { untilTool: 'Bash' }, { stop: true, interrupt: true }, { untilRunsDone: true }, { script: 'return "after"', keepTurn: true }] });
   expect(out.wakeAttempts).toBe(0);
   expect(out.results[1]!.immediate).toContain('[' + out.results[0]!.id + ' stopped after');
   expect(out.results[0]!.text).toContain('[aborted]');
@@ -2023,7 +2023,7 @@ test('Reloading the mod in the middle of a session leaves its running runs alone
 test('Esc stops only the interrupted turn\'s runs, and a run from an earlier turn still finishes and wakes the session', () => {
   const dir = scratch();
   const gate = join(dir, 'gate');
-  const out = run({ surfaces: ['terminal'], steps: [{ turnStart: 't1' }, { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "earlier-turn-output"', keepTurn: true }, { turnComplete: 't1' }, { turnStart: 't2' }, { script: 'return String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true }, { untilTool: 'Bash' }, { turnAborted: 't2' }, { touch: gate }, { untilWake: true }, { collect: true }] });
+  const out = run({ surfaces: ['terminal'], steps: [{ turnStart: 't1' }, { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "earlier-turn-output"', keepTurn: true }, { turnComplete: 't1' }, { turnStart: 't2' }, { script: 'return String(await sh("sleep 30"))', keepTurn: true }, { untilTool: 'Bash' }, { turnAborted: 't2' }, { touch: gate }, { untilWake: true }, { collect: true }] });
   expect(out.submitted[0]).toContain(out.results[0]!.id!);
   expect(out.submitted[0]).not.toContain(out.results[1]!.id!);
   expect(out.collected[0]).toContain('[' + out.results[0]!.id + ' finished after');
@@ -2084,7 +2084,7 @@ test('A run Esc stopped is never named at a later turn\'s end, and still comes b
 });
 
 test('A stop interrupted in the middle of its wait leaves no waiting process and keeps the output', () => {
-  const out = run({ steps: [{ script: 'await sh("true")\nreturn "kept-mid-wait"', keepTurn: true }, { script: 'return String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true }, { untilRunDone: 'r1' }, { untilTool: 'Bash' }, { stopAbortAfterMs: 300 }, { collect: true }] });
+  const out = run({ steps: [{ script: 'await sh("true")\nreturn "kept-mid-wait"', keepTurn: true }, { script: 'return String(await sh("sleep 30"))', keepTurn: true }, { untilRunDone: 'r1' }, { untilTool: 'Bash' }, { stopAbortAfterMs: 300 }, { collect: true }] });
   expect(out.stops[0]).toBe('');
   expect(out.collected[0]).toContain('kept-mid-wait');
   expect(out.waitsAlive).toBe(0);
@@ -2138,7 +2138,7 @@ test('Two runs writing the same file at once never both pass the read check', ()
 });
 
 test('Esc on an older turn stops that turn\'s runs even after a newer turn started', () => {
-  const out = run({ steps: [{ turnStart: 't1' }, { script: 'return String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true }, { untilTool: 'Bash' }, { turnStart: 't2' }, { turnAborted: 't1' }, { untilRunDone: 'r1' }, { collect: true }] });
+  const out = run({ steps: [{ turnStart: 't1' }, { script: 'return String(await sh("sleep 30"))', keepTurn: true }, { untilTool: 'Bash' }, { turnStart: 't2' }, { turnAborted: 't1' }, { untilRunDone: 'r1' }, { collect: true }] });
   expect(out.kills).toHaveLength(1);
   expect(out.collected[0]).toContain('[r1 stopped after');
 });
@@ -2170,7 +2170,7 @@ test('What a stopped run read never counts as read for later writes', () => {
   writeFileSync(file, 'v1\n');
   const f = JSON.stringify(file);
   const mark = join(dir, 'read');
-  const out = run({ steps: [{ script: 'await read(' + f + ')\nawait sh("touch ' + mark + '")\nreturn String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true }, { untilFile: mark }, { script: 'return String(await cancel("r1"))', keepTurn: true }, { untilRunsDone: true }, { collect: true }, { script: 'const r = await call("Write", { file_path: ' + f + ', content: "v2\\n" })\nreturn r.error', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  const out = run({ steps: [{ script: 'await read(' + f + ')\nawait sh("touch ' + mark + '")\nreturn String(await sh("sleep 30"))', keepTurn: true }, { untilFile: mark }, { script: 'return String(await cancel("r1"))', keepTurn: true }, { untilRunsDone: true }, { collect: true }, { script: 'const r = await call("Write", { file_path: ' + f + ', content: "v2\\n" })\nreturn r.error', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
   expect(out.results[2]!.text).toContain('File has not been read yet');
   expect(readFileSync(file, 'utf8')).toBe('v1\n');
 });
@@ -2212,7 +2212,7 @@ test('A run\'s reply with nine other runs named and a finished run in it stays w
 test('Esc with no turn ids stops only the runs the interrupted turn started', () => {
   const dir = scratch();
   const gate = join(dir, 'gate');
-  const out = run({ steps: [{ turnStart: '' }, { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 30000 })\nreturn "earlier-kept"', keepTurn: true }, { turnComplete: '' }, { turnStart: '' }, { script: 'return String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true }, { untilTool: 'Bash' }, { turnAborted: '' }, { touch: gate }, { untilRunsDone: true }, { collect: true }] });
+  const out = run({ steps: [{ turnStart: '' }, { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 30000 })\nreturn "earlier-kept"', keepTurn: true }, { turnComplete: '' }, { turnStart: '' }, { script: 'return String(await sh("sleep 30"))', keepTurn: true }, { untilTool: 'Bash' }, { turnAborted: '' }, { touch: gate }, { untilRunsDone: true }, { collect: true }] });
   expect(out.collected[0]).toContain('[r1 finished after');
   expect(out.collected[0]).toContain('earlier-kept');
   expect(out.collected[0]).toContain('[r2 stopped after');
@@ -2278,7 +2278,7 @@ test('Esc on a turn while a newer turn starts never marks the newer turn idle', 
     { script: 'await waitFor(() => sh("test -f ' + gate + '"), { every: 20, timeout: 30000 })\nreturn "earlier"', keepTurn: true },
     { turnComplete: 't0' },
     { turnStart: 't1' },
-    { script: 'await sh("touch ' + started + '")\nreturn String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true },
+    { script: 'await sh("touch ' + started + '")\nreturn String(await sh("sleep 30"))', keepTurn: true },
     { untilFile: started },
     { abortAndStart: { abort: 't1', start: 't2' } },
     { touch: gate }, { untilRunDone: 'r1' }, { untilQuiet: true },
@@ -2371,7 +2371,7 @@ test('Esc with no turn ids while a newer turn starts never marks the newer turn 
     { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 30000 })\nreturn "earlier"', keepTurn: true },
     { turnComplete: '' },
     { turnStart: '' },
-    { script: 'await sh("touch ' + started + '")\nreturn String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true },
+    { script: 'await sh("touch ' + started + '")\nreturn String(await sh("sleep 30"))', keepTurn: true },
     { untilFile: started },
     { touch: gate },
     { untilRunDone: 'r1' },
@@ -2485,7 +2485,7 @@ test('Esc with no turn ids stops the interrupted turn\'s runs even when a newer 
   const started = join(dir, 'started');
   const out = run({ steps: [
     { turnStart: '' },
-    { script: 'await sh("touch ' + started + '")\nreturn String(await sh("timeout 20 tail -f /dev/null"))', keepTurn: true },
+    { script: 'await sh("touch ' + started + '")\nreturn String(await sh("sleep 20"))', keepTurn: true },
     { untilFile: started }, { abortDuringNext: { abort: '', start: '' } }, { untilRunDone: 'r1' }, { collect: true },
   ] });
   expect(out.collected[0]).toContain('[r1 stopped after');

@@ -1367,12 +1367,12 @@ test('An object key named class does not change how a later block is read', () =
   expect(one('const o = { a: 1, class: 1 }\nif (true) {}\n/`/.test("a")\n// @text a\nhi\n// @end\nreturn TEXT.a')).toBe('hi');
 });
 
-test('A run that times out while a big Read is read in pages names the Read as still running', () => {
+test('A run that times out while a big Read is read in pages names the Read as still running or cut off', () => {
   const dir = scratch();
   const f = join(dir, 'big.txt');
   writeFileSync(f, Array.from({ length: 3000 }, (_, i) => 'line ' + i + ' ' + 'x'.repeat(60)).join('\n') + '\n');
   const text = one('// @options: {"timeout_ms": 1500}\nawait tools.Read({ file_path: ' + JSON.stringify(f) + ' })', { readDelayMs: 400 });
-  expect(text).toMatch(/still running[^\n]*Read \(/);
+  expect(text).toMatch(/still running[^\n]*Read \(|Read 1 cut off by the run's end/);
 });
 
 test('A command whose output starts like a background notice still passes', () => {

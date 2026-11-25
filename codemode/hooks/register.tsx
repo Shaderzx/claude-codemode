@@ -778,14 +778,17 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (!patch) throw toolError('edit: this session has no Edit tool and no patch tool')
     const moved = (r) => toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
     let check = await req('fresh', { path: file })
+    let reread = false
     if (!check.read || check.fresh === false) {
       if (!force) throw check.read ? moved() : unread()
       check = (await forcedRead(file, 'edit')).check
+      reread = true
     }
     const args = { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }
     let r = await req('call', { tool: patch, args, ...guardOf(check) })
-    for (let n = 1; force && unreadWrite(r) && timeToRetry(); n++) {
-      await pause(n)
+    for (let n = 1; force && unreadWrite(r) && (!reread || timeToRetry()); n++) {
+      if (reread) await pause(n)
+      reread = true
       r = await req('call', { tool: patch, args, ...guardOf((await forcedRead(file, 'edit')).check) })
     }
     if (r.ok) return wrote(file, 'edited')
@@ -1424,14 +1427,14 @@ export const similar = (name: string, names: string[]): string[] => {
     .map((x) => x.n)
 }
 
-type Tally = { ok: number; failed: number; open: number; arg?: string }
+type Tally = { ok: number; failed: number; open: number; cutOff?: number; arg?: string }
 
 // What a run had called by the time it failed: those side effects stand, and
 // the next run should not repeat them blind.
 export const ledger = (calls: Map<string, Tally>): string =>
   [...calls]
     .map(([n, t]) => {
-      const parts = [t.ok ? `${t.ok} ok` : '', t.failed ? `${t.failed} failed${t.arg ? ` (${t.arg})` : ''}` : '', t.open ? `${t.open} still running (may still finish)` : '']
+      const parts = [t.ok ? `${t.ok} ok` : '', t.failed ? `${t.failed} failed${t.arg ? ` (${t.arg})` : ''}` : '', t.cutOff ? `${t.cutOff} cut off by the run's end (the mod stopped reading it)` : '', t.open ? `${t.open} still running (may still finish)` : '']
       return `${n} ${parts.filter(Boolean).join(', ')}`
     })
     .slice(0, 12)
@@ -1978,7 +1981,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       return { ok: true }
     }
     if (m.kind === 'fresh') {
-      const path = normal(String(p.path))
+      const path = await readKeyOf(normal(String(p.path)))
       const read = job.reads.has(path) || readPaths.has(path)
       const was = job.reads.has(path) ? job.reads.get(path) : readPaths.has(path) ? readVersions.get(path) : undefined
       const now = was === undefined ? undefined : await versionOf(path)
@@ -2057,9 +2060,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const path = normal(expanded)
       args.file_path = path
       const exists = await $.fs.exists(path).catch(() => true)
-      if (!readPaths.has(path) && !job.reads.has(path) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
+      const key = exists ? await readKeyOf(path) : path
+      if (!readPaths.has(key) && !job.reads.has(key) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
       if (exists) {
-        const was = job.reads.has(path) ? job.reads.get(path) : readVersions.get(path)
+        const was = job.reads.has(key) ? job.reads.get(key) : readVersions.get(key)
         const now = await versionOf(path)
         if (was === undefined || now === undefined || now !== was)
           return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
@@ -2124,7 +2128,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       (infoOf(r.result)?.truncatedByTokenCap === true || ((args.offset === undefined || args.offset === 1) && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
     if (tool === 'Read' && args.limit === undefined && (capped || (r.isError && /exceeds maximum allowed (?:tokens|size)/i.test(String(r.text ?? show(r.result)))))) {
       const paged = await pageRead(args)
-      if (paged === undefined && late()) return refusal('call')
+      if (paged === undefined && late()) {
+        tally.open--
+        tally.cutOff = (tally.cutOff ?? 0) + 1
+        tally.arg ??= firstArg(args)
+        return refusal('call')
+      }
       if (paged?.text !== undefined) r = { text: paged.text, result: paged.result } as typeof r
       else if (paged?.error !== undefined) r = { isError: true, text: paged.error } as typeof r
       else if (capped)
@@ -2423,15 +2432,31 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const onDisk = async (v: string) => {
     const t = v.trim()
     const e = t === '~' || t.startsWith('~/') ? home + t.slice(1) : t
-    return e.startsWith('/') ? climb(e) : v
+    if (e.startsWith('/')) return climb(e)
+    return cwd ? climb(`${cwd.replace(/\/$/, '')}/${e}`) : v
   }
   const resolveClimbs = async (m: Request) => {
     if (m.kind === 'fresh' && climbs(m.payload.path)) m.payload.path = await onDisk(String(m.payload.path))
-    const args = m.kind === 'call' ? (m.payload.args as Record<string, unknown> | undefined) : undefined
-    if (!args || typeof args !== 'object') return
-    for (const k of ['file_path', 'notebook_path', 'path']) if (climbs(args[k])) args[k] = await onDisk(String(args[k]))
-    if (Array.isArray(args.ops)) for (const o of args.ops as Record<string, unknown>[]) if (o && climbs(o.path)) o.path = await onDisk(String(o.path))
+    if (m.kind !== 'call') return
+    const given = (m.payload.args && typeof m.payload.args === 'object' ? m.payload.args : {}) as Record<string, unknown>
+    const preset = defaults[String(m.payload.tool)] ?? {}
+    const args = { ...given }
+    for (const k of ['file_path', 'notebook_path', 'path']) {
+      const v = k in given ? given[k] : preset[k]
+      if (climbs(v)) args[k] = await onDisk(String(v))
+    }
+    if (Array.isArray(args.ops)) args.ops = await Promise.all((args.ops as Record<string, unknown>[]).map(async (o) => (o && climbs(o.path) ? { ...o, path: await onDisk(String(o.path)) } : o)))
+    m.payload.args = args
   }
+  const sameFileKey = async (path: string, keys: Iterable<string>) => {
+    const name = path.slice(path.lastIndexOf('/'))
+    const candidates = [...new Set(keys)].filter((k) => k !== path && k.endsWith(name))
+    if (!candidates.length) return undefined
+    const real = await realOf(path)
+    for (const k of candidates) if ((await realOf(k)) === real) return k
+    return undefined
+  }
+  const readKeyOf = async (path: string) => (job.reads.has(path) || readPaths.has(path) ? path : ((await sameFileKey(path, [...job.reads.keys(), ...readPaths])) ?? path))
   const respond = async (m: Request) => {
     await resolveClimbs(m)
     let out: Record<string, unknown>

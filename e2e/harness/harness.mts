@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 type Case = {
+  writeDelayMs?: number
+  skillDelayMs?: number
   statDelayMs?: number
   hangListMs?: number
   surfaces?: string[]
@@ -60,7 +62,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; untilRunsCleaned?: number; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilCleaned?: number; untilQuiet?: boolean; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilCleaned?: number; untilQuiet?: boolean; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -209,6 +211,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       return ok(numbered(part, offset), { type: 'text', file: { filePath: p, content: part.join('\n'), numLines: part.length, startLine: offset, totalLines: lines.length, ...(cut ? { truncatedByTokenCap: true } : {}) } })
     }
     case 'Write': {
+      if (c.writeDelayMs) await new Promise((r) => setTimeout(r, c.writeDelayMs))
       if (c.deniedWriteMessage !== undefined) return err(c.deniedWriteMessage)
       const w = writePath(a.file_path)
       if (!c.engineForgets && existsSync(w) && readTimes.has(w) && statSync(w).mtimeMs !== readTimes.get(w)) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
@@ -356,6 +359,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       return ok('No matching deferred tools found')
     }
     case 'Skill':
+      if (c.skillDelayMs) await new Promise((r) => setTimeout(r, c.skillDelayMs))
       return ok('Launching skill: ' + a.skill)
     case 'mcp__lean-ctx__ctx_expand': {
       if (jobs.get(String(a.id))?.done && !jobArchive.has(String(a.id))) return ok("Background job '" + String(a.id) + "' finished (exit " + jobs.get(String(a.id))!.done!.code + ') without output.')
@@ -439,6 +443,7 @@ const absorb = (text: string) => {
 let inTurn = false
 let sessionStarted = false
 let wakesPending = 0
+let wakesSeen = 0
 let statsPending = 0
 let bashWaits = 0
 let listsHanging = 0
@@ -450,7 +455,6 @@ const waits = new Set<number>()
 let runsStarted = 0
 let inflight = 0
 let runsCleanedAll = 0
-let runsCleaned = 0
 const until = async (check: () => boolean, ms: number, what = 'a harness wait') => {
   const end = Date.now() + ms
   while (!check()) {
@@ -575,7 +579,6 @@ const $ = {
         p.on('error', (e) => done({ exitCode: 127, stdout, stderr: stderr + String(e.message) }))
         p.on('close', (code) => {
           if (argv[0] === 'rm' && argv.some((a) => a.includes('/codemode/runs/'))) {
-            runsCleaned++
             runsCleanedAll++
           }
           done({ exitCode: code ?? 1, stdout, stderr })
@@ -692,7 +695,7 @@ for (const s of c.steps) {
     continue
   }
   if (s.untilRunsDone) {
-    await until(() => mod.openRunIds().length === 0 && inflight === 0, 60_000, 'every run settling')
+    await until(() => mod.openRunIds().length === 0 && inflight === 0 && statsPending === 0, 60_000, 'every run settling')
     await new Promise((r) => setTimeout(r, 0))
     continue
   }
@@ -746,8 +749,8 @@ for (const s of c.steps) {
     continue
   }
   if (s.untilWake) {
-    const before = wakeAttempts
-    await until(() => (wakeAttempts > before || wakeAttempts > 0) && wakesPending === 0, 30_000, 'a wake prompt')
+    await until(() => wakeAttempts > wakesSeen && wakesPending === 0, 30_000, 'a wake prompt')
+    wakesSeen = wakeAttempts
     continue
   }
   if (s.collect) {

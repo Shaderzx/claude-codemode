@@ -2642,7 +2642,7 @@ test('A kill timer that fires early never stops a run before its time', () => {
 
 test('Two runs creating one new file through a dangling symlink and its target never both write it', () => {
   const dir = scratch();
-  const real = join(dir, 'real.txt');
+  const real = join(dir, 'missing', 'real.txt');
   const link = join(dir, 'link.txt');
   const go = join(dir, 'go');
   const writer = (path: string, mine: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(path) + ', content: "' + mine + '\\n" })\nreturn r.ok ? "wrote" : r.error';
@@ -2652,7 +2652,6 @@ test('Two runs creating one new file through a dangling symlink and its target n
   expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
   expect(readFileSync(real, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
 });
-
 test('A call refused for time before it started is never reported as still running', () => {
   const dir = scratch();
   const file = join(dir, 'f.txt');
@@ -2682,4 +2681,15 @@ test('A refused load or describeTool throws instead of giving nothing', () => {
   const big = '"x".repeat(7000001)';
   const out = run({ steps: [{ script: 'const seen = []\nfor (const f of [() => load(' + big + '), () => describeTool(' + big + ')]) { try { await f(); seen.push("resolved") } catch (e) { seen.push("threw") } }\nreturn seen.join(",")' }] });
   expect(out.results[0]!.text).toBe('threw,threw');
+});
+
+test('A run whose runner starts more than five seconds late, within its start time, still runs its script', () => {
+  const dir = scratch();
+  const shim = join(dir, 'slower-node');
+  writeFileSync(shim, '#!/bin/sh\nsleep 9\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n');
+  chmodSync(shim, 0o755);
+  const out = run({ env: { CODEMODE_NODE: shim }, steps: [{ script: '// @options: {"timeout_ms": 3000}\nawait sh("true")\nreturn "finished"', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('finished');
+  expect(out.collected[0]).not.toContain('[timeout]');
+  expect(out.kills).toHaveLength(0);
 });

@@ -13,6 +13,28 @@ const line = (o: unknown) => {
   const before = rest.done ? [...(items ?? []).map((text) => ({ out: 'item', text })), ...(logs ?? []).map((text) => ({ out: 'log', text }))] : []
   return { stream: 'stdout' as const, text: [...before, rest.done ? rest : o].map((x) => MARK + JSON.stringify(x) + '\n').join('') }
 }
+type Runs = { tool: { call: (a: never) => Promise<{ result?: unknown }> }; classic: { Stop: (a: never) => Promise<unknown> } }
+const sectionOf = (text: string, id: string) => {
+  const heads = [...text.matchAll(/^\[(r\d+) (?:finished|stopped) after [^\]\n]*\]$/gm)]
+  const i = heads.findIndex((m) => m[1] === id)
+  if (i < 0) return undefined
+  const from = (heads[i]!.index ?? 0) + heads[i]![0].length + 1
+  const to = i + 1 < heads.length ? (heads[i + 1]!.index ?? text.length) : text.length
+  return text.slice(from, to).replace(/\n\n$/, '')
+}
+const runTool = async ($: Runs, script: string) => {
+  const started = await $.tool.call({ tool: RUN, script } as never)
+  const id = /^Started (r\d+) in the background/.exec(String(started.result))?.[1]
+  if (!id) return started
+  const held = (await $.classic.Stop({ stop_hook_active: false } as never)) as { block?: string } | undefined
+  const text = sectionOf(String(held?.block ?? ''), id) ?? ''
+  const later = new RegExp('\\n\\(\\d+ attachments? of ' + id + ' come with the reply to your next run\\)$')
+  if (!later.test(text)) return { ...started, result: text }
+  const next = await $.tool.call({ tool: RUN, script: 'return 0' } as never)
+  await $.classic.Stop({ stop_hook_active: false } as never)
+  const blocks = Array.isArray(next.result) ? (next.result as { type: string }[]).filter((b) => b.type !== 'text') : []
+  return { ...started, result: [{ type: 'text', text: text.replace(later, '') }, ...blocks] }
+}
 const ran = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
 type Fake = {
@@ -38,6 +60,7 @@ const setup = (on: On, child: Child, opts: Opts = {}) => {
   const f: Fake = { writes: [], texts: {}, runs: [], calls: [], stored: { ...opts.stored }, registered: [] }
   const waiters: [string, () => void][] = []
   on('session.start', async () => ({ cwd: '/tmp' }))
+  on('classic.Stop', async () => ({}) as never)
   on('tool.register', async (_$, e) => {
     f.registered.push({ ...e })
     return { value: { tool: `mcp__codemode__${(e as { name: string }).name}` } }
@@ -99,7 +122,7 @@ test('a request id that is not a positive integer is ignored, and reserved keys 
     yield line({ done: true, items: ['ok'], logs: [] })
   })
   await $.session.start(START)
-  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  const r = await runTool($ as never, 'return 1')
   expect(String(r.result)).toContain('ok')
   for (const p of f.writes) {
     expect(p.startsWith(`${HOME}/.claude/codemode/runs/`)).toBe(true)
@@ -131,7 +154,7 @@ test('a runner that never answers is killed by its pid once the watchdog fires',
     release()
   }
   await $.session.start(START)
-  const r = await $.tool.call({ tool: RUN, script: 'while (true) {}' } as never)
+  const r = await runTool($ as never, 'while (true) {}')
   expect(f.runs).toContainEqual(['kill', '-9', '4242'])
   expect(String(r.result)).toContain('never yielded')
 })
@@ -144,7 +167,7 @@ test('Workflow is refused from a script', { timeoutMs: 10_000 }, async ($, on) =
     yield line({ done: true, items: [], logs: [] })
   })
   await $.session.start(START)
-  await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  await runTool($ as never, 'return 1')
   expect(f.calls.some((c) => c.tool === 'Workflow')).toBe(false)
 })
 
@@ -186,7 +209,7 @@ test('an image reaches the model as an image block and the script sees only its 
   const image = { type: 'image', file: { base64: 'QUJDREVG', type: 'image/png', originalSize: 6 } }
   const f = setup(on, oneCall(['look: [image #1 image/png 1KB]']), { answer: { result: image, text: '' } })
   await $.session.start(START)
-  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  const r = await runTool($ as never, 'return 1')
   const reply = Object.entries(f.texts).find(([p]) => p.endsWith('/1.json'))?.[1] ?? ''
   expect(reply).toContain('[image #1 image/png 1KB]')
   expect(reply).not.toContain('QUJDREVG')
@@ -201,7 +224,7 @@ test('an image whose marker is left out of the output is not attached', { timeou
   const image = { type: 'image', file: { base64: 'QUJDREVG', type: 'image/png', originalSize: 6 } }
   setup(on, oneCall(['nothing to see']), { answer: { result: image, text: '' } })
   await $.session.start(START)
-  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  const r = await runTool($ as never, 'return 1')
   expect(r.result).toBe('nothing to see')
 })
 
@@ -210,7 +233,7 @@ test('an image whose marker falls in the cut middle is still attached', { timeou
   const big = 'a'.repeat(15_000) + '[image #1 image/png 1KB]' + 'b'.repeat(15_000)
   setup(on, oneCall([big]), { answer: { result: image, text: '' } })
   await $.session.start(START)
-  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  const r = await runTool($ as never, 'return 1')
   const blocks = r.result as unknown as { type: string; source?: { data: string } }[]
   expect(blocks[1]?.type).toBe('image')
   expect(blocks[1]?.source?.data).toBe('QUJDREVG')
@@ -223,7 +246,7 @@ test('a cut output is saved whole and the cut names the file', { timeoutMs: 10_0
     yield line({ done: true, items: [big], logs: [] })
   })
   await $.session.start(START)
-  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  const r = await runTool($ as never, 'return 1')
   const spill = f.writes.find((p) => p.startsWith(`${HOME}/.claude/codemode/out/`))
   expect(spill).toBeDefined()
   expect(f.texts[spill ?? '']).toBe(big)
@@ -241,7 +264,7 @@ test('bad arguments come back as one TypeScript type, without the ToolSearch adv
   )
   const f = setup(on, oneCall(['done']), { answer: { result: 'InputValidationError', text: message, isError: true } })
   await $.session.start(START)
-  await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  await runTool($ as never, 'return 1')
   const reply = Object.entries(f.texts).find(([p]) => p.endsWith('/1.json'))?.[1] ?? ''
   expect(reply).toContain('Read takes { file_path: string; offset?: number }')
   expect(reply).not.toContain('ToolSearch')
@@ -305,7 +328,7 @@ test('a failed run says which tool calls already ran', { timeoutMs: 10_000 }, as
     yield line({ done: true, items: [], logs: [], failure: 'Error: boom' })
   })
   await $.session.start(START)
-  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  const r = await runTool($ as never, 'return 1')
   expect(String(r.result)).toContain('Error: boom\nTool calls before the failure: Read 1 ok')
 })
 
@@ -327,7 +350,7 @@ test('describeTool names lookalikes for a missing tool, reads stored types, and 
     { tools, stored: { 'type:9.9.9:Grep': '{ pattern: string }' } },
   )
   await $.session.start(START)
-  await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  await runTool($ as never, 'return 1')
   const reply = (id: number) => Object.entries(f.texts).find(([p]) => p.endsWith(`/${id}.json`))?.[1] ?? ''
   expect(reply(1)).toContain('not in this session; similar: mcp__lean-ctx__ctx_shell')
   expect(reply(2)).toContain('{ pattern: string }')
@@ -372,7 +395,7 @@ test('two Skill calls at once each get their own skill text', { timeoutMs: 10_00
     },
   )
   await $.session.start(START)
-  await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  await runTool($ as never, 'return 1')
   const reply = (id: number) => Object.entries(f.texts).find(([p]) => p.endsWith(`/${id}.json`))?.[1] ?? ''
   // Each call gets its own expansion, not whichever landed last.
   expect(reply(1)).toContain('SKILL BODY A')
@@ -393,7 +416,7 @@ test('a Skill call does not pick up text a previous call expanded', { timeoutMs:
   )
   await $.session.start(START)
   await $.skill.prompt({ skill: 'lean', text: 'STALE BODY' } as never)
-  await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  await runTool($ as never, 'return 1')
   const reply = Object.entries(f.texts).find(([p]) => p.endsWith('/1.json'))?.[1] ?? ''
   expect(reply).toContain('Launching skill: lean')
   expect(reply).not.toContain('STALE BODY')
@@ -413,7 +436,7 @@ test('an MCP tool never teaches a type, even when its error looks like the engin
     { tools: [{ name: 'mcp__evil__t', description: 'x', mcp: true }], answer: { result: 'bad', text: message, isError: true } },
   )
   await $.session.start(START)
-  await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  await runTool($ as never, 'return 1')
   expect(Object.keys(f.stored).filter((k) => k.startsWith('type:'))).toEqual([])
 })
 
@@ -432,7 +455,7 @@ test('a failing command whose output imitates the engine teaches no type', { tim
     { tools: [{ name: 'Bash', description: 'runs', mcp: false }], answer: { result: 'x', text: message, isError: true } },
   )
   await $.session.start(START)
-  await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  await runTool($ as never, 'return 1')
   expect(Object.keys(f.stored).filter((k) => k.startsWith('type:'))).toEqual([])
   const reply = Object.entries(f.texts).find(([p]) => p.endsWith('/1.json'))?.[1] ?? ''
   expect(reply).not.toContain('Bash takes')
@@ -451,7 +474,7 @@ test('a run that failed on its only call adds no ledger that repeats the error',
     { answer: { result: 'no such file', text: 'no such file', isError: true } },
   )
   await $.session.start(START)
-  const r = await $.tool.call({ tool: RUN, script: 'return 1' } as never)
+  const r = await runTool($ as never, 'return 1')
   expect(String(r.result)).toContain('Error: Read: no such file')
   expect(String(r.result)).not.toContain('Tool calls before the failure')
 })

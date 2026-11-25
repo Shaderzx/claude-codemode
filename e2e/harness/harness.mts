@@ -429,6 +429,8 @@ const absorb = (text: string) => {
   })
 }
 let inTurn = false
+let runsStarted = 0
+let runsCleaned = 0
 const until = async (check: () => boolean, ms: number) => {
   const end = Date.now() + ms
   while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 20))
@@ -482,6 +484,7 @@ const $ = {
   },
   process: {
     spawn: ({ argv, input }: { argv: string[]; input?: string }) => {
+      if (argv.includes('--permission')) runsStarted++
       const child = spawn(argv[0] as string, argv.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
       child.stdin.end(input ?? '')
       const queue: { stream: string; text: string }[] = []
@@ -515,7 +518,10 @@ const $ = {
         p.stdout.setEncoding('utf8').on('data', (t: string) => { stdout += t })
         p.stderr.setEncoding('utf8').on('data', (t: string) => { stderr += t })
         p.on('error', (e) => done({ exitCode: 127, stdout, stderr: stderr + String(e.message) }))
-        p.on('close', (code) => done({ exitCode: code ?? 1, stdout, stderr }))
+        p.on('close', (code) => {
+          if (argv[0] === 'rm' && argv.some((a) => a.includes('/codemode/runs/'))) runsCleaned++
+          done({ exitCode: code ?? 1, stdout, stderr })
+        })
       }),
   },
   clock: {
@@ -588,8 +594,7 @@ for (const s of c.steps) {
   }
   if (s.newSession) { await startSession(); continue }
   if (s.untilRunsDone) {
-    const runsDir = join(home, '.claude', 'codemode', 'runs')
-    await until(() => !existsSync(runsDir) || readdirSync(runsDir).length === 0, 60_000)
+    await until(() => runsStarted > 0 && runsCleaned >= runsStarted, 60_000)
     continue
   }
   if (s.stop) {

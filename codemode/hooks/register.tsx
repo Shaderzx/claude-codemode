@@ -2130,6 +2130,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       (infoOf(r.result)?.truncatedByTokenCap === true || ((args.offset === undefined || args.offset === 1) && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
     if (tool === 'Read' && args.limit === undefined && (capped || (r.isError && /exceeds maximum allowed (?:tokens|size)/i.test(String(r.text ?? show(r.result)))))) {
       const paged = await pageRead(args)
+      if (paged === undefined && late()) return refusal('call')
       if (paged?.text !== undefined) r = { text: paged.text, result: paged.result } as typeof r
       else if (paged?.error !== undefined) r = { isError: true, text: paged.error } as typeof r
       else if (capped)

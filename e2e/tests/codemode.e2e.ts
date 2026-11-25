@@ -2902,7 +2902,7 @@ for (const [label, tools, op] of [['Write', undefined, 'write'], ['the patch too
     const call = op === 'write' ? 'await write(' + f + ', "mine\\n", { force: true })' : 'await edit(' + f + ', "original", "mine", { force: true })';
     const out = run({ ...(tools ? { tools: [...tools] } : {}), changeEveryRead: true, readDelayMs: 100, steps: [{ script: '// @options: {"timeout_ms": 30000}\ntry { ' + call + '; return "landed" } catch (x) { return String(x.message) }' }] });
     expect(out.results[0]!.text).toContain('keeps changing while it is read');
-    expect(out.calls.filter((c) => c.tool === 'Read').length).toBeLessThanOrEqual(40);
+    expect(out.calls.filter((c) => c.tool === 'Read').length).toBeLessThanOrEqual(20);
   });
 }
 

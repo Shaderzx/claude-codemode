@@ -2594,3 +2594,92 @@ test('A run whose runner is slow to start gets its whole time before the mod kil
   expect(out.collected[0]).not.toContain('[timeout]');
   expect(out.kills).toHaveLength(0);
 });
+
+test('Two forced edits through the patch tool at once both land', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const [a, b, go] = ['a-read', 'b-read', 'go'].map((n) => join(dir, n));
+  const editor = (from: string, to: string, marker: string) => 'await read(' + f + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await edit(' + f + ', "' + from + '", "' + to + '", { force: true }); return "edited" } catch (e) { return String(e.message) }';
+  const out = run({ tools: NO_BASH, statDelayMs: 250, steps: [{ script: editor('alpha', 'ALPHA', a), keepTurn: true }, { script: editor('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['edited', 'edited']);
+  expect(readFileSync(file, 'utf8')).toBe('ALPHA\nBETA\n');
+});
+
+test('An edit through the patch tool counts a read another run brought back while it was running', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const [gate, started] = ['gate', 'started'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, steps: [
+    { script: 'await sh("touch ' + started + '")\nawait waitFor(() => sh("test -f ' + gate + '"), { every: 20, timeout: 20000 })\ntry { await edit(' + f + ', "alpha", "ALPHA"); return "edited" } catch (e) { return String(e.message) }', keepTurn: true },
+    { untilFile: started },
+    { script: 'await read(' + f + ')\nreturn "read-ok"', keepTurn: true }, { untilRunDone: 'r2' }, { collect: true },
+    { touch: gate }, { untilRunDone: 'r1' }, { collect: true },
+  ] });
+  expect(out.collected.join('')).toContain('[r1 finished after');
+  expect(out.collected[1]).toContain('edited');
+  expect(readFileSync(file, 'utf8')).toBe('ALPHA\nbeta\n');
+});
+
+test('An edit through the patch tool counts a read whose path came from tool defaults', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const out = run({ tools: NO_BASH, env: { CODEMODE_TOOL_DEFAULTS: JSON.stringify({ Read: { file_path: file } }) }, steps: [{ script: 'await tools.Read({})\ntry { await edit(' + f + ', "alpha", "ALPHA"); return "edited" } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toBe('edited');
+  expect(readFileSync(file, 'utf8')).toBe('ALPHA\nbeta\n');
+});
+
+test('A kill timer that fires early never stops a run before its time', () => {
+  const out = run({ clockEarlyMs: 5500, steps: [{ script: '// @options: {"timeout_ms": 1500}\nawait sh("sleep 1.1")\nreturn "completed-in-time"', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('completed-in-time');
+  expect(out.kills).toHaveLength(0);
+});
+
+test('Two runs creating one new file through a dangling symlink and its target never both write it', () => {
+  const dir = scratch();
+  const real = join(dir, 'real.txt');
+  const link = join(dir, 'link.txt');
+  const go = join(dir, 'go');
+  const writer = (path: string, mine: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(path) + ', content: "' + mine + '\\n" })\nreturn r.ok ? "wrote" : r.error';
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, writeDelayMs: 800, steps: [{ link: { from: link, to: real } }, { script: writer(real, 'from-a', a), keepTurn: true }, { script: writer(link, 'from-b', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const texts = [out.results[0]!.text, out.results[1]!.text];
+  expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
+  expect(readFileSync(real, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
+});
+
+test('A call refused for time before it started is never reported as still running', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const f = JSON.stringify(file);
+  const out = run({ tools: NO_BASH, statDelayMs: 1500, steps: [
+    { script: 'await read(' + f + ')\nreturn "r1"', keepTurn: true }, { untilRunDone: 'r1' }, { collect: true },
+    { script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 400) {}\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + f + ', old_text: "original", new_text: "changed" })\nreturn 1', keepTurn: true },
+    { untilRunsDone: true }, { untilQuiet: true }, { collect: true },
+  ] });
+  expect(out.calls.filter((c) => c.tool === 'mcp__lean-ctx__ctx_patch')).toHaveLength(0);
+  expect(readFileSync(file, 'utf8')).toBe('original\n');
+  expect(out.collected[1]).toContain('[timeout]');
+  expect(out.collected[1]).not.toContain('still running');
+});
+
+test('A load near the end of a run whose runner was slow to start still returns the stored value', () => {
+  const dir = scratch();
+  const shim = join(dir, 'slow-node');
+  writeFileSync(shim, '#!/bin/sh\nsleep 0.7\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n');
+  chmodSync(shim, 0o755);
+  const out = run({ env: { CODEMODE_NODE: shim }, store: { 'script:k': 'saved-value' }, steps: [{ script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 400) {}\nconst v = await load("k")\nreturn "loaded=" + String(v)', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('loaded=saved-value');
+});
+
+test('A refused load or describeTool throws instead of giving nothing', () => {
+  const big = '"x".repeat(7000001)';
+  const out = run({ steps: [{ script: 'const seen = []\nfor (const f of [() => load(' + big + '), () => describeTool(' + big + ')]) { try { await f(); seen.push("resolved") } catch (e) { seen.push("threw") } }\nreturn seen.join(",")' }] });
+  expect(out.results[0]!.text).toBe('threw,threw');
+});

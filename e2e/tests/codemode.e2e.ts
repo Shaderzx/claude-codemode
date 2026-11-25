@@ -2924,7 +2924,7 @@ test('Two paged reads of one file in a run never stitch an old first page to a n
   writeFileSync(newer, lines('new'));
   const f = JSON.stringify(file);
   const out = run({ readLagMs: 400, steps: [{ script: 'const first = read(' + f + ').then((t) => (t.includes("old 0") && t.includes("new 2399") ? "stitched" : "clean"), (e) => "refused: " + e.message)\nawait sh("cp ' + newer + ' ' + file + '")\nawait read(' + f + ')\nreturn await first' }] });
-  expect(out.results[0]!.text).not.toBe('stitched');
+  expect(out.results[0]!.text).toContain('refused: read: ' + file + ' changed while it was read in pages');
 });
 
 test('A forced patch edit in a short run whose read races a change retries and keeps the file counted as read', () => {
@@ -2968,3 +2968,19 @@ for (const [label, tools] of [['Read, Write and Edit', undefined], ['the patch t
     expect(readFileSync(decoy, 'utf8')).toBe('DECOY\n');
   });
 }
+
+test('A file read by its plain path can be written through a path that climbs out of a symlinked folder to it', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'w', 'B', 'other', 'deep'), { recursive: true });
+  mkdirSync(join(dir, 'w', 'B', 'real'), { recursive: true });
+  writeFileSync(join(dir, 'w', 'B', 'other', 'f.txt'), 'theirs\n');
+  const plain = join(dir, 'w', 'A', 'other', 'f.txt');
+  const climbing = join(dir, 'w', 'A', 'real', 'L') + '/../f.txt';
+  const out = run({ steps: [
+    { link: { from: join(dir, 'w', 'A'), to: join(dir, 'w', 'B') } },
+    { link: { from: join(dir, 'w', 'B', 'real', 'L'), to: join(dir, 'w', 'A', 'other', 'deep') } },
+    { script: 'await read(' + JSON.stringify(plain) + ')\ntry { await write(' + JSON.stringify(climbing) + ', "mine\\n"); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[0]!.text).toBe('wrote');
+  expect(readFileSync(join(dir, 'w', 'B', 'other', 'f.txt'), 'utf8')).toBe('mine\n');
+});

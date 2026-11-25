@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
@@ -2869,4 +2869,60 @@ test('A kill timer still waiting on a slow clock when the runner starts kills th
   const out = run({ clockNowDelayMs: 2000, env: { CODEMODE_NODE: shim }, steps: [{ script: '// @options: {"timeout_ms": 1000}\nwhile (true) {}', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
   expect(out.collected[0]).toContain('never yielded');
   expect(out.kills).toHaveLength(1);
+});
+
+test('A forced write and edit through Write and Edit in a two-second run read the file once and land', () => {
+  const dir = scratch();
+  const [w, e] = ['w.txt', 'e.txt'].map((n) => join(dir, n));
+  writeFileSync(w, 'original\n');
+  writeFileSync(e, 'original\n');
+  const out = run({ steps: [
+    { script: '// @options: {"timeout_ms": 2000}\ntry { await write(' + JSON.stringify(w) + ', "mine\\n", { force: true }); return "wrote" } catch (x) { return String(x.message) }' },
+    { script: '// @options: {"timeout_ms": 2000}\ntry { await edit(' + JSON.stringify(e) + ', "original", "mine", { force: true }); return "edited" } catch (x) { return String(x.message) }' },
+  ] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['wrote', 'edited']);
+  expect([readFileSync(w, 'utf8'), readFileSync(e, 'utf8')]).toEqual(['mine\n', 'mine\n']);
+});
+
+test('A forced write through Write in the last seconds of a run still lands', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const out = run({ steps: [{ script: '// @options: {"timeout_ms": 10000}\nawait waitFor(() => deadline() < 1500, { every: 50, timeout: 9000 })\ntry { await write(' + JSON.stringify(file) + ', "mine\\n", { force: true }); return "wrote" } catch (x) { return String(x.message) }' }] });
+  expect(out.results[0]!.text).toBe('wrote');
+  expect(readFileSync(file, 'utf8')).toBe('mine\n');
+});
+
+for (const [label, tools, op] of [['Write', undefined, 'write'], ['the patch tool', NO_BASH, 'write'], ['the patch tool', NO_BASH, 'edit']] as const) {
+  test('A forced ' + op + ' through ' + label + ' of a file that never stops changing fails within seconds and says so', () => {
+    const dir = scratch();
+    const file = join(dir, 'f.txt');
+    writeFileSync(file, 'original\n');
+    const f = JSON.stringify(file);
+    const call = op === 'write' ? 'await write(' + f + ', "mine\\n", { force: true })' : 'await edit(' + f + ', "original", "mine", { force: true })';
+    const churn = 'await sh("(i=0; while [ $i -lt 600 ]; do echo x >> ' + file + '; sleep 0.02; i=$((i+1)); done) >/dev/null 2>&1 &")\n';
+    const out = run({ ...(tools ? { tools: [...tools] } : {}), readDelayMs: 100, steps: [{ script: '// @options: {"timeout_ms": 30000}\n' + churn + 'try { ' + call + '; return "landed" } catch (x) { return String(x.message) }' }] });
+    expect(out.results[0]!.text).toContain('keeps changing while it is read');
+    expect(out.calls.filter((c) => c.tool === 'Read').length).toBeLessThanOrEqual(40);
+  });
+}
+
+test('A kill timer whose clock never answers still kills a spinning run within seconds', () => {
+  const out = run({ clockNowDelayMs: 30000, steps: [{ script: '// @options: {"timeout_ms": 1000}\nwhile (true) {}', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('never yielded');
+  expect(out.kills).toHaveLength(1);
+  const after = Number(/\[r1 \w+ after ([\d.]+)s\]/.exec(out.collected[0]!)?.[1]);
+  expect(after).toBeLessThan(15);
+});
+
+test('Two paged reads of one file in a run never stitch an old first page to a new second one', () => {
+  const dir = scratch();
+  const file = join(dir, 'big.txt');
+  const lines = (tag: string) => Array.from({ length: 2400 }, (_, n) => tag + ' ' + n).join('\n') + '\n';
+  writeFileSync(file, lines('old'));
+  const newer = join(dir, 'newer.txt');
+  writeFileSync(newer, lines('new'));
+  const f = JSON.stringify(file);
+  const out = run({ readLagMs: 400, steps: [{ script: 'const first = read(' + f + ').then((t) => (t.includes("old 0") && t.includes("new 2399") ? "stitched" : "clean"), (e) => "refused: " + e.message)\nawait sh("cp ' + newer + ' ' + file + '")\nawait read(' + f + ')\nreturn await first' }] });
+  expect(out.results[0]!.text).not.toBe('stitched');
 });

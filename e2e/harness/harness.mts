@@ -48,6 +48,7 @@ type Case = {
   changeAfterPage?: number
   rewriteDuringFirstRead?: string
   readDelayMs?: number
+  readLagMs?: number
   listThrows?: boolean
   detachAfterMs?: number
   slowWritesMs?: number
@@ -190,6 +191,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       const p = String(a.file_path ?? '').trim()
       if (!p.startsWith('/') || !existsSync(p)) return err('File does not exist. Note: your current working directory is ' + cwd + '.')
       const text = readFileSync(p, 'utf8')
+      if (c.readLagMs) await new Promise((r) => setTimeout(r, c.readLagMs))
       if (!text) return ok('<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>')
       const lines = text.split('\n').map((l) => l.replace(/\r$/, ''))
       const key = p + ':' + String(a.offset) + ':' + String(a.limit)

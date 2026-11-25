@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -54,7 +54,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -413,6 +413,26 @@ const handlers: Record<string, (...x: unknown[]) => Promise<unknown>> = Object.f
 let listing = true
 
 const registered: Record<string, unknown>[] = []
+const submitted: string[] = []
+const stops: string[] = []
+type Result = { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }
+const byRun = new Map<string, Result>()
+const SECTION = /^\[(r\d+) (?:finished|stopped) after [^\]\n]*\]$/gm
+const absorb = (text: string) => {
+  const heads = [...text.matchAll(SECTION)]
+  heads.forEach((m, i) => {
+    const r = byRun.get(m[1] as string)
+    if (!r) return
+    const from = (m.index ?? 0) + m[0].length + 1
+    const to = i + 1 < heads.length ? (heads[i + 1]!.index ?? text.length) : text.length
+    r.text = text.slice(from, to).replace(/\n\n$/, '')
+  })
+}
+let inTurn = false
+const until = async (check: () => boolean, ms: number) => {
+  const end = Date.now() + ms
+  while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 20))
+}
 let started = Date.now()
 const $ = {
   plugin: { root: join(root, 'codemode') },
@@ -487,10 +507,16 @@ const $ = {
         }
       })()
     },
-    run: async (argv: string[]) => {
-      const r = spawnSync(argv[0] as string, argv.slice(1), { encoding: 'utf8' })
-      return { exitCode: r.status ?? 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
-    },
+    run: (argv: string[]) =>
+      new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
+        const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
+        let stdout = ''
+        let stderr = ''
+        p.stdout.setEncoding('utf8').on('data', (t: string) => { stdout += t })
+        p.stderr.setEncoding('utf8').on('data', (t: string) => { stderr += t })
+        p.on('error', (e) => done({ exitCode: 127, stdout, stderr: stderr + String(e.message) }))
+        p.on('close', (code) => done({ exitCode: code ?? 1, stdout, stderr }))
+      }),
   },
   clock: {
     after: (ms: number, fn: () => void) => {
@@ -504,6 +530,13 @@ const $ = {
     delete: async (k: string) => { delete store[k] },
   },
   session: { version: async () => ({ version: '2.1.325' }) },
+  prompt: {
+    submit: async (a: { text: string }) => {
+      submitted.push(a.text)
+      absorb(a.text)
+      return { text: a.text, origin: { kind: 'plugin', name: 'codemode' } }
+    },
+  },
   model: { complete: async (r: { model: string; prompt: string }) => ({ isAnswered: true, text: 'answer from ' + r.model + ' to: ' + r.prompt.slice(0, 60) }) },
 }
 
@@ -515,7 +548,29 @@ const flatten = (r: unknown): { text: string; attachments: number } => {
   return { text: JSON.stringify(v), attachments: 0 }
 }
 
-const out: { description?: string; results: { text: string; attachments: number; ms: number }[]; calls: typeof calls; store: typeof store } = { results: [], calls, store }
+const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[] } = { results: [], calls, store, submitted, stops }
+const endTurn = async (agentId: string | undefined, interrupt: boolean) => {
+  const t0 = Date.now()
+  if (interrupt) {
+    const before = submitted.length
+    inTurn = false
+    await handlers['turn.complete']?.($, { turnId: 'turn' }, engine(async () => ({})))
+    await until(() => submitted.length > before, 30_000)
+    return Date.now() - t0
+  }
+  const hook = agentId ? handlers['classic.SubagentStop'] : handlers['classic.Stop']
+  const e = agentId ? { hook_event_name: 'SubagentStop', agent_id: agentId, stop_hook_active: false } : { hook_event_name: 'Stop', stop_hook_active: false, background_tasks: [] }
+  const r = (await hook?.($, e, engine(async () => ({})))) as { block?: string } | undefined
+  if (typeof r?.block === 'string') {
+    stops.push(r.block)
+    absorb(r.block)
+  }
+  if (!agentId) {
+    inTurn = false
+    await handlers['turn.complete']?.($, { turnId: 'turn' }, engine(async () => ({})))
+  }
+  return Date.now() - t0
+}
 const startSession = async () => {
   registered.length = 0
   await handlers['session.start']?.($, { cwd }, engine(async () => ({})))
@@ -532,9 +587,32 @@ for (const s of c.steps) {
     continue
   }
   if (s.newSession) { await startSession(); continue }
+  if (s.untilRunsDone) {
+    const runsDir = join(home, '.claude', 'codemode', 'runs')
+    await until(() => !existsSync(runsDir) || readdirSync(runsDir).length === 0, 60_000)
+    continue
+  }
+  if (s.stop) {
+    await endTurn(s.agentId, !!s.interrupt)
+    continue
+  }
   if (s.script !== undefined) {
-    const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: s.script }, engine(async () => ({})))
-    out.results.push({ ...flatten(r), ms: Date.now() - started })
+    if (!inTurn && !s.agentId) {
+      inTurn = true
+      await handlers['turn.start']?.($, { turnId: 'turn' }, engine(async () => ({})))
+    }
+    const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: s.script, ...(s.agentId ? { agentId: s.agentId } : {}) }, engine(async () => ({})))
+    const flat = flatten(r)
+    const result: Result = { ...flat, ms: Date.now() - started, immediate: flat.text, immediateMs: Date.now() - started }
+    const id = /^Started (r\d+) in the background/.exec(flat.text)?.[1]
+    absorb(flat.text)
+    if (id) {
+      result.id = id
+      byRun.set(id, result)
+    }
+    out.results.push(result)
+    if (!s.keepTurn) result.heldMs = await endTurn(s.agentId, !!s.interrupt)
+    result.ms = Date.now() - started
   } else if (s.direct) {
     const r = await handlers['tool.call']?.($, { tool: s.direct.tool, ...s.direct.args }, engine(async (e) => fake(String(e.tool), s.direct!.args)))
     out.results.push({ ...flatten(r), ms: Date.now() - started })

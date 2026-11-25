@@ -6,9 +6,9 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
 type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
-type Out = { description: string; results: { text: string; attachments: number; ms: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown> };
+type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[] };
 
 const made: string[] = [];
 test.afterAll(() => {
@@ -1754,4 +1754,52 @@ test('read() goes on past a page shorter than it asked for while Read says more 
   const f = join(scratch(), 'long.txt');
   writeFileSync(f, Array.from({ length: 3000 }, (_, i) => 'row ' + i).join('\n') + '\n');
   expect(one('return (await read(' + JSON.stringify(f) + ')).split("\\n").length', { tools: NO_BASH, shortPages: 700 })).toBe('3001');
+});
+
+test('A run answers at once while its command still runs, and ending the turn waits for it and hands back its output', () => {
+  const out = run({ steps: [{ script: 'const r = await sh("sleep 2; echo late-output")\nreturn String(r).trim()' }] });
+  const r = out.results[0]!;
+  expect(r.immediate).toMatch(/^Started r\d+ in the background/);
+  expect(r.immediate).not.toContain('late-output');
+  expect(r.immediateMs).toBeLessThan(1500);
+  expect(r.text).toBe('late-output');
+  expect(r.heldMs).toBeGreaterThanOrEqual(1500);
+});
+
+test('A run that finished before the next run comes back with that next run\'s reply, and ending the turn does not hand it back twice', () => {
+  const out = run({ steps: [{ script: 'return "first-output"', keepTurn: true }, { untilRunsDone: true }, { script: 'return "second-output"' }] });
+  expect(out.results[1]!.immediate).toContain('[' + out.results[0]!.id + ' finished after');
+  expect(out.results[0]!.text).toBe('first-output');
+  expect(out.results[1]!.text).toBe('second-output');
+  expect(out.stops).toHaveLength(1);
+  expect(out.stops[0]).not.toContain('first-output');
+});
+
+test('A subagent\'s turn end hands back only its own runs and does not wait for the main session\'s', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 3")\nreturn "main-output"', keepTurn: true }, { script: 'return "agent-output"', agentId: 'a1' }, { stop: true }] });
+  expect(out.results[1]!.text).toBe('agent-output');
+  expect(out.results[1]!.heldMs).toBeLessThan(2500);
+  expect(out.stops[0]).not.toContain('main-output');
+  expect(out.results[0]!.text).toBe('main-output');
+});
+
+test('jobs() lists the session\'s running runs and cancel(id) stops one, which comes back marked as cancelled', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 20; echo never-printed")\nreturn "unreached"', keepTurn: true }, { script: 'const list = await jobs()\nawait cancel(list[0].id)\nreturn list.map((j) => j.id + " " + j.state).join(",")' }, { stop: true }] });
+  expect(out.results[1]!.text).toBe(out.results[0]!.id + ' running');
+  expect(out.results[0]!.text).toContain('[cancelled]');
+  expect(out.results[0]!.text).not.toContain('never-printed');
+  expect(out.results[0]!.ms + out.results[1]!.ms).toBeLessThan(15000);
+});
+
+test('A run that finishes after its turn was interrupted wakes the session with its output', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 1")\nreturn "woke-with-this"', interrupt: true }] });
+  expect(out.submitted).toHaveLength(1);
+  expect(out.results[0]!.text).toBe('woke-with-this');
+});
+
+test('The run tool tells the model its runs go to the background and how their output comes back', () => {
+  const out = run({ steps: [] });
+  expect(out.description).toContain('Every run goes to the background');
+  expect(out.description).toContain('jobs()');
+  expect(out.description).toContain('cancel(id)');
 });

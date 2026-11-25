@@ -10,6 +10,7 @@ type Case = {
   writeDelayMs?: number
   statDelayMs?: number
   hangListMs?: number
+  hangListCount?: number
   surfaces?: string[]
   submitDelayMs?: number
   hangListDuringRuns?: boolean
@@ -448,6 +449,7 @@ let wakesSeen = 0
 let statsPending = 0
 let bashWaits = 0
 let listsHanging = 0
+let listsHung = 0
 let fakesPending = 0
 let lastActivity = Date.now()
 let wakeAttempts = 0
@@ -470,7 +472,7 @@ const $ = {
     list: async () => {
       if (!listing) throw new Error('$.tool.list failed')
       if (c.hangListDuringRuns && sessionStarted) await new Promise(() => {})
-      if (c.hangListMs && sessionStarted) {
+      if (c.hangListMs && sessionStarted && (c.hangListCount === undefined || listsHung++ < c.hangListCount)) {
         listsHanging++
         await new Promise((r) => setTimeout(r, c.hangListMs))
         listsHanging--

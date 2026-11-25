@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mode="${1:---full}"
+case "$mode" in --fast|--full) ;; *) echo "usage: ci/verify [--fast|--full]" >&2; exit 2 ;; esac
+(cd e2e && npm ci --silent && npx tsrs --noEmit -p .)
+for mod in codemode codemode-agents; do (cd "$mod" && claude plugin validate . >/dev/null && claude plugin test); done
+if [ "$mode" = "--full" ]; then (cd e2e && npx e2e run); fi
+echo "ci/verify $mode: passed"

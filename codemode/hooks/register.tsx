@@ -2404,6 +2404,8 @@ export const register: Register = (on) => {
   })
 
   on('classic.Stop', async ($, e, next) => {
+    const watched = (await $.session.surfaces().catch(() => [])).length > 0
+    if (watched) return next(e)
     const held = await holdTurn($, MAIN, (next as { signal?: AbortSignal }).signal)
     return withHeld(await next(e), held) as never
   }).catch(($, e, next) => next(e))

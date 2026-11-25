@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { surfaces?: string[]; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[] };
 
 const made: string[] = [];
@@ -1802,4 +1802,12 @@ test('The run tool tells the model its runs go to the background and how their o
   expect(out.description).toContain('Every run goes to the background');
   expect(out.description).toContain('jobs()');
   expect(out.description).toContain('cancel(id)');
+});
+
+test('In a session a person is watching, ending the turn does not wait for a run, and its output arrives as a new prompt when it finishes', () => {
+  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await sh("sleep 2")\nreturn "watched-output"' }] });
+  expect(out.results[0]!.heldMs).toBeLessThan(1000);
+  expect(out.stops).toHaveLength(0);
+  expect(out.submitted).toHaveLength(1);
+  expect(out.results[0]!.text).toBe('watched-output');
 });

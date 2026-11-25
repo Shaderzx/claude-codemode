@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 type Case = {
+  surfaces?: string[]
   tools?: string[]
   denied?: string[]
   home?: string
@@ -535,7 +536,7 @@ const $ = {
     set: async (k: string, v: unknown) => { store[k] = v },
     delete: async (k: string) => { delete store[k] },
   },
-  session: { version: async () => ({ version: '2.1.325' }) },
+  session: { version: async () => ({ version: '2.1.325' }), surfaces: async () => c.surfaces ?? [] },
   prompt: {
     submit: async (a: { text: string }) => {
       submitted.push(a.text)
@@ -564,6 +565,7 @@ const endTurn = async (agentId: string | undefined, interrupt: boolean) => {
     await until(() => submitted.length > before, 30_000)
     return Date.now() - t0
   }
+  const waking = submitted.length
   const hook = agentId ? handlers['classic.SubagentStop'] : handlers['classic.Stop']
   const e = agentId ? { hook_event_name: 'SubagentStop', agent_id: agentId, stop_hook_active: false } : { hook_event_name: 'Stop', stop_hook_active: false, background_tasks: [] }
   const r = (await hook?.($, e, engine(async () => ({})))) as { block?: string } | undefined
@@ -571,11 +573,13 @@ const endTurn = async (agentId: string | undefined, interrupt: boolean) => {
     stops.push(r.block)
     absorb(r.block)
   }
+  const stopped = Date.now() - t0
   if (!agentId) {
     inTurn = false
     await handlers['turn.complete']?.($, { turnId: 'turn' }, engine(async () => ({})))
+    if (c.surfaces?.length) await until(() => submitted.length > waking, 30_000)
   }
-  return Date.now() - t0
+  return stopped
 }
 const startSession = async () => {
   registered.length = 0

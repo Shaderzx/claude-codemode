@@ -683,6 +683,19 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     seen.add(file)
     return verb + ' ' + file
   }
+  const forcedRead = async (file) => {
+    for (let tries = 0; ; tries++) {
+      let text
+      try {
+        text = await read(file)
+      } catch (err) {
+        if (tries < 4 && /changed while it was read/i.test(String(err && err.message))) continue
+        throw err
+      }
+      const check = await req('fresh', { path: file })
+      if (typeof check.version === 'string' || tries >= 4) return { text, check }
+    }
+  }
   const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version } : {})
   const unreadWrite = (r) => !r.ok && !r.refused && !r.denied && UNREAD.test(String(r.error))
   const write = async (path, content, opts) => {
@@ -691,10 +704,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const force = !!(opts && typeof opts === 'object' && opts.force)
     if (usable('Write')) {
       let r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
-      if (unreadWrite(r)) {
-        if (!force && MOVED.test(String(r.error))) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
-        if (!force) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace it unread', r)
-        await read(file)
+      if (unreadWrite(r) && !force && MOVED.test(String(r.error))) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
+      if (unreadWrite(r) && !force) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace it unread', r)
+      for (let tries = 0; unreadWrite(r) && tries < 5; tries++) {
+        await forcedRead(file)
         r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
       }
       if (r.ok) return wrote(file)
@@ -727,13 +740,12 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       throw toolError('write: ' + r.error + endings(r.error), r)
     }
     for (let tries = 0; ; tries++) {
-      const now = await read(file)
+      const { text: now, check } = await forcedRead(file)
       if (!now) throw empty()
-      const check = await req('fresh', { path: file })
+      if (typeof check.version !== 'string') throw moved()
       r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
-      const readWhileChanging = typeof check.version !== 'string' && /not found/i.test(String(r.error))
-      if (tries >= 4 || !(unreadWrite(r) || readWhileChanging)) break
+      if (tries >= 4 || !unreadWrite(r)) break
     }
     throw toolError('write: ' + r.error + endings(r.error), r)
   }
@@ -746,10 +758,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (usable('Edit')) {
       const args = { file_path: file, old_string: String(from), new_string: String(to), ...(all ? { replace_all: true } : {}) }
       let r = await req('call', { tool: 'Edit', args })
-      if (unreadWrite(r)) {
-        if (!force && MOVED.test(String(r.error))) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
-        if (!force) throw unread(r)
-        await read(file)
+      if (unreadWrite(r) && !force && MOVED.test(String(r.error))) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
+      if (unreadWrite(r) && !force) throw unread(r)
+      for (let tries = 0; unreadWrite(r) && tries < 5; tries++) {
+        await forcedRead(file)
         r = await req('call', { tool: 'Edit', args })
       }
       if (r.ok) return wrote(file, 'edited')
@@ -762,14 +774,12 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let check = await req('fresh', { path: file })
     if (!check.read || check.fresh === false) {
       if (!force) throw check.read ? moved() : unread()
-      await read(file)
-      check = await req('fresh', { path: file })
+      check = (await forcedRead(file)).check
     }
     const args = { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }
     let r = await req('call', { tool: patch, args, ...guardOf(check) })
     for (let tries = 0; force && unreadWrite(r) && tries < 4; tries++) {
-      await read(file)
-      r = await req('call', { tool: patch, args, ...guardOf(await req('fresh', { path: file })) })
+      r = await req('call', { tool: patch, args, ...guardOf((await forcedRead(file)).check) })
     }
     if (r.ok) return wrote(file, 'edited')
     if (unreadWrite(r)) throw moved(r)
@@ -2371,7 +2381,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (target) {
         const parent = head.slice(0, head.lastIndexOf('/')) || '/'
         const base = target.startsWith('/') ? '' : ((await realpath(parent)) ?? parent).replace(/\/$/, '') + '/'
-        return { done: false, path: normal(base + target + missing) }
+        return { done: false, path: (base + target + missing).replace(/\/(?:\.?\/)+/g, '/') }
       }
       const slash = head.lastIndexOf('/')
       if (slash <= 0) return { done: true, path: p }
@@ -2475,7 +2485,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   // the mod kills it a little after the deadline.
   let gone = false
   const killRunner = () => {
-    if (gone) return
     killed = true
     if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
   }

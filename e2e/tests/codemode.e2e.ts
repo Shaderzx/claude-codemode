@@ -2346,8 +2346,13 @@ test('A spill clean-up never deletes saved outputs another session wrote in the 
     const at = (Date.now() - (i + 1) * 1000) / 1000;
     utimesSync(p, at, at);
   });
+  const stale = join(spills, 'other-session-stale.txt');
+  writeFileSync(stale, 'stale');
+  const old = (Date.now() - 3 * 86_400_000) / 1000;
+  utimesSync(stale, old, old);
   run({ home: dir, cwd: dir, steps: [{ script: 'return "S".repeat(30000)' }] });
   expect(theirs.filter((p) => !existsSync(p))).toEqual([]);
+  expect(existsSync(stale)).toBe(false);
 });
 
 test('A run that works until its time is up makes no tool call after it', () => {
@@ -2527,4 +2532,49 @@ test('A run\'s own older page bookmark never hides a newer one another run broug
   expect(out.collected.join('')).toContain('[r1 finished after');
   expect(out.collected.join('')).toContain('wrote');
   expect(readFileSync(file, 'utf8')).toBe('new\n');
+});
+
+test('Two runs editing one file through the patch tool at once never both pass the read check', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const [a, b, go] = ['a-read', 'b-read', 'go'].map((n) => join(dir, n));
+  const editor = (from: string, to: string, marker: string) => 'await read(' + f + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await edit(' + f + ', "' + from + '", "' + to + '"); return "edited" } catch (e) { return String(e.message) }';
+  const out = run({ tools: NO_BASH, statDelayMs: 250, steps: [{ script: editor('alpha', 'ALPHA', a), keepTurn: true }, { script: editor('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const texts = [out.results[0]!.text, out.results[1]!.text];
+  expect(texts.filter((x) => x === 'edited')).toHaveLength(1);
+  expect(texts.find((x) => x !== 'edited')).toContain('changed since this session read it');
+  expect(readFileSync(file, 'utf8')).toBe(texts[0] === 'edited' ? 'ALPHA\nbeta\n' : 'alpha\nBETA\n');
+});
+
+test('Two runs writing one file through the patch tool at once never both write it', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const f = JSON.stringify(file);
+  const [a, b, go] = ['a-read', 'b-read', 'go'].map((n) => join(dir, n));
+  const writer = (mine: string, marker: string) => 'await read(' + f + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await write(' + f + ', "' + mine + '\\n"); return "wrote" } catch (e) { return String(e.message) }';
+  const out = run({ tools: NO_BASH, statDelayMs: 250, steps: [{ script: writer('from-a', a), keepTurn: true }, { script: writer('from-b', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const texts = [out.results[0]!.text, out.results[1]!.text];
+  expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
+  expect(texts.find((x) => x !== 'wrote')).toContain('changed since this session read it');
+  expect(readFileSync(file, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
+});
+
+test('A load at the very end of a run returns the stored value or ends the run as timed out, never an empty value', () => {
+  const out = run({ store: { 'script:k': 'saved-value' }, steps: [{ script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 25) {}\nconst v = await load("k")\nreturn "loaded=" + String(v)', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).not.toContain('loaded=undefined');
+  expect(out.collected[0]).toMatch(/loaded=saved-value|\[timeout\]/);
+});
+
+test('A helper called once the time is up ends the run as timed out', () => {
+  const out = run({ steps: [{ script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 0) {}\nawait sh("echo late")\nreturn 1', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('[timeout]');
+  expect(out.collected[0]).not.toContain('[tool]');
+});
+
+test('A run that exits after a call refused for time still comes back timed out', () => {
+  const out = run({ steps: [{ script: '// @options: {"timeout_ms": 1500}\nwhile (deadline() > 0) {}\nconst r = await call("Bash", { command: "echo late" })\nif (!r.ok) exit()\nreturn 1', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('[timeout]');
 });

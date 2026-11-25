@@ -1623,6 +1623,8 @@ type Job = {
   reads: Map<string, string | undefined>
   progress: Map<string, { next: number; version?: string }>
   gen: number
+  pidKnown: Promise<void>
+  onPid: () => void
   done: Promise<void>
 }
 const MAIN = 'main'
@@ -1636,7 +1638,8 @@ let waking = false
 export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string, timeout: number): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), progress: new Map(), gen: sessionGen, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), progress: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  job.pidKnown = new Promise<void>((r) => (job.onPid = r))
   jobsById.set(job.id, job)
   return job
 }
@@ -1656,7 +1659,7 @@ const running = (asker: Job) =>
   openJobs(asker.agent)
     .filter((j) => j !== asker)
     .map((j) => ({ id: j.id, state: j.exited ? 'finishing' : 'running', seconds: Math.round((Date.now() - j.started) / 1000) }))
-const REPLY_ROOM = DEFAULT_MAX_CHARS - 600
+const LATER_ROOM = 300
 const promoteReads = (j: Job) => {
   if (j.stopped || j.gen !== sessionGen) return
   for (const [p, v] of j.reads) {
@@ -1669,7 +1672,7 @@ const promoteReads = (j: Job) => {
   while (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
   while (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
 }
-const deliver = (agent: string): { text: string; blocks: { type: string }[] } => {
+const deliver = (agent: string, room: number): { text: string; blocks: { type: string }[] } => {
   const texts: string[] = []
   const blocks: { type: string }[] = []
   const later: string[] = []
@@ -1677,7 +1680,7 @@ const deliver = (agent: string): { text: string; blocks: { type: string }[] } =>
   for (const j of readyJobs(agent)) {
     const attached = j.blocks.length ? `, ${j.blocks.length} attachment${j.blocks.length === 1 ? '' : 's'}` : ''
     const section = `[${j.id} ${j.stopped ? 'stopped' : 'finished'} after ${seconds(j.ms)}${attached}]\n${j.text}`
-    if (later.length || (texts.length && (used + section.length > REPLY_ROOM || blocks.length + j.blocks.length > MAX_PICTURES))) {
+    if (later.length || (texts.length && (used + section.length > room || blocks.length + j.blocks.length > MAX_PICTURES))) {
       later.push(j.id)
       j.noticed = false
       continue
@@ -1691,22 +1694,24 @@ const deliver = (agent: string): { text: string; blocks: { type: string }[] } =>
     deliveredIds.set(j.id, j.agent)
     if (deliveredIds.size > 500) deliveredIds.delete(deliveredIds.keys().next().value as string)
   }
-  if (later.length) texts.push(`${later.join(', ')} finished too; ${later.length === 1 ? 'its' : 'their'} output comes with the reply to your next run (an empty script fetches it).`)
+  if (later.length) texts.push(`${later.slice(0, NAMED).join(', ')}${later.length > NAMED ? ` and ${later.length - NAMED} more` : ''} finished too; ${later.length === 1 ? 'its' : 'their'} output comes with the reply to your next run (an empty script fetches it).`)
   return { text: texts.join('\n\n'), blocks }
 }
+const NAMED = 9
 const stillRunning = (agent: string, except?: Job) => {
   const others = openJobs(agent).filter((j) => j !== except)
-  return others.length ? ` Still running: ${others.map((j) => `${j.id} (${seconds(Date.now() - j.started)})`).join(', ')}.` : ''
+  const more = others.length > NAMED ? ` and ${others.length - NAMED} more` : ''
+  return others.length ? ` Still running: ${others.slice(0, NAMED).map((j) => `${j.id} (${seconds(Date.now() - j.started)})`).join(', ')}${more}.` : ''
 }
 const withBlocks = (text: string, blocks: { type: string }[]): RunResult => (blocks.length ? [{ type: 'text', text }, ...blocks] : text)
 const startedReply = (job: Job): RunResult => {
-  const still = stillRunning(job.agent, job)
-  const finished = deliver(job.agent)
-  return withBlocks(`Started ${job.id} in the background.${still}${finished.text ? `\n\n${finished.text}` : ''}`, finished.blocks)
+  const head = `Started ${job.id} in the background.${stillRunning(job.agent, job)}`
+  const finished = deliver(job.agent, DEFAULT_MAX_CHARS - head.length - LATER_ROOM)
+  return withBlocks(`${head}${finished.text ? `\n\n${finished.text}` : ''}`, finished.blocks)
 }
 const collectReply = (agent: string): RunResult => {
-  const finished = deliver(agent)
   const still = stillRunning(agent).trim()
+  const finished = deliver(agent, DEFAULT_MAX_CHARS - still.length - LATER_ROOM - 200)
   const advice = still ? ` ${still} If you need their output before you can go on, end your turn: a notice comes when they finish, so do not call again to check.` : ''
   return withBlocks(finished.text ? `${finished.text}${still ? `\n\n${still}` : ''}` : `No run has finished output waiting.${advice}`, finished.blocks)
 }
@@ -1741,7 +1746,7 @@ const stopJobs = async ($: Dollar, jobs: Job[], by: string, kind: 'cancelled' | 
   await Promise.all(pids.map((p) => $.process.run(['kill', '-9', String(p)]).catch(() => undefined)))
   return stopping.length
 }
-const RUNNERS_GONE = 'S=$1; shift; if [ "$#" = 0 ]; then sleep 0.1; rm -f "$S"; exit 0; fi; for i in $(seq 25); do if [ -e "$S" ]; then rm -f "$S"; exit 0; fi; alive=0; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done; if [ "$alive" = 0 ]; then exit 0; fi; sleep 0.2; done'
+const RUNNERS_GONE = 'S=$1; N=$2; shift 2; for i in $(seq "$N"); do if [ -e "$S" ]; then rm -f "$S"; exit 0; fi; if [ "$#" -gt 0 ]; then alive=0; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done; if [ "$alive" = 0 ]; then exit 0; fi; fi; sleep 0.2; done'
 const holdTurn = async ($: Dollar, agent: string, signal: AbortSignal | undefined): Promise<Job[]> => {
   const aborted = new Promise<void>((r) => signal?.addEventListener('abort', () => r(), { once: true }))
   const home = (await $.env.get('HOME')) || '/tmp'
@@ -1749,19 +1754,27 @@ const holdTurn = async ($: Dollar, agent: string, signal: AbortSignal | undefine
   for (let round = 0; ; round++) {
     for (const j of openJobs(agent))
       if (!j.pid && !j.exited && Date.now() > j.deadline) {
-        settle(j, format(Date.now() - j.started, { items: [], logs: [], kind: 'runner', failure: 'the run never started its runner within its time; none of its tool calls ran.' }))
+        j.cancelledBy = 'its start deadline'
+        j.stopKind = 'cancelled'
+        settle(j, format(Date.now() - j.started, { items: [], logs: [], kind: 'runner', failure: 'the run never started its runner within its time; none of its tool calls ran, and it will not start now.' }))
         j.exited = true
       }
     const open = openJobs(agent)
     if (!open.length || signal?.aborted || failures >= 3) break
     const pids = open.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
-    const stopFile = `${home}/.claude/codemode/holds/${Date.now().toString(36)}-${round}-${Math.random().toString(36).slice(2, 8)}`
-    const pause = $.process.run(['bash', '-c', RUNNERS_GONE, 'runners', stopFile, ...pids.map(String)], { timeoutMs: 30_000 }).then((r) => r.exitCode === 0, () => false)
+    const waitingForPid = open.filter((j) => !j.pid && !j.exited)
+    const stopFile = `${home}/.claude/codemode/runs/hold-${Date.now().toString(36)}-${round}-${Math.random().toString(36).slice(2, 8)}`
+    const untilDeadline = waitingForPid.length ? Math.min(...waitingForPid.map((j) => j.deadline)) - Date.now() : 5_000
+    const ticks = Math.max(1, Math.min(25, Math.ceil(untilDeadline / 200)))
+    const pause = $.process.run(['bash', '-c', RUNNERS_GONE, 'runners', stopFile, String(ticks), ...pids.map(String)], { timeoutMs: 30_000 }).then((r) => r.exitCode === 0, () => false)
     const settled = Promise.all(open.map((j) => j.done)).then(() => 'settled' as const)
-    const first = await Promise.race([settled, pause.then((ok) => (ok ? ('paused' as const) : ('failed' as const))), aborted.then(() => 'aborted' as const)])
+    const started = waitingForPid.length ? Promise.race(waitingForPid.map((j) => j.pidKnown)).then(() => 'started' as const) : new Promise<never>(() => undefined)
+    const first = await Promise.race([settled, started, pause.then((ok) => (ok ? ('paused' as const) : ('failed' as const))), aborted.then(() => 'aborted' as const)])
     failures = first === 'failed' ? failures + 1 : 0
-    if (first === 'aborted') await $.fs.write(stopFile, '').catch(() => undefined)
-    if (first !== 'paused' && first !== 'failed') await pause
+    if (first === 'paused' || first === 'failed') continue
+    await $.fs.write(stopFile, '').catch(() => undefined)
+    await pause
+    await $.process.run(['rm', '-f', stopFile]).catch(() => undefined)
   }
   if (signal?.aborted) return []
   return readyJobs(agent).filter((j) => !j.noticed && !j.quiet)
@@ -1980,7 +1993,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const alt = wants.length === 1 && fits(wants[0] as string) ? wants[0] : undefined
       if (!alt) return { ok: false, error: plain, refused: true }
       if (!deniedTools.has(tool)) {
-        deniedTools.set(tool, { alt, at: Date.now() })
+        if (job.gen === sessionGen) deniedTools.set(tool, { alt, at: Date.now() })
         await saveDenied()
       }
       return { ok: false, error: `${plain}\n${tool} is denied by a hook in this session; use tools.${ident(alt)}({...}) instead.`, denied: true, alt }
@@ -2301,6 +2314,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (pid === undefined) {
           pid = Number.isSafeInteger(m.pid) && (m.pid as number) > 1 ? m.pid : 0
           job.pid = pid || undefined
+          job.onPid()
           if ((killed || job.cancelledBy) && pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
           continue
         }
@@ -2452,7 +2466,7 @@ export const register: Register = (on) => {
     readPaths.clear()
     readProgress.clear()
     readVersions.clear()
-        failedScripts.clear()
+    failedScripts.clear()
     for (const [n, v] of Object.entries(kept && typeof kept === 'object' ? kept : {}))
       if (v && Date.now() - Number(v.at ?? 0) < DENIED_MS && (names.size === 0 || (typeof v.alt === 'string' && names.has(v.alt)))) deniedTools.set(n, { alt: v.alt, at: Number(v.at) })
     await $.tool.register({

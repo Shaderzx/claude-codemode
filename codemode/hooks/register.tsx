@@ -1424,7 +1424,7 @@ const infoOf = (result: unknown): FileInfo | undefined => {
 }
 const reachesEnd = (info: FileInfo | undefined) =>
   !!info && typeof info.startLine === 'number' && typeof info.numLines === 'number' && typeof info.totalLines === 'number' && info.startLine + info.numLines - 1 >= info.totalLines
-const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, version: string | undefined, chain: { next: number; version?: string } | undefined): Receipt | undefined => {
+const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, version: string | undefined, chains: ({ next: number; version?: string } | undefined)[]): Receipt | undefined => {
   if (version === undefined) return undefined
   if (isStub(text)) return undefined
   const info = infoOf(result)
@@ -1432,7 +1432,7 @@ const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, 
   const rows = text.split('\n').filter((l) => /^\s*\d+\t/.test(l)).length
   if (!rows && !NOTICE.test(text)) return undefined
   const from = typeof offset === 'number' ? offset : 1
-  if (from !== 1 && (!chain || chain.next !== from || chain.version !== version)) return undefined
+  if (from !== 1 && !chains.some((c) => c?.next === from && c.version === version)) return undefined
   if (!rows) return { file, whole: true, version }
   if (!info || rows !== info.numLines) return undefined
   return reachesEnd(info) ? { file, whole: true, version } : { file, whole: false, next: from + rows, version }
@@ -2164,7 +2164,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       const receipt =
         tool === 'Read' && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined, job.progress.get(args.file_path) ?? readProgress.get(args.file_path))
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined, [job.progress.get(args.file_path), readProgress.get(args.file_path)])
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
             : undefined
@@ -2303,11 +2303,15 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const pictures: Picture[] = []
   const realpath = (p: string) => $.process.run(['realpath', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : undefined), () => undefined)
   const realOf = async (p: string) => {
-    const whole = await realpath(p)
-    if (whole) return whole
-    const slash = p.lastIndexOf('/')
-    const folder = slash > 0 ? await realpath(p.slice(0, slash)) : undefined
-    return folder ? folder.replace(/\/$/, '') + p.slice(slash) : p
+    let missing = ''
+    for (let head = p; ; ) {
+      const found = await realpath(head)
+      if (found) return found.replace(/\/$/, '') + missing
+      const slash = head.lastIndexOf('/')
+      if (slash <= 0) return p
+      missing = head.slice(slash) + missing
+      head = head.slice(0, slash)
+    }
   }
   const respond = async (m: Request) => {
     let out: Record<string, unknown>
@@ -2328,27 +2332,34 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const receipt = out[READ as never] as Receipt | undefined
     let undo: (() => void) | undefined
     if (receipt) {
-      const had = job.reads.has(receipt.file)
-      const before = job.reads.get(receipt.file)
-      const beforeAt = job.readAt.get(receipt.file)
-      const progress = job.progress.get(receipt.file)
-      const after = receipt.whole ? receipt.version : before
-      undo = () => {
-        if (job.reads.get(receipt.file) !== after) return
-        if (had) job.reads.set(receipt.file, before)
-        else job.reads.delete(receipt.file)
-        if (beforeAt === undefined) job.readAt.delete(receipt.file)
-        else job.readAt.set(receipt.file, beforeAt)
-        if (progress === undefined) job.progress.delete(receipt.file)
-        else job.progress.set(receipt.file, progress)
+      const f = receipt.file
+      const stamp = ++readClock
+      const read = { had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f) }
+      const page = { value: job.progress.get(f), at: job.progressAt.get(f) }
+      const restorePage = () => {
+        if (page.value === undefined) job.progress.delete(f)
+        else job.progress.set(f, page.value)
+        if (page.at === undefined) job.progressAt.delete(f)
+        else job.progressAt.set(f, page.at)
       }
       if (receipt.whole) {
-        job.progress.delete(receipt.file)
-        job.reads.set(receipt.file, receipt.version)
-        job.readAt.set(receipt.file, ++readClock)
+        job.progress.delete(f)
+        job.reads.set(f, receipt.version)
+        job.readAt.set(f, stamp)
+        undo = () => {
+          if (job.readAt.get(f) !== stamp) return
+          if (read.had) job.reads.set(f, read.value)
+          else job.reads.delete(f)
+          if (read.at === undefined) job.readAt.delete(f)
+          else job.readAt.set(f, read.at)
+          if (!job.progress.has(f)) restorePage()
+        }
       } else if (receipt.next !== undefined) {
-        job.progress.set(receipt.file, { next: receipt.next, version: receipt.version })
-        job.progressAt.set(receipt.file, ++readClock)
+        job.progress.set(f, { next: receipt.next, version: receipt.version })
+        job.progressAt.set(f, stamp)
+        undo = () => {
+          if (job.progressAt.get(f) === stamp) restorePage()
+        }
       }
     }
     // Tracked whole, fallbacks included, so the run dir is removed only after it.
@@ -2656,6 +2667,7 @@ export const register: Register = (on) => {
     const agent = agentOf((e as { agentId?: unknown }).agentId)
     const turnId = String((e as { turnId?: unknown }).turnId ?? '') || undefined
     const seq = turnSeq
+    const current = !mainTurnId || !turnId || turnId === mainTurnId
     try {
       return await next(e)
     } finally {
@@ -2667,9 +2679,8 @@ export const register: Register = (on) => {
           jobsById.delete(j.id)
         }
       } else {
-        const current = !mainTurnId || !turnId || turnId === mainTurnId
         if ((e as { isAborted?: unknown }).isAborted === true) {
-          const jobs = agentJobs(MAIN).filter((j) => (turnId ? j.turnId === turnId : current && j.turnSeq === turnSeq))
+          const jobs = agentJobs(MAIN).filter((j) => (turnId ? j.turnId === turnId : current && j.turnSeq === seq))
           for (const j of jobs) j.quiet = true
           await stopJobs($, jobs, 'the interrupt', 'aborted')
         }

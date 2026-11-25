@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 
 type Case = {
   surfaces?: string[]
+  submitRefusals?: number
   tools?: string[]
   denied?: string[]
   home?: string
@@ -55,7 +56,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -382,6 +383,8 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
     }
     case 'mcp__t3-code__big_report':
       return ok('x'.repeat(2_100_000), { structuredContent: { data: 'y'.repeat(2_100_000) } })
+    case 'mcp__shots__snap':
+      return { text: '', result: { type: 'image', file: { base64: 'QUJDREVG', type: 'image/png', originalSize: 6 } } }
     case 'mcp__other__git_patch':
       return err('git_patch must never be chosen by write() or edit()')
     case 'mcp__aaa-ssh__remote_shell':
@@ -430,6 +433,10 @@ const absorb = (text: string) => {
   })
 }
 let inTurn = false
+let wakeAttempts = 0
+let refusals = c.submitRefusals ?? 0
+const kills: string[][] = []
+const waits = new Set<number>()
 let runsStarted = 0
 let runsCleaned = 0
 const until = async (check: () => boolean, ms: number) => {
@@ -487,6 +494,11 @@ const $ = {
     spawn: ({ argv, input }: { argv: string[]; input?: string }) => {
       if (argv.includes('--permission')) runsStarted++
       const child = spawn(argv[0] as string, argv.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
+      const runner = argv.includes('--permission')
+      if (!runner && child.pid) {
+        waits.add(child.pid)
+        child.on('close', () => waits.delete(child.pid as number))
+      }
       child.stdin.end(input ?? '')
       const queue: { stream: string; text: string }[] = []
       let wake: (() => void) | undefined
@@ -497,6 +509,7 @@ const $ = {
       child.on('error', (e) => { queue.push({ stream: 'stderr', text: String(e.message) }); ended = true; wake?.() })
       const abortAt = c.abortAfterMs === undefined ? undefined : started + c.abortAfterMs
       return (async function* () {
+        try {
         while (true) {
           if (abortAt !== undefined && Date.now() >= abortAt) {
             child.kill('SIGKILL')
@@ -509,11 +522,18 @@ const $ = {
           await new Promise<void>((r) => { wake = r; setTimeout(r, 20) })
           wake = undefined
         }
+        } finally {
+          if (!ended && !runner) child.kill('SIGKILL')
+        }
       })()
     },
     run: (argv: string[]) =>
-      new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
+      (argv[0] === 'kill' ? kills.push([...argv]) : 0, new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
         const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
+        if (argv[0] === 'sleep' && p.pid) {
+          waits.add(p.pid)
+          p.on('close', () => waits.delete(p.pid as number))
+        }
         let stdout = ''
         let stderr = ''
         p.stdout.setEncoding('utf8').on('data', (t: string) => { stdout += t })
@@ -523,7 +543,7 @@ const $ = {
           if (argv[0] === 'rm' && argv.some((a) => a.includes('/codemode/runs/'))) runsCleaned++
           done({ exitCode: code ?? 1, stdout, stderr })
         })
-      }),
+      })),
   },
   clock: {
     after: (ms: number, fn: () => void) => {
@@ -539,8 +559,12 @@ const $ = {
   session: { version: async () => ({ version: '2.1.325' }), surfaces: async () => c.surfaces ?? [] },
   prompt: {
     submit: async (a: { text: string }) => {
+      wakeAttempts++
+      if (refusals > 0) {
+        refusals--
+        throw new Error('prompt.submit refused')
+      }
       submitted.push(a.text)
-      absorb(a.text)
       return { text: a.text, origin: { kind: 'plugin', name: 'codemode' } }
     },
   },
@@ -555,29 +579,43 @@ const flatten = (r: unknown): { text: string; attachments: number } => {
   return { text: JSON.stringify(v), attachments: 0 }
 }
 
-const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[] } = { results: [], calls, store, submitted, stops }
+const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number } = { results: [], calls, store, submitted, stops, collected: [], collectedAttachments: [], kills, waitsAlive: 0, wakeAttempts: 0 }
+const collect = async (agentId?: string) => {
+  const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: '', ...(agentId ? { agentId } : {}) }, engine(async () => ({})))
+  const flat = flatten(r)
+  out.collected.push(flat.text)
+  out.collectedAttachments.push(flat.attachments)
+  absorb(flat.text)
+  return flat
+}
 const endTurn = async (agentId: string | undefined, interrupt: boolean) => {
   const t0 = Date.now()
   if (interrupt) {
-    const before = submitted.length
     inTurn = false
-    await handlers['turn.complete']?.($, { turnId: 'turn' }, engine(async () => ({})))
-    await until(() => submitted.length > before, 30_000)
+    await handlers['turn.complete']?.($, { turnId: 'turn', isAborted: true }, engine(async () => ({})))
     return Date.now() - t0
   }
-  const waking = submitted.length
+  const waking = wakeAttempts
   const hook = agentId ? handlers['classic.SubagentStop'] : handlers['classic.Stop']
   const e = agentId ? { hook_event_name: 'SubagentStop', agent_id: agentId, stop_hook_active: false } : { hook_event_name: 'Stop', stop_hook_active: false, background_tasks: [] }
   const r = (await hook?.($, e, engine(async () => ({})))) as { block?: string } | undefined
   if (typeof r?.block === 'string') {
     stops.push(r.block)
     absorb(r.block)
+    if (/empty script/.test(r.block)) {
+      await collect(agentId)
+      const again = (await hook?.($, { ...e, stop_hook_active: true }, engine(async () => ({})))) as { block?: string } | undefined
+      if (typeof again?.block === 'string') stops.push(again.block)
+    }
   }
   const stopped = Date.now() - t0
   if (!agentId) {
     inTurn = false
     await handlers['turn.complete']?.($, { turnId: 'turn' }, engine(async () => ({})))
-    if (c.surfaces?.length) await until(() => submitted.length > waking, 30_000)
+    if (c.surfaces?.length) {
+      await until(() => wakeAttempts > waking, 30_000)
+      if (submitted.length && /empty script/.test(submitted.at(-1) as string)) await collect()
+    }
   }
   return stopped
 }
@@ -603,6 +641,27 @@ for (const s of c.steps) {
   }
   if (s.stop) {
     await endTurn(s.agentId, !!s.interrupt)
+    continue
+  }
+  if (s.collect) {
+    await collect(s.agentId)
+    continue
+  }
+  if (s.agentEnd) {
+    await handlers['turn.complete']?.($, { turnId: 'agent-turn', agentId: s.agentEnd }, engine(async () => ({})))
+    continue
+  }
+  if (s.subagentStopWithoutId) {
+    const r = (await handlers['classic.SubagentStop']?.($, { hook_event_name: 'SubagentStop', stop_hook_active: false }, engine(async () => ({})))) as { block?: string } | undefined
+    stops.push(String(r?.block ?? ''))
+    continue
+  }
+  if (s.untilTool) {
+    await until(() => calls.some((x) => x.tool === s.untilTool), 30_000)
+    continue
+  }
+  if (s.touch) {
+    writeFileSync(s.touch, '')
     continue
   }
   if (s.script !== undefined) {
@@ -633,4 +692,6 @@ for (const s of c.steps) {
     out.results.push({ text: String((r as { description?: string })?.description ?? ''), attachments: 0, ms: 0 })
   }
 }
+out.waitsAlive = waits.size
+out.wakeAttempts = wakeAttempts
 process.stdout.write(JSON.stringify(out), () => process.exit(0))

@@ -6,9 +6,9 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { surfaces?: string[]; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
-type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[] };
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Case = { surfaces?: string[]; submitRefusals?: number; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number };
 
 const made: string[] = [];
 test.afterAll(() => {
@@ -1756,58 +1756,150 @@ test('read() goes on past a page shorter than it asked for while Read says more 
   expect(one('return (await read(' + JSON.stringify(f) + ')).split("\\n").length', { tools: NO_BASH, shortPages: 700 })).toBe('3001');
 });
 
-test('A run answers at once while its command still runs, and ending the turn waits for it and hands back its output', () => {
+test('A run answers at once with its id while its command still runs, and its output comes back after the turn ends', () => {
   const out = run({ steps: [{ script: 'const r = await sh("sleep 2; echo late-output")\nreturn String(r).trim()' }] });
   const r = out.results[0]!;
-  expect(r.immediate).toMatch(/^Started r\d+ in the background/);
-  expect(r.immediate).not.toContain('late-output');
-  expect(r.immediateMs).toBeLessThan(1500);
+  expect(r.immediate).toMatch(/^Started r\d+ in the background\.$/);
   expect(r.text).toBe('late-output');
-  expect(r.heldMs).toBeGreaterThanOrEqual(1500);
 });
 
-test('A run that finished before the next run comes back with that next run\'s reply, and ending the turn does not hand it back twice', () => {
+test('Ending the turn hands back only a notice naming the finished runs, and their output comes back as the reply to an empty-script run', () => {
+  const out = run({ steps: [{ script: 'return "secret-tool-text"' }] });
+  const id = out.results[0]!.id!;
+  expect(out.stops[0]).toContain(id);
+  expect(out.stops[0]).toContain('empty script');
+  expect(out.stops[0]).not.toContain('secret-tool-text');
+  expect(out.collected[0]).toContain('[' + id + ' finished after');
+  expect(out.results[0]!.text).toBe('secret-tool-text');
+});
+
+test('An empty script starts no run and says when nothing has finished yet', () => {
+  const out = run({ steps: [{ collect: true }] });
+  expect(out.collected[0]).toBe('No run has finished output waiting.');
+});
+
+test('A run that finished before the next run comes back with that next run\'s reply, and only once', () => {
   const out = run({ steps: [{ script: 'return "first-output"', keepTurn: true }, { untilRunsDone: true }, { script: 'return "second-output"' }] });
   expect(out.results[1]!.immediate).toContain('[' + out.results[0]!.id + ' finished after');
   expect(out.results[0]!.text).toBe('first-output');
   expect(out.results[1]!.text).toBe('second-output');
-  expect(out.stops).toHaveLength(1);
-  expect(out.stops[0]).not.toContain('first-output');
+  expect(out.collected.join('\n')).not.toContain('first-output');
 });
 
 test('A subagent\'s turn end hands back only its own runs and does not wait for the main session\'s', () => {
-  const out = run({ steps: [{ script: 'await sh("sleep 3")\nreturn "main-output"', keepTurn: true }, { script: 'return "agent-output"', agentId: 'a1' }, { stop: true }] });
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const out = run({ steps: [{ script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "main-output"', keepTurn: true }, { script: 'return "agent-output"', agentId: 'a1' }, { touch: gate }, { stop: true }] });
   expect(out.results[1]!.text).toBe('agent-output');
-  expect(out.results[1]!.heldMs).toBeLessThan(2500);
-  expect(out.stops[0]).not.toContain('main-output');
+  expect(out.stops[0]).not.toContain(out.results[0]!.id!);
   expect(out.results[0]!.text).toBe('main-output');
 });
 
-test('jobs() lists the session\'s running runs and cancel(id) stops one, which comes back marked as cancelled', () => {
-  const out = run({ steps: [{ script: 'await sh("sleep 20; echo never-printed")\nreturn "unreached"', keepTurn: true }, { script: 'const list = await jobs()\nawait cancel(list[0].id)\nreturn list.map((j) => j.id + " " + j.state).join(",")' }, { stop: true }] });
+test('A subagent\'s runs still going when its turn ends are stopped and never handed to anyone', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 60")\nreturn "agent-late"', agentId: 'a1', keepTurn: true }, { untilTool: 'Bash' }, { agentEnd: 'a1' }, { untilRunsDone: true }, { script: 'return "main"' }] });
+  expect(out.kills).toHaveLength(1);
+  expect(out.results[1]!.immediate).not.toContain('agent-late');
+  expect(out.results[1]!.immediate).not.toContain(out.results[0]!.id! + ' ');
+});
+
+test('A subagent stop with no agent id holds nothing', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 60")\nreturn 1', agentId: 'a1', keepTurn: true }, { subagentStopWithoutId: true }] });
+  expect(out.stops[0]).toBe('');
+});
+
+test('jobs() lists the caller\'s runs still going, and cancel(id) stops one, which comes back marked as cancelled', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 20; echo never-printed")\nreturn "unreached"', keepTurn: true }, { untilTool: 'Bash' }, { script: 'const list = await jobs()\nawait cancel(list[0].id)\nreturn list.map((j) => j.id + " " + j.state).join(",")' }, { stop: true }] });
   expect(out.results[1]!.text).toBe(out.results[0]!.id + ' running');
   expect(out.results[0]!.text).toContain('[cancelled]');
   expect(out.results[0]!.text).not.toContain('never-printed');
-  expect(out.results[0]!.ms + out.results[1]!.ms).toBeLessThan(15000);
 });
 
-test('A run that finishes after its turn was interrupted wakes the session with its output', () => {
-  const out = run({ steps: [{ script: 'await sh("sleep 1")\nreturn "woke-with-this"', interrupt: true }] });
+test('cancel() refuses a run of another agent and an id that names no run', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 20")\nreturn 1', agentId: 'a1', keepTurn: true }, { untilTool: 'Bash' }, { script: 'const mine = await cancel("r999").catch((e) => e.message)\nconst other = await cancel("' + 'r1' + '").catch((e) => e.message)\nreturn [mine, other].join(" | ")' }, { stop: true }] });
+  expect(out.results[1]!.text).toContain('there is no run r999 here');
+  expect(out.results[1]!.text).toContain('there is no run r1 here');
+});
+
+test('cancel() of a run that has exited but not yet come back returns false', () => {
+  const out = run({ slowWritesMs: 1500, steps: [{ script: 'return "x".repeat(30000)', keepTurn: true }, { script: 'await waitFor(async () => (await jobs()).some((j) => j.state === "finishing"), { timeout: 20000, every: 20 })\nreturn String(await cancel((await jobs())[0].id))' }, { stop: true }] });
+  expect(out.results[1]!.text).toBe('false');
+  expect(out.results[0]!.text).not.toContain('[cancelled]');
+});
+
+test('Interrupting the turn stops its runs, which come back marked aborted with the next run\'s reply, and wakes nothing', () => {
+  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await sh("sleep 30; echo never-printed")\nreturn 1', interrupt: true }, { untilRunsDone: true }, { script: 'return "after"' }] });
+  expect(out.wakeAttempts).toBe(0);
+  expect(out.results[1]!.immediate).toContain('[' + out.results[0]!.id + ' stopped after');
+  expect(out.results[0]!.text).toContain('[aborted]');
+  expect(out.results[0]!.text).not.toContain('never-printed');
+});
+
+test('In a session a person is watching, ending the turn does not wait for a run, and a wake prompt names it once it finishes', () => {
+  const dir = scratch();
+  const gate = join(dir, 'gate');
+  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "watched-output"', keepTurn: true }, { stop: true }, { touch: gate }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.stops).toHaveLength(0);
   expect(out.submitted).toHaveLength(1);
-  expect(out.results[0]!.text).toBe('woke-with-this');
+  expect(out.submitted[0]).toContain(out.results[0]!.id!);
+  expect(out.submitted[0]).not.toContain('watched-output');
+  expect(out.results[0]!.text).toBe('watched-output');
+});
+
+test('A wake prompt the engine refuses leaves the output for the next run\'s reply', () => {
+  const out = run({ surfaces: ['terminal'], submitRefusals: 1, steps: [{ script: 'await sh("sleep 1")\nreturn "kept-output"' }, { script: 'return 2' }] });
+  expect(out.wakeAttempts).toBeGreaterThanOrEqual(1);
+  expect(out.submitted).toHaveLength(0);
+  expect(out.results[1]!.immediate).toContain('kept-output');
+});
+
+test('Two runs that finish while the session is idle each come back exactly once', () => {
+  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await sh("sleep 1")\nreturn "one-output"', keepTurn: true }, { script: 'await sh("sleep 1")\nreturn "two-output"', keepTurn: true }, { stop: true }, { untilRunsDone: true }, { collect: true }, { collect: true }] });
+  const all = out.collected.join('\n');
+  expect(all.split('one-output').length - 1).toBe(1);
+  expect(all.split('two-output').length - 1).toBe(1);
+});
+
+test('A new session never gets the output of a run started in the session before it', () => {
+  const out = run({ steps: [{ script: 'return "old-session-output"', keepTurn: true }, { untilRunsDone: true }, { newSession: true }, { script: 'return "new"' }] });
+  expect(out.results[1]!.immediate).not.toContain('old-session-output');
+  expect(out.results[1]!.text).toBe('new');
+});
+
+test('A file one run read cannot be written by another run before the first run\'s output is back', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'v1\n');
+  const gate = join(dir, 'gate');
+  const out = run({ steps: [{ script: 'await read(' + JSON.stringify(file) + ')\nawait waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "read-done"', keepTurn: true }, { untilTool: 'Read' }, { script: 'const r = await call("Write", { file_path: ' + JSON.stringify(file) + ', content: "v2\\n" })\nreturn r.error', keepTurn: true }, { untilRunsDone: true }, { touch: gate }, { stop: true }] });
+  expect(out.results[1]!.text).toContain('File has not been read yet');
+  expect(readFileSync(file, 'utf8')).toBe('v1\n');
+});
+
+test('Finished runs past one reply\'s room wait for the next reply instead of making one huge reply', () => {
+  const out = run({ steps: [{ script: 'return "A".repeat(15000)', keepTurn: true }, { script: 'return "B".repeat(15000)', keepTurn: true }, { untilRunsDone: true }, { collect: true }, { collect: true }] });
+  expect(out.collected[0]!.length).toBeLessThan(21000);
+  expect(out.collected[0]).toContain('A'.repeat(15000));
+  expect(out.collected[0]).toContain(out.results[1]!.id + ' finished too');
+  expect(out.collected[1]).toContain('B'.repeat(15000));
+});
+
+test('A picture a finished run shows comes back attached to the next run\'s reply', () => {
+  const tools = ['Read', 'Bash', 'mcp__shots__snap'];
+  const out = run({ tools, steps: [{ script: 'const s = await tools.mcp__shots__snap({})\nreturn "look " + s', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('[image #1 image/png');
+  expect(out.collectedAttachments[0]).toBe(1);
+});
+
+test('Ending the turn leaves no waiting process behind', () => {
+  const out = run({ steps: [{ script: 'await sh("sleep 1")\nreturn "done"' }] });
+  expect(out.results[0]!.text).toBe('done');
+  expect(out.waitsAlive).toBe(0);
 });
 
 test('The run tool tells the model its runs go to the background and how their output comes back', () => {
   const out = run({ steps: [] });
   expect(out.description).toContain('Every run goes to the background');
+  expect(out.description).toContain('empty script');
   expect(out.description).toContain('jobs()');
   expect(out.description).toContain('cancel(id)');
-});
-
-test('In a session a person is watching, ending the turn does not wait for a run, and its output arrives as a new prompt when it finishes', () => {
-  const out = run({ surfaces: ['terminal'], steps: [{ script: 'await sh("sleep 2")\nreturn "watched-output"' }] });
-  expect(out.results[0]!.heldMs).toBeLessThan(1000);
-  expect(out.stops).toHaveLength(0);
-  expect(out.submitted).toHaveLength(1);
-  expect(out.results[0]!.text).toBe('watched-output');
 });

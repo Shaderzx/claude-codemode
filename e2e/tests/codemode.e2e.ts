@@ -1985,3 +1985,11 @@ test('Two runs reading the same long file at once each count it as read for thei
   expect(out.results[0]!.text).toBe('wrote');
   expect(out.results[1]!.text).toBe('read');
 });
+
+test('The run tool\'s description fits in the 4,096 characters the engine hands the model, even with every common tool and denials listed', () => {
+  const tools = ['Read', 'Bash', 'Write', 'Edit', 'Skill', 'ToolSearch', 'Agent', 'AskUserQuestion', 'mcp__lean-ctx__ctx_shell', 'mcp__lean-ctx__ctx_patch'];
+  const store = { denied: { Bash: { alt: 'mcp__lean-ctx__ctx_shell', at: Date.now() }, Write: { alt: 'mcp__lean-ctx__ctx_patch', at: Date.now() }, Edit: { alt: 'mcp__lean-ctx__ctx_patch', at: Date.now() } } };
+  const out = run({ tools, store, steps: [] });
+  expect(out.description).toContain('denied by a hook here');
+  expect(out.description.length).toBeLessThanOrEqual(4096);
+});

@@ -603,6 +603,7 @@ const $ = {
       }))),
   },
   clock: {
+    now: async () => Date.now(),
     after: (ms: number, fn: () => void) => {
       if (c.clockFrozen && sessionStarted) return { cancel: () => undefined }
       const h = setTimeout(fn, Math.max(0, ms - (c.clockEarlyMs ?? 0)))

@@ -320,7 +320,6 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       let res
       try { res = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { continue }
       try { fs.unlinkSync(file) } catch {}
-      if (res && res.timedOut === true) return endTimedOut()
       t.answered = ++tick
       t.ok = !!(res && res.ok)
       if (res && typeof res === 'object') {
@@ -709,8 +708,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const moved = () => toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
     let guard = {}
     if (!force) {
-      if (!seen.has(file)) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
       const check = await req('fresh', { path: file })
+      if (!check.read) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
       if (check.fresh === false) throw moved()
       if (typeof check.version === 'string') guard = { expectedVersion: check.version }
     }
@@ -749,16 +748,14 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (!patch) throw toolError('edit: this session has no Edit tool and no patch tool')
     const moved = (r) => toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
     let guard = {}
-    if (!seen.has(file)) {
+    const check = await req('fresh', { path: file })
+    if (!check.read) {
       if (!force) throw unread()
       await read(file)
-    } else {
-      const check = await req('fresh', { path: file })
-      if (check.fresh === false) {
-        if (!force) throw moved()
-        await read(file)
-      } else if (typeof check.version === 'string') guard = { expectedVersion: check.version }
-    }
+    } else if (check.fresh === false) {
+      if (!force) throw moved()
+      await read(file)
+    } else if (!force && typeof check.version === 'string') guard = { expectedVersion: check.version }
     const r = await req('call', { tool: patch, args: { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }, ...guard })
     if (r.ok) return wrote(file, 'edited')
     if (unreadWrite(r)) throw moved(r)
@@ -1827,6 +1824,14 @@ const wake = async ($: Dollar) => {
     waking = false
   }
 }
+const clockNow = async ($: Dollar): Promise<number> => {
+  try {
+    const now = await $.clock.now()
+    return typeof now === 'number' ? now : Date.now()
+  } catch {
+    return Date.now()
+  }
+}
 const expireLater = ($: Dollar, job: Job) => {
   job.expiry = $.clock.after(Math.max(0, job.deadline - Date.now()), () => {
     if (job.settled || job.pid || job.exited || job.cancelledBy) return
@@ -1935,9 +1940,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     if (m.kind === 'fresh') {
       const path = normal(String(p.path))
-      const was = job.reads.has(path) ? job.reads.get(path) : readVersions.get(path)
+      const read = job.reads.has(path) || readPaths.has(path)
+      const was = job.reads.has(path) ? job.reads.get(path) : readPaths.has(path) ? readVersions.get(path) : undefined
       const now = was === undefined ? undefined : await versionOf(path)
-      return { ok: true, fresh: was !== undefined && now !== undefined && now === was, version: was }
+      return { ok: true, read, fresh: was !== undefined && now !== undefined && now === was, version: was }
     }
     if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
     if (m.kind === 'jobs') return { ok: true, value: running(job) }
@@ -2038,11 +2044,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (tool === 'Skill' && !release)
       return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
     const since = skillSeq
-    const counted = p.poll !== true
-    const tally = (counted ? calls.get(tool) : undefined) ?? { ok: 0, failed: 0, open: 0 }
-    if (counted) calls.set(tool, tally)
-    tally.open++
-    if (counted) open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const patchPath = (v: unknown) => (typeof v === 'string' && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
     const patchOps = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
@@ -2058,11 +2059,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
     if (late()) {
       release?.()
-      tally.open--
-      if (counted && tally.ok + tally.failed + tally.open === 0) calls.delete(tool)
-      open.delete(m.id)
       return refusal('call')
     }
+    const counted = p.poll !== true
+    const tally = (counted ? calls.get(tool) : undefined) ?? { ok: 0, failed: 0, open: 0 }
+    if (counted) calls.set(tool, tally)
+    tally.open++
+    if (counted) open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
     let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
       tally.open--
       tally.failed++
@@ -2313,7 +2316,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
 
   let over = false
   const late = () => over || !!job.cancelledBy || killed || Date.now() >= started + timeout
-  const refusal = (what: string) => ({ ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this ${what} started`, ...(over || job.cancelledBy || killed ? {} : { timedOut: true }) })
+  const refusal = (what: string) => ({ ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this ${what} started` })
   const writes = new Set<Promise<unknown>>()
   const replies = new Set<Promise<unknown>>()
   const items: string[] = []
@@ -2330,13 +2333,25 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   }
   const pictures: Picture[] = []
   const realpath = (p: string) => $.process.run(['realpath', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : undefined), () => undefined)
+  const readlink = (p: string) => $.process.run(['readlink', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : undefined), () => undefined)
   const realOf = async (p: string) => {
+    let path = p
+    for (let hops = 0; hops < 40; hops++) {
+      const next = await resolveOnce(path)
+      if (next.done) return next.path
+      path = next.path
+    }
+    return path
+  }
+  const resolveOnce = async (p: string): Promise<{ done: boolean; path: string }> => {
     let missing = ''
     for (let head = p; ; ) {
       const found = await realpath(head)
-      if (found) return found.replace(/\/$/, '') + missing
+      if (found) return { done: true, path: found.replace(/\/$/, '') + missing }
+      const target = await readlink(head)
+      if (target) return { done: false, path: normal((target.startsWith('/') ? target : head.slice(0, head.lastIndexOf('/')) + '/' + target) + missing) }
       const slash = head.lastIndexOf('/')
-      if (slash <= 0) return p
+      if (slash <= 0) return { done: true, path: p }
       missing = head.slice(slash) + missing
       head = head.slice(0, slash)
     }
@@ -2439,7 +2454,15 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     killed = true
     if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
   }
-  let watchdog = $.clock.after(timeout + 5_000, killRunner)
+  let watchdog: { cancel: () => unknown } = { cancel: () => undefined }
+  const armWatchdog = (ms: number) => {
+    watchdog = $.clock.after(ms, async () => {
+      const left = started + timeout + 5_000 - (await clockNow($))
+      if (left > 0) armWatchdog(left)
+      else killRunner()
+    })
+  }
+  armWatchdog(timeout + 5_000)
   try {
     if (!job.cancelledBy && !job.pid && Date.now() > job.deadline) expire(job)
     if (job.cancelledBy) throw new Error('codemode: stopped before its runner started')
@@ -2470,7 +2493,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           if (typeof childStarted === 'number' && childStarted >= started && childStarted <= Date.now()) {
             started = childStarted
             watchdog.cancel()
-            watchdog = $.clock.after(Math.max(0, started + timeout + 5_000 - Date.now()), killRunner)
+            armWatchdog(Math.max(0, started + timeout + 5_000 - Date.now()))
           }
           job.pid = pid || undefined
           job.onPid()

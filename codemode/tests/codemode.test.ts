@@ -82,8 +82,11 @@ const setup = (on: On, child: Child, opts: Opts = {}) => {
     f.onRun?.([...e.argv])
     return { value: ran }
   })
-  on('clock.after', async () => {
+  let clockSkew = 0
+  on('clock.now', async () => ({ value: Date.now() + clockSkew }))
+  on('clock.after', async (_$, e) => {
     if (!opts.fireWatchdog) await new Promise(() => {})
+    clockSkew += (e as { ms: number }).ms
     return { value: undefined }
   })
   on('session.version', async () => ({ value: { version: '9.9.9' } }) as never)

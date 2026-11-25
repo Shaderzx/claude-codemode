@@ -11,6 +11,7 @@ type Case = {
   statDelayMs?: number
   hangListMs?: number
   hangListCount?: number
+  failReplyAfter?: { fail: number; after: number }
   surfaces?: string[]
   submitDelayMs?: number
   hangListDuringRuns?: boolean
@@ -65,7 +66,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -218,6 +219,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       if (c.deniedWriteMessage !== undefined) return err(c.deniedWriteMessage)
       const w = writePath(a.file_path)
       if (!c.engineForgets && existsSync(w) && readTimes.has(w) && statSync(w).mtimeMs !== readTimes.get(w)) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
+      mkdirSync(dirname(w), { recursive: true })
       writeFileSync(w, String(a.content))
       readTimes.set(w, statSync(w).mtimeMs)
       return ok('File created successfully at: ' + a.file_path)
@@ -449,6 +451,8 @@ let wakesSeen = 0
 let statsPending = 0
 let bashWaits = 0
 let listsHanging = 0
+const writtenReplies = new Set<string>()
+const failedReplies = new Set<string>()
 let listsHung = 0
 let fakesPending = 0
 let lastActivity = Date.now()
@@ -511,6 +515,14 @@ const $ = {
     write: async (p: string, t: string) => {
       inflight++
       try {
+        writtenReplies.add(p)
+        const failing = c.failReplyAfter
+        if (failing && p.endsWith('/' + failing.fail + '.json') && t.includes('"ok":true')) {
+          const after = p.slice(0, p.lastIndexOf('/') + 1) + failing.after + '.json'
+          if (!failedReplies.has(p)) await until(() => writtenReplies.has(after), 30_000, 'reply ' + failing.after + ' being written')
+          failedReplies.add(p)
+          throw new Error('fs.write: failed on purpose')
+        }
         if (Buffer.byteLength(t) > 4 * 1024 * 1024) throw new Error('fs.write: over the 4 MiB limit')
         mkdirSync(dirname(p), { recursive: true })
         writeFileSync(p, t)
@@ -717,6 +729,16 @@ for (const s of c.steps) {
     const spills = join(home, '.claude', 'codemode', 'out')
     const old = (Date.now() - 3 * 86_400_000) / 1000
     for (const n of existsSync(spills) ? readdirSync(spills) : []) utimesSync(join(spills, n), old, old)
+    continue
+  }
+  if (s.abortDuringNext) {
+    const { abort, start } = s.abortDuringNext
+    inTurn = false
+    await handlers['turn.complete']?.($, { ...(abort ? { turnId: abort } : {}), isAborted: true }, engine(async () => {
+      inTurn = true
+      await handlers['turn.start']?.($, start ? { turnId: start } : {}, engine(async () => ({})))
+      return {}
+    }))
     continue
   }
   if (s.abortAndStart) {

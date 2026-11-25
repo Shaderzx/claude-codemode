@@ -6,8 +6,8 @@ import { expect, test } from 'e2e';
 
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Step = { abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
+type Case = { failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
@@ -2469,4 +2469,58 @@ test('A run out of time keeps nothing it asks to store after its time is up', ()
   const out = run({ steps: [{ script: '// @options: {"timeout_ms": 2000}\nwhile (deadline() > 0) {}\nawait store("late-key", "late")\nreturn 1', keepTurn: true }, { untilRunsDone: true }, { untilQuiet: true }, { collect: true }] });
   expect(out.collected[0]).toContain('[timeout]');
   expect(out.store['script:late-key']).toBeUndefined();
+});
+
+test('Esc with no turn ids stops the interrupted turn\'s runs even when a newer turn starts during the interrupt', () => {
+  const dir = scratch();
+  const started = join(dir, 'started');
+  const out = run({ steps: [
+    { turnStart: '' },
+    { script: 'await sh("touch ' + started + '")\nreturn String(await sh("timeout 20 tail -f /dev/null"))', keepTurn: true },
+    { untilFile: started }, { abortDuringNext: { abort: '', start: '' } }, { untilRunDone: 'r1' }, { collect: true },
+  ] });
+  expect(out.collected[0]).toContain('[r1 stopped after');
+  expect(out.collected[0]).toContain('[aborted]');
+});
+
+test('Two runs creating one new file under missing folders through a symlinked folder and its real path never both write it', () => {
+  const dir = scratch();
+  const real = join(dir, 'real');
+  const link = join(dir, 'link');
+  mkdirSync(real);
+  const go = join(dir, 'go');
+  const writer = (path: string, mine: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(path) + ', content: "' + mine + '\\n" })\nreturn r.ok ? "wrote" : r.error';
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, writeDelayMs: 800, steps: [{ link: { from: link, to: real } }, { script: writer(join(real, 'missing', 'sub', 'n.txt'), 'from-a', a), keepTurn: true }, { script: writer(join(link, 'missing', 'sub', 'n.txt'), 'from-b', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const texts = [out.results[0]!.text, out.results[1]!.text];
+  expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
+  expect(texts.find((x) => x !== 'wrote')).toContain('has not been read yet');
+  expect(readFileSync(join(real, 'missing', 'sub', 'n.txt'), 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
+});
+
+test('A failed reply of one read never undoes an overlapping read of the same file that came back', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'v1\n');
+  const f = JSON.stringify(file);
+  const out = run({ failReplyAfter: { fail: 1, after: 3 }, steps: [{ script: 'const first = call("Read", { file_path: ' + f + ' })\nawait call("Bash", { command: "sleep 0.3" })\nawait call("Read", { file_path: ' + f + ' })\nawait first\nconst r = await call("Write", { file_path: ' + f + ', content: "v2\\n" })\nreturn r.ok ? "wrote" : r.error' }] });
+  expect(out.results[0]!.text).toBe('wrote');
+  expect(readFileSync(file, 'utf8')).toBe('v2\n');
+});
+
+test('A run\'s own older page bookmark never hides a newer one another run brought back', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'a\nb\nc\nd');
+  const f = JSON.stringify(file);
+  const [gate, read1] = ['gate', 'read1'].map((n) => join(dir, n));
+  const out = run({ steps: [
+    { script: 'await call("Read", { file_path: ' + f + ', offset: 1, limit: 1 })\nawait sh("touch ' + read1 + '")\nawait waitFor(() => sh("test -f ' + gate + '"), { every: 20, timeout: 20000 })\nawait call("Read", { file_path: ' + f + ', offset: 3, limit: 2 })\nconst r = await call("Write", { file_path: ' + f + ', content: "new\\n" })\nreturn r.ok ? "wrote" : r.error', keepTurn: true },
+    { untilFile: read1 },
+    { script: 'await call("Read", { file_path: ' + f + ', offset: 1, limit: 2 })\nreturn "first-half"', keepTurn: true }, { untilRunDone: 'r2' }, { collect: true },
+    { touch: gate }, { untilRunDone: 'r1' }, { collect: true },
+  ] });
+  expect(out.collected.join('')).toContain('[r1 finished after');
+  expect(out.collected.join('')).toContain('wrote');
+  expect(readFileSync(file, 'utf8')).toBe('new\n');
 });

@@ -2642,7 +2642,7 @@ test('A kill timer that fires early never stops a run before its time', () => {
 
 test('Two runs creating one new file through a dangling symlink and its target never both write it', () => {
   const dir = scratch();
-  const real = join(dir, 'missing', 'real.txt');
+  const real = join(dir, 'real.txt');
   const link = join(dir, 'link.txt');
   const go = join(dir, 'go');
   const writer = (path: string, mine: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(path) + ', content: "' + mine + '\\n" })\nreturn r.ok ? "wrote" : r.error';
@@ -2650,6 +2650,7 @@ test('Two runs creating one new file through a dangling symlink and its target n
   const out = run({ engineForgets: true, writeDelayMs: 800, steps: [{ link: { from: link, to: real } }, { script: writer(real, 'from-a', a), keepTurn: true }, { script: writer(link, 'from-b', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
   const texts = [out.results[0]!.text, out.results[1]!.text];
   expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
+  expect(texts.find((x) => x !== 'wrote')).toContain('has not been read yet');
   expect(readFileSync(real, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
 });
 test('A call refused for time before it started is never reported as still running', () => {

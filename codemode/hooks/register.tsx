@@ -2456,14 +2456,17 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   // The child's own timer cannot fire while a script spins synchronously, so
   // the mod kills it a little after the deadline.
   const killRunner = () => {
+    if (job.exited) return
     killed = true
     if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
   }
   let watchdog: { cancel: () => unknown } = { cancel: () => undefined }
   const armWatchdog = (ms: number) => {
     watchdog = $.clock.after(ms, async () => {
-      const left = started + timeout + 5_000 - (await clockNow($))
-      if (left > 0) armWatchdog(left)
+      const now = await clockNow($)
+      if (over || job.exited || pid === undefined) return
+      const left = started + timeout + 5_000 - now
+      if (left > 0) armWatchdog(Math.max(50, left))
       else killRunner()
     })
   }
@@ -2495,11 +2498,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (pid === undefined) {
           pid = Number.isSafeInteger(m.pid) && (m.pid as number) > 1 ? m.pid : 0
           const childStarted = (m as { started?: unknown }).started
-          if (typeof childStarted === 'number' && childStarted >= started && childStarted <= Date.now()) {
-            started = childStarted
-            watchdog.cancel()
-            armWatchdog(Math.max(0, started + timeout + 5_000 - Date.now()))
-          }
+          if (typeof childStarted === 'number' && childStarted >= started && childStarted <= Date.now()) started = childStarted
+          watchdog.cancel()
+          armWatchdog(Math.max(0, started + timeout + 5_000 - Date.now()))
           job.pid = pid || undefined
           job.onPid()
           if (killed || job.cancelledBy) {

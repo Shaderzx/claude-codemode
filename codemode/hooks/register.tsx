@@ -683,17 +683,18 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     seen.add(file)
     return verb + ' ' + file
   }
+  const timeToRetry = () => started + timeout - Date.now() > 2000
   const forcedRead = async (file) => {
-    for (let tries = 0; ; tries++) {
+    for (;;) {
       let text
       try {
         text = await read(file)
       } catch (err) {
-        if (tries < 4 && /changed while it was read/i.test(String(err && err.message))) continue
+        if (timeToRetry() && /changed while it was read/i.test(String(err && err.message))) continue
         throw err
       }
       const check = await req('fresh', { path: file })
-      if (typeof check.version === 'string' || tries >= 4) return { text, check }
+      if (typeof check.version === 'string' || !timeToRetry()) return { text, check }
     }
   }
   const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version } : {})
@@ -706,7 +707,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       let r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
       if (unreadWrite(r) && !force && MOVED.test(String(r.error))) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
       if (unreadWrite(r) && !force) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace it unread', r)
-      for (let tries = 0; unreadWrite(r) && tries < 5; tries++) {
+      while (unreadWrite(r) && timeToRetry()) {
         await forcedRead(file)
         r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
       }
@@ -739,13 +740,13 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (unreadWrite(r)) throw moved()
       throw toolError('write: ' + r.error + endings(r.error), r)
     }
-    for (let tries = 0; ; tries++) {
+    for (;;) {
       const { text: now, check } = await forcedRead(file)
       if (!now) throw empty()
       if (typeof check.version !== 'string') throw moved()
       r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
-      if (tries >= 4 || !unreadWrite(r)) break
+      if (!unreadWrite(r) || !timeToRetry()) break
     }
     throw toolError('write: ' + r.error + endings(r.error), r)
   }
@@ -760,7 +761,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       let r = await req('call', { tool: 'Edit', args })
       if (unreadWrite(r) && !force && MOVED.test(String(r.error))) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
       if (unreadWrite(r) && !force) throw unread(r)
-      for (let tries = 0; unreadWrite(r) && tries < 5; tries++) {
+      while (unreadWrite(r) && timeToRetry()) {
         await forcedRead(file)
         r = await req('call', { tool: 'Edit', args })
       }
@@ -778,7 +779,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     }
     const args = { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }
     let r = await req('call', { tool: patch, args, ...guardOf(check) })
-    for (let tries = 0; force && unreadWrite(r) && tries < 4; tries++) {
+    while (force && unreadWrite(r) && timeToRetry()) {
       r = await req('call', { tool: patch, args, ...guardOf((await forcedRead(file)).check) })
     }
     if (r.ok) return wrote(file, 'edited')
@@ -2489,10 +2490,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
   }
   let watchdog: { cancel: () => unknown } = { cancel: () => undefined }
+  let watchdogTicket = 0
   const armWatchdog = (ms: number) => {
+    watchdog.cancel()
+    const ticket = ++watchdogTicket
     watchdog = $.clock.after(ms, async () => {
       const now = await clockNow($)
-      if (gone || pid === undefined) return
+      if (gone || pid === undefined || ticket !== watchdogTicket) return
       const left = started + timeout + 5_000 - now
       if (left > 0) armWatchdog(Math.max(50, left))
       else killRunner()

@@ -69,10 +69,10 @@ export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<stri
     '',
     'Globals:',
     '- sh(cmd): runs a command on the session\'s shell; resolves to its text with .exitCode and .ok, never throws on a non-zero exit. quote(s) makes s one shell word.',
-    '- read(path): a file\'s whole text, no line numbers, line endings as \\n. write(path, text, { force }?), edit(path, old, new, { all, force }?): absolute paths, read the file first ({ force: true } reads it for you).',
+    '- read(path): a file\'s whole text, no line numbers, line endings as \\n; a relative path starts at the session folder. write(path, text, { force }?), edit(path, old, new, { all, force }?): absolute paths, read the file first ({ force: true } reads it for you).',
     '- waitFor(check, { every = 1000, timeout }): calls check until it returns something truthy; deadline(): ms left.',
     '- tools.<Name>(args): call a tool by its exact name (invalid characters become _: tools.mcp__lean_ctx__ctx_read; a unique suffix such as tools.ctx_read works). Resolves to its text; rejects on failure.',
-    '- call(name, args): the same, never throws: { ok, text, result, error, exitCode? }; String(r) is its text.',
+    '- call(name, args): the same, never throws: { ok, text, result, error, exitCode? }; String(r) is its text. Promise.allSettled also keeps partial results.',
     '- A returned value and text(value) add output items; console.log adds lines.',
     '- describeTool(name): { name, description, input } with input as a TypeScript type when known.',
     '- ask(prompt, { model = "haiku", system, maxTokens }?): one completion by another model, no tools.',
@@ -81,7 +81,8 @@ export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<stri
     '- jobs(): promise of your other runs still going, [{ id, state, seconds }]; cancel(id) stops one, and its output comes back marked [cancelled].',
     '- store(key, value) / load(key): small JSON kept across runs. exit(): stop successfully. btoa, atob, TextEncoder, TextDecoder, Buffer.',
     'No fetch, timers, process, require or import: only tools reach the outside world.',
-    '',    'Common arguments:',
+    '',
+    'Common arguments:',
     ...common,
     ...(missing.length ? [`Not in this session: ${missing.join(', ')}. searchTools() finds other tools.`] : []),
     ...(refused.length ? [`${refused.join(', ')}: denied by a hook here.`] : []),
@@ -1605,7 +1606,9 @@ type RunResult = string | { type: string; text?: string }[]
 type Job = {
   id: string
   agent: string
+  turnId?: string
   started: number
+  deadline: number
   pid?: number
   exited: boolean
   cancelledBy?: string
@@ -1628,12 +1631,13 @@ let jobSeq = 0
 let mainTurn = false
 let mainTurnId: string | undefined
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
-const startJob = (agent: string): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, started: Date.now(), exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Set(), done: Promise.resolve() }
+const startJob = (agent: string, timeout: number): Job => {
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Set(), done: Promise.resolve() }
   jobsById.set(job.id, job)
   return job
 }
 const settle = (job: Job, result: RunResult) => {
+  if (job.settled) return
   const parts = typeof result === 'string' ? [{ type: 'text', text: result }] : result
   job.text = parts.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n')
   job.blocks = parts.filter((b) => b.type !== 'text')
@@ -1694,8 +1698,9 @@ const wake = async ($: Dollar) => {
   if (mainTurn) return
   const ready = readyJobs(MAIN).filter((j) => !j.noticed && !j.quiet)
   if (!ready.length) return
+  for (const j of ready) j.noticed = true
   const sent = await $.prompt.submit({ text: notice(ready) }).then(() => true, () => false)
-  if (sent) for (const j of ready) j.noticed = true
+  if (!sent) for (const j of ready) j.noticed = false
 }
 const stopJobs = async ($: Dollar, jobs: Job[], by: string, kind: 'cancelled' | 'aborted') => {
   for (const j of jobs) {
@@ -1710,6 +1715,11 @@ const holdTurn = async ($: Dollar, agent: string, signal: AbortSignal | undefine
   const aborted = new Promise<void>((r) => signal?.addEventListener('abort', () => r(), { once: true }))
   let failures = 0
   for (;;) {
+    for (const j of openJobs(agent))
+      if (!j.pid && !j.exited && Date.now() > j.deadline) {
+        settle(j, format(Date.now() - j.started, { items: [], logs: [], kind: 'runner', failure: 'the run never started its runner within its time; none of its tool calls ran.' }))
+        j.exited = true
+      }
     const open = openJobs(agent)
     if (!open.length || signal?.aborted || failures >= 3) break
     const pids = open.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
@@ -1730,8 +1740,7 @@ const withHeld = (r: unknown, held: string) => {
   return { ...base, block: typeof base.block === 'string' && base.block ? `${base.block}\n\n${held}` : held }
 }
 const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: Record<string, string>, timeout: number, maxChars: number): Promise<{ result: RunResult }> => {
-const thisRun = job
-const pagesStarted = new Map<string, string | undefined>()
+  const pagesStarted = new Map<string, string | undefined>()
   const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
   const all = listing.map((t) => ({ name: t.name, description: t.description }))
   const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
@@ -1997,13 +2006,13 @@ const pagesStarted = new Map<string, string | undefined>()
       for (const o of patchOps) {
         if (created.has(o.path) || patchFresh.get(o.path) === true) {
           const version = await versionOf(o.path)
-          thisRun.reads.add(o.path)
+          job.reads.add(o.path)
           if (version === undefined) readVersions.delete(o.path)
           else readVersions.set(o.path, version)
           readNow.push(o.path)
         } else {
           readPaths.delete(o.path)
-          thisRun.reads.delete(o.path)
+          job.reads.delete(o.path)
           readVersions.delete(o.path)
         }
       }
@@ -2020,7 +2029,7 @@ const pagesStarted = new Map<string, string | undefined>()
       }
       const receipt =
         tool === 'Read' && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined, p.handled === true ? `${thisRun.id}:${args.file_path}` : args.file_path)
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined, p.handled === true ? `${job.id}:${args.file_path}` : args.file_path)
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
             : undefined
@@ -2030,8 +2039,8 @@ const pagesStarted = new Map<string, string | undefined>()
         stubs.add(tool)
         if (/read-dedup/.test(text)) deduped = true
       }
-      const job = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
-      return { ok: true, text, result, ...exit, ...(job ? { job } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}) }
+      const leanJob = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
+      return { ok: true, text, result, ...exit, ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}) }
     }
     const bad = tidy(tool, text)
     if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
@@ -2407,9 +2416,6 @@ export const register: Register = (on) => {
     const cwd = (e as { cwd?: unknown }).cwd
     sessionCwd = typeof cwd === 'string' && cwd ? cwd : undefined
     const kept = (await $.store.get('denied').catch(() => undefined)) as Record<string, { alt?: string; at?: number }> | undefined
-    await stopJobs($, [...jobsById.values()], 'a new session', 'aborted')
-    jobsById.clear()
-    mainTurn = false
     deniedTools.clear()
     readPaths.clear()
     readProgress.clear()
@@ -2430,6 +2436,21 @@ export const register: Register = (on) => {
     return next(e)
   })
 
+  on('session.end', async ($, e, next) => {
+    const jobs = [...jobsById.values()]
+    for (const j of jobs) j.quiet = true
+    void stopJobs($, jobs, 'the end of its session', 'aborted')
+    jobsById.clear()
+    deliveredIds.clear()
+    mainTurn = false
+    mainTurnId = undefined
+    readPaths.clear()
+    readProgress.clear()
+    readVersions.clear()
+    failedScripts.clear()
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
     const skipped = !!r && typeof r === 'object' && 'skip' in r && (r as { skip?: unknown }).skip !== undefined
@@ -2437,7 +2458,7 @@ export const register: Register = (on) => {
       readPaths.clear()
       readProgress.clear()
       readVersions.clear()
-          }
+    }
     return r
   }).catch(($, e, next) => next(e))
 
@@ -2463,10 +2484,11 @@ export const register: Register = (on) => {
         mainTurn = false
         mainTurnId = undefined
         if ((e as { isAborted?: unknown }).isAborted === true) {
-          const jobs = agentJobs(MAIN)
+          const jobs = agentJobs(MAIN).filter((j) => !j.turnId || !turnId || j.turnId === turnId)
           for (const j of jobs) j.quiet = true
           await stopJobs($, jobs, 'the interrupt', 'aborted')
-        } else await wake($)
+        }
+        await wake($)
       }
     }
   })
@@ -2542,7 +2564,7 @@ export const register: Register = (on) => {
     const script = pre.script
     const timeout = num(options.timeout_ms, DEFAULT_TIMEOUT_MS, 1_000, 3_600_000)
     const maxChars = num(options.max_output_chars, DEFAULT_MAX_CHARS, 1_000, 1_000_000)
-    const job = startJob(caller)
+    const job = startJob(caller, timeout)
     job.done = execute($, job, raw, script, pre.texts, timeout, maxChars).then(
       (r) => settle(job, r.result),
       (err: unknown) => settle(job, format(0, { items: [], logs: [], failure: `codemode's own hook failed: ${(err as Error)?.message ?? String(err)}`, kind: 'runner' })),

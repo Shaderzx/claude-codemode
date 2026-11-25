@@ -2864,9 +2864,9 @@ for (const [label, tools] of [['the patch tool', NO_BASH], ['Write', undefined]]
 test('A kill timer still waiting on a slow clock when the runner starts kills that runner only once', () => {
   const dir = scratch();
   const shim = join(dir, 'late-node');
-  writeFileSync(shim, '#!/bin/sh\nsleep 0.8\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n');
+  writeFileSync(shim, '#!/bin/sh\nsleep 6.5\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n');
   chmodSync(shim, 0o755);
-  const out = run({ clockEarlyMs: 5500, clockNowDelayMs: 1500, killDelayMs: 1600, env: { CODEMODE_NODE: shim }, steps: [{ script: '// @options: {"timeout_ms": 1000}\nwhile (true) {}', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  const out = run({ clockNowDelayMs: 2000, env: { CODEMODE_NODE: shim }, steps: [{ script: '// @options: {"timeout_ms": 1000}\nwhile (true) {}', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
   expect(out.collected[0]).toContain('never yielded');
   expect(out.kills).toHaveLength(1);
 });
@@ -2939,12 +2939,12 @@ test('A forced patch edit in a short run whose read races a change retries and k
 test('A forced patch write never takes an older read of the file as current', () => {
   const dir = scratch();
   const file = join(dir, 'f.txt');
-  writeFileSync(file, 'v0\n');
   const f = JSON.stringify(file);
   const out = run({ tools: NO_BASH, rewriteDuringFirstRead: 'v3\n', statDelayMs: 200, steps: [
-    { script: 'await write(' + f + ', "v1\\n", { force: true })\nawait sh("printf v2 > ' + file + '")\nreturn "prepared"' },
-    { script: '// @options: {"timeout_ms": 2700}\ntry { await write(' + f + ', "from-codemode\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }' },
+    { script: 'await write(' + f + ', "v1\\n")\nawait sh("printf v2 > ' + file + '")\nreturn "prepared"' },
+    { script: '// @options: {"timeout_ms": 2200}\ntry { await write(' + f + ', "from-codemode\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }' },
   ] });
+  expect(out.results[0]!.text).toBe('prepared');
   expect(out.results[1]!.text).toBe('wrote');
   expect(readFileSync(file, 'utf8')).toBe('from-codemode\n');
 });

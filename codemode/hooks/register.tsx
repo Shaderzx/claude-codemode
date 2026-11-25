@@ -699,9 +699,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       }
       if (text !== undefined) {
         const check = await req('fresh', { path: file })
-        if (typeof check.version === 'string') return { text, check }
+        if (check.fresh === true && typeof check.version === 'string') return { text, check }
       }
-      if (Date.now() >= settleBy || !timeToRetry()) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
+      if (Date.now() >= settleBy || started + timeout - Date.now() < 300) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
     }
   }
   const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version } : {})
@@ -2507,13 +2507,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
   }
   let watchdog: { cancel: () => unknown } = { cancel: () => undefined }
-  let watchdogTicket = 0
   const armWatchdog = (ms: number) => {
     watchdog.cancel()
-    const ticket = ++watchdogTicket
     watchdog = $.clock.after(ms, async () => {
       const now = await clockNow($)
-      if (gone || pid === undefined || ticket !== watchdogTicket) return
+      if (gone || pid === undefined) return
       const left = started + timeout + 5_000 - now
       if (left > 0) armWatchdog(Math.max(50, left))
       else killRunner()

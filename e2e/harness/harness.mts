@@ -1,10 +1,12 @@
 import { spawn } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 type Case = {
   clockEarlyMs?: number
+  clockFrozen?: boolean
+  killDelayMs?: number
   writeDelayMs?: number
   skillDelayMs?: number
   statDelayMs?: number
@@ -63,7 +65,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilCleaned?: number; untilQuiet?: boolean; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilCleaned?: number; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -565,7 +567,7 @@ const $ = {
       })()
     },
     run: (argv: string[], _init?: unknown) =>
-      (argv[0] === 'kill' ? kills.push([...argv]) : 0, new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
+      (argv[0] === 'kill' ? kills.push([...argv]) : 0, (argv[0] === 'kill' && c.killDelayMs ? new Promise((r) => setTimeout(r, c.killDelayMs)) : Promise.resolve()).then(() => new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
         const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
         if (p.pid !== undefined) live.add(p.pid)
         if (argv[0] === 'bash') bashWaits++
@@ -584,10 +586,11 @@ const $ = {
           }
           done({ exitCode: code ?? 1, stdout, stderr })
         })
-      })),
+      }))),
   },
   clock: {
     after: (ms: number, fn: () => void) => {
+      if (c.clockFrozen && sessionStarted) return { cancel: () => undefined }
       const h = setTimeout(fn, Math.max(0, ms - (c.clockEarlyMs ?? 0)))
       return { cancel: () => clearTimeout(h) }
     },
@@ -707,6 +710,25 @@ for (const s of c.steps) {
   if (s.untilRunDone) {
     await until(() => !mod.openRunIds().includes(s.untilRunDone) && inflight === 0, 60_000, s.untilRunDone + ' settling')
     await new Promise((r) => setTimeout(r, 0))
+    continue
+  }
+  if (s.ageSpills) {
+    const spills = join(home, '.claude', 'codemode', 'out')
+    const old = (Date.now() - 3 * 86_400_000) / 1000
+    for (const n of existsSync(spills) ? readdirSync(spills) : []) utimesSync(join(spills, n), old, old)
+    continue
+  }
+  if (s.abortAndStart) {
+    inTurn = false
+    const aborting = handlers['turn.complete']?.($, { turnId: s.abortAndStart.abort, isAborted: true }, engine(async () => ({})))
+    await until(() => kills.length > 0, 30_000, 'the abort sending its kill')
+    inTurn = true
+    await handlers['turn.start']?.($, { turnId: s.abortAndStart.start }, engine(async () => ({})))
+    await aborting
+    continue
+  }
+  if (s.link) {
+    symlinkSync(s.link.to, s.link.from)
     continue
   }
   if (s.untilQuiet) {

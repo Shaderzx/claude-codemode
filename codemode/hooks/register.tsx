@@ -1606,6 +1606,7 @@ type Job = {
   id: string
   agent: string
   turnId?: string
+  turnSeq: number
   started: number
   deadline: number
   pid?: number
@@ -1634,6 +1635,7 @@ const deliveredIds = new Map<string, string>()
 let jobSeq = 0
 let mainTurn = false
 let mainTurnId: string | undefined
+let turnSeq = 0
 let sessionGen = 0
 let waking = false
 let wakeAgain = false
@@ -1650,13 +1652,20 @@ const lockFile = async (path: string): Promise<() => void> => {
     if (fileLocks.get(path) === chained) fileLocks.delete(path)
   }
 }
-const writeTarget = (m: Request, cwd: string | undefined, home: string): string | undefined => {
-  if (m.kind !== 'call') return undefined
+const writeTargets = (m: Request, cwd: string | undefined, home: string): string[] => {
+  if (m.kind !== 'call') return []
   const tool = String(m.payload.tool)
   const args = (m.payload.args ?? {}) as Record<string, unknown>
   const ops = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : []
-  const raw = /^(?:Write|Edit|MultiEdit|NotebookEdit)$/.test(tool) ? args.file_path : /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) ? (args.path ?? ops[0]?.path) : undefined
-  return typeof raw === 'string' && raw.trim() ? normal(absolute(raw.trim(), cwd, home)) : undefined
+  const raws = /^(?:Write|Edit|MultiEdit)$/.test(tool)
+    ? [args.file_path]
+    : tool === 'NotebookEdit'
+      ? [args.notebook_path]
+      : /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+        ? [args.path, ...ops.map((o) => o?.path ?? args.path)]
+        : []
+  const paths = raws.filter((r): r is string => typeof r === 'string' && !!r.trim() && !r.trim().startsWith('~')).map((r) => normal(absolute(r.trim(), cwd, home)))
+  return [...new Set(paths)].sort()
 }
 const expire = (j: Job) => {
   j.cancelledBy = 'its start deadline'
@@ -1667,7 +1676,7 @@ const expire = (j: Job) => {
 export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string, timeout: number): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), progress: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), progress: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
   job.pidKnown = new Promise<void>((r) => (job.onPid = r))
   jobsById.set(job.id, job)
   return job
@@ -1774,7 +1783,8 @@ const wake = async ($: Dollar) => {
 }
 const expireLater = ($: Dollar, job: Job) => {
   job.expiry = $.clock.after(Math.max(0, job.deadline - Date.now()), () => {
-    if (job.settled || job.pid || job.exited || Date.now() < job.deadline) return
+    if (job.settled || job.pid || job.exited) return
+    if (Date.now() < job.deadline) return expireLater($, job)
     expire(job)
     if (job.agent === MAIN) void wake($)
   })
@@ -2257,14 +2267,14 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const pictures: Picture[] = []
   const respond = async (m: Request) => {
     let out: Record<string, unknown>
-    const target = writeTarget(m, cwd, home)
-    const unlock = target ? await lockFile(target) : undefined
+    const unlocks: (() => void)[] = []
+    for (const path of writeTargets(m, cwd, home)) unlocks.push(await lockFile(path))
     try {
       out = await handle(m)
     } catch (err) {
       out = { ok: false, error: (err as Error)?.message ?? String(err) }
     } finally {
-      unlock?.()
+      for (const unlock of unlocks.reverse()) unlock()
     }
     open.delete(m.id)
     // The child is gone after a timeout; writing would recreate its run dir.
@@ -2484,7 +2494,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     if (failedScripts.size > 20) failedScripts.delete(failedScripts.keys().next().value as string)
   } else if (!ended.failure && current) failedScripts.delete(raw)
-  const room = Math.max(1_000, maxChars - 400)
+  const room = Math.max(200, maxChars - 400)
   let parts = sections(now - started, ended)
   let full = parts.join('\n')
   if (full.length > room) {
@@ -2563,6 +2573,7 @@ export const register: Register = (on) => {
   on('turn.start', async ($, e, next) => {
     if (agentOf((e as { agentId?: unknown }).agentId) === MAIN) {
       mainTurn = true
+      turnSeq++
       mainTurnId = String((e as { turnId?: unknown }).turnId ?? '') || undefined
     }
     return next(e)
@@ -2581,7 +2592,7 @@ export const register: Register = (on) => {
       } else {
         const current = !mainTurnId || !turnId || turnId === mainTurnId
         if ((e as { isAborted?: unknown }).isAborted === true) {
-          const jobs = agentJobs(MAIN).filter((j) => (turnId && j.turnId === turnId) || (current && (!j.turnId || !turnId)))
+          const jobs = agentJobs(MAIN).filter((j) => (turnId ? j.turnId === turnId : current && j.turnSeq === turnSeq))
           for (const j of jobs) j.quiet = true
           await stopJobs($, jobs, 'the interrupt', 'aborted')
         }

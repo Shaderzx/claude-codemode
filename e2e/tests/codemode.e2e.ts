@@ -2845,3 +2845,28 @@ test('Two runs creating one new file through a dangling symlink whose target cli
   expect(texts.find((x) => x !== 'wrote')).toContain('has not been read yet');
   expect(readFileSync(real, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
 });
+
+for (const [label, tools] of [['the patch tool', NO_BASH], ['Write', undefined]] as const) {
+  test('Eight forced writes through ' + label + ' at once all land', () => {
+    const dir = scratch();
+    const file = join(dir, 'f.txt');
+    writeFileSync(file, 'original\n');
+    const f = JSON.stringify(file);
+    const go = join(dir, 'go');
+    const names = ['w0', 'w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7'];
+    const writer = (mine: string) => 'await sh("touch ' + join(dir, mine) + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await write(' + f + ', "' + mine + '\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }';
+    const out = run({ ...(tools ? { tools: [...tools] } : {}), statDelayMs: 250, steps: [...names.map((n) => ({ script: writer(n), keepTurn: true })), ...names.map((n) => ({ untilFile: join(dir, n) })), { touch: go }, { untilRunsDone: true }, { collect: true }] });
+    expect(out.results.map((r) => r.text)).toEqual(names.map(() => 'wrote'));
+    expect(names.map((n) => n + '\n')).toContain(readFileSync(file, 'utf8'));
+  });
+}
+
+test('A kill timer still waiting on a slow clock when the runner starts kills that runner only once', () => {
+  const dir = scratch();
+  const shim = join(dir, 'late-node');
+  writeFileSync(shim, '#!/bin/sh\nsleep 6.5\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n');
+  chmodSync(shim, 0o755);
+  const out = run({ clockNowDelayMs: 2000, env: { CODEMODE_NODE: shim }, steps: [{ script: '// @options: {"timeout_ms": 1000}\nwhile (true) {}', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('never yielded');
+  expect(out.kills).toHaveLength(1);
+});

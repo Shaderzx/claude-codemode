@@ -2844,6 +2844,7 @@ test('Two runs creating one new file through a dangling symlink whose target cli
   expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
   expect(texts.find((x) => x !== 'wrote')).toContain('has not been read yet');
   expect(readFileSync(real, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
+  expect(existsSync(join(dir, 'real.txt'))).toBe(false);
 });
 
 for (const [label, tools] of [['the patch tool', NO_BASH], ['Write', undefined]] as const) {
@@ -2948,3 +2949,22 @@ test('A forced patch write never takes an older read of the file as current', ()
   expect(out.results[1]!.text).toBe('wrote');
   expect(readFileSync(file, 'utf8')).toBe('from-codemode\n');
 });
+
+for (const [label, tools] of [['Read, Write and Edit', undefined], ['the patch tool', NO_BASH]] as const) {
+  test('A read, write and edit through ' + label + ' on a path whose .. climbs out of a symlinked folder reach the file the disk names', () => {
+    const dir = scratch();
+    mkdirSync(join(dir, 'x', 'y'), { recursive: true });
+    const intended = join(dir, 'x', 'real.txt');
+    const decoy = join(dir, 'real.txt');
+    writeFileSync(intended, 'INTENDED\n');
+    writeFileSync(decoy, 'DECOY\n');
+    const climbing = JSON.stringify(join(dir, 'sub') + '/../real.txt');
+    const out = run({ ...(tools ? { tools: [...tools] } : {}), steps: [
+      { link: { from: join(dir, 'sub'), to: 'x/y' } },
+      { script: 'const seen = (await read(' + climbing + ')).trim()\nawait edit(' + climbing + ', "INTENDED", "EDITED")\nawait write(' + climbing + ', (await read(' + climbing + ')).replace("EDITED", "MINE"))\nreturn seen' },
+    ] });
+    expect(out.results[0]!.text).toBe('INTENDED');
+    expect(readFileSync(intended, 'utf8')).toBe('MINE\n');
+    expect(readFileSync(decoy, 'utf8')).toBe('DECOY\n');
+  });
+}

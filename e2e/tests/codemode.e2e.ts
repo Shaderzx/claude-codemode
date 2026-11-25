@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
@@ -2602,9 +2602,10 @@ test('Two forced edits through the patch tool at once both land', () => {
   const f = JSON.stringify(file);
   const [a, b, go] = ['a-read', 'b-read', 'go'].map((n) => join(dir, n));
   const editor = (from: string, to: string, marker: string) => 'await read(' + f + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await edit(' + f + ', "' + from + '", "' + to + '", { force: true }); return "edited" } catch (e) { return String(e.message) }';
-  const out = run({ tools: NO_BASH, statDelayMs: 250, steps: [{ script: editor('alpha', 'ALPHA', a), keepTurn: true }, { script: editor('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const out = run({ tools: NO_BASH, statDelayMs: 250, steps: [{ script: editor('alpha', 'ALPHA', a), keepTurn: true }, { script: editor('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }, { script: 'try { await edit(' + f + ', "BETA", "BETA2"); return "edited-again" } catch (e) { return String(e.message) }' }] });
   expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['edited', 'edited']);
-  expect(readFileSync(file, 'utf8')).toBe('ALPHA\nBETA\n');
+  expect(out.results[2]!.text).toBe('edited-again');
+  expect(readFileSync(file, 'utf8')).toBe('ALPHA\nBETA2\n');
 });
 
 test('An edit through the patch tool counts a read another run brought back while it was running', () => {
@@ -2693,4 +2694,44 @@ test('A run whose runner starts more than five seconds late, within its start ti
   expect(out.collected[0]).toContain('finished');
   expect(out.collected[0]).not.toContain('[timeout]');
   expect(out.kills).toHaveLength(0);
+});
+
+test('Two forced writes through the patch tool at once both land', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const f = JSON.stringify(file);
+  const go = join(dir, 'go');
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const writer = (mine: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await write(' + f + ', "' + mine + '\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }';
+  const out = run({ tools: NO_BASH, statDelayMs: 250, steps: [{ script: writer('from-a', a), keepTurn: true }, { script: writer('from-b', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['wrote', 'wrote']);
+  expect(['from-a\n', 'from-b\n']).toContain(readFileSync(file, 'utf8'));
+});
+
+test('A kill timer whose clock answers slowly never kills a runner that already ended', () => {
+  const out = run({ clockEarlyMs: 5500, clockNowDelayMs: 50, steps: [{ script: '// @options: {"timeout_ms": 1500}\nawait sh("sleep 1.1")\nreturn "completed-in-time"', keepTurn: true }, { untilRunsDone: true }, { collect: true }, { script: 'await sh("sleep 5.6")\nreturn "later"' }] });
+  expect(out.collected[0]).toContain('completed-in-time');
+  expect(out.results[1]!.text).toBe('later');
+  expect(out.kills).toHaveLength(0);
+});
+
+test('Two runs creating one new file through a relative dangling symlink inside a symlinked folder never both write it', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'nested', 'deeper'), { recursive: true });
+  const real = join(dir, 'nested', 'real.txt');
+  const via = join(dir, 'sub', 'link.txt');
+  const go = join(dir, 'go');
+  const writer = (path: string, mine: string, marker: string) => 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(path) + ', content: "' + mine + '\\n" })\nreturn r.ok ? "wrote" : r.error';
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, writeDelayMs: 800, steps: [
+    { link: { from: join(dir, 'sub'), to: 'nested/deeper' } },
+    { link: { from: join(dir, 'nested', 'deeper', 'link.txt'), to: '../real.txt' } },
+    { script: writer(real, 'from-a', a), keepTurn: true }, { script: writer(via, 'from-b', b), keepTurn: true },
+    { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true },
+  ] });
+  const texts = [out.results[0]!.text, out.results[1]!.text];
+  expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
+  expect(texts.find((x) => x !== 'wrote')).toContain('has not been read yet');
+  expect(readFileSync(real, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
 });

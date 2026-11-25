@@ -11,6 +11,7 @@ type Case = {
   statDelayMs?: number
   hangListMs?: number
   hangListCount?: number
+  clockNowDelayMs?: number
   loadDelayMs?: number
   failReplyAfter?: { fail: number; after: number }
   surfaces?: string[]
@@ -603,7 +604,10 @@ const $ = {
       }))),
   },
   clock: {
-    now: async () => Date.now(),
+    now: async () => {
+      if (c.clockNowDelayMs) await new Promise((r) => setTimeout(r, c.clockNowDelayMs))
+      return Date.now()
+    },
     after: (ms: number, fn: () => void) => {
       if (c.clockFrozen && sessionStarted) return { cancel: () => undefined }
       const h = setTimeout(fn, Math.max(0, ms - (c.clockEarlyMs ?? 0)))

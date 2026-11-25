@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'e2e';
@@ -2296,4 +2296,73 @@ test('A slow run that read an older version of a file cannot make a newer read c
     { script: 'const r = await call("Write", { file_path: ' + f + ', content: "v3\\n" })\nreturn r.ok ? "wrote-v3" : r.error', keepTurn: true }, { untilRunsDone: true }, { collect: true },
   ] });
   expect(out.results[2]!.text).toBe('wrote-v3');
+});
+
+test('Two runs writing one file through ~/ and its full path never both pass the read check', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const [a, b, go] = ['a-read', 'b-read', 'go'].map((n) => join(dir, n));
+  const writer = (path: string, mine: string, marker: string) => 'await read(' + JSON.stringify(file) + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { timeout: 20000, every: 10 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(path) + ', content: "' + mine + '\\n" })\nreturn r.ok ? "wrote" : r.error';
+  const out = run({ home: dir, cwd: dir, writeDelayMs: 800, steps: [{ script: writer(file, 'from-a', a), keepTurn: true }, { script: writer('~/f.txt', 'from-b', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const texts = [out.results[0]!.text, out.results[1]!.text];
+  expect(texts.filter((x) => x === 'wrote')).toHaveLength(1);
+  expect(texts.find((x) => x !== 'wrote')).toContain('modified since read');
+  expect(readFileSync(file, 'utf8')).toBe(texts[0] === 'wrote' ? 'from-a\n' : 'from-b\n');
+});
+
+test('A spill clean-up never deletes saved outputs another session wrote in the last day', () => {
+  const dir = scratch();
+  const spills = join(dir, '.claude', 'codemode', 'out');
+  mkdirSync(spills, { recursive: true });
+  const theirs = Array.from({ length: 201 }, (_, i) => join(spills, 'other-session-' + i + '.txt'));
+  theirs.forEach((p, i) => {
+    writeFileSync(p, 'theirs ' + i);
+    const at = (Date.now() - (i + 1) * 1000) / 1000;
+    utimesSync(p, at, at);
+  });
+  run({ home: dir, cwd: dir, steps: [{ script: 'return "S".repeat(30000)' }] });
+  expect(theirs.filter((p) => !existsSync(p))).toEqual([]);
+});
+
+test('A run that works until its time is up makes no tool call after it', () => {
+  const dir = scratch();
+  const mark = join(dir, 'late-call');
+  const out = run({ steps: [{ script: '// @options: {"timeout_ms": 2000}\nwhile (deadline() > 0) {}\nawait call("Bash", { command: "touch ' + mark + '" })\nreturn 1', keepTurn: true }, { untilRunsDone: true }, { untilQuiet: true }, { collect: true }] });
+  expect(out.collected[0]).toContain('[timeout]');
+  expect(existsSync(mark)).toBe(false);
+});
+
+test('Esc with no turn ids while a newer turn starts never marks the newer turn idle', () => {
+  const dir = scratch();
+  const [gate, started] = ['gate', 'started'].map((n) => join(dir, n));
+  const out = run({ surfaces: ['terminal'], killDelayMs: 600, steps: [
+    { turnStart: '' },
+    { script: 'await waitFor(() => sh("test -f ' + gate + '"), { timeout: 30000 })\nreturn "earlier"', keepTurn: true },
+    { turnComplete: '' },
+    { turnStart: '' },
+    { script: 'await sh("touch ' + started + '")\nreturn String(await sh("timeout 30 tail -f /dev/null"))', keepTurn: true },
+    { untilFile: started },
+    { touch: gate },
+    { untilRunDone: 'r1' },
+    { abortAndStart: { abort: '', start: '' } },
+    { untilRunDone: 'r2' },
+  ] });
+  expect(out.wakeAttempts).toBe(0);
+});
+
+test('An older run\'s partial read never moves a newer partial read\'s progress back', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'a\nb\nc\nd');
+  const f = JSON.stringify(file);
+  const [gate, read1] = ['gate', 'read1'].map((n) => join(dir, n));
+  const out = run({ steps: [
+    { script: 'await call("Read", { file_path: ' + f + ', offset: 1, limit: 1 })\nawait sh("touch ' + read1 + '")\nawait waitFor(() => sh("test -f ' + gate + '"), { timeout: 20000 })\nreturn "slow"', keepTurn: true },
+    { untilFile: read1 },
+    { script: 'await call("Read", { file_path: ' + f + ', offset: 1, limit: 2 })\nreturn "first-half"', keepTurn: true },
+    { untilRunDone: 'r2' }, { collect: true }, { touch: gate }, { untilRunDone: 'r1' }, { collect: true },
+    { script: 'await call("Read", { file_path: ' + f + ', offset: 3, limit: 2 })\nconst r = await call("Write", { file_path: ' + f + ', content: "new\\n" })\nreturn r.ok ? "wrote" : r.error', keepTurn: true }, { untilRunsDone: true }, { collect: true },
+  ] });
+  expect(out.results[2]!.text).toBe('wrote');
 });

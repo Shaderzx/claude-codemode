@@ -3911,3 +3911,91 @@ test('A patch path starting with ~ that climbs with .. is refused like any other
   for (const part of out.results[0]!.text.split(' | ')) expect(part).toContain('full path');
   expect(readFileSync(join(home, 'f.txt'), 'utf8')).toBe('alpha\n');
 });
+
+test('A read() of a climbing path whose symlink moves between pages never stitches two files', () => {
+  const dir = scratch();
+  bigTwins(dir, 2400, (tag, i) => tag + ' ' + String(i).padStart(4, '0'));
+  mkdirSync(join(dir, 'X', 'deep'));
+  mkdirSync(join(dir, 'Y', 'deep'));
+  const sub = join(dir, 'sub');
+  const script = 'const p = read(' + JSON.stringify(sub + '/../big.txt') + ')\nawait sh("ln -sfn ' + join(dir, 'Y', 'deep') + ' ' + sub + '")\ntry { const t = await p; return (t.includes("XXXX 0000") ? "X" : "") + (t.includes("YYYY 2399") ? "Y" : "") } catch (e) { return String(e.message) }';
+  const out = run({ readLagMs: 400, steps: [{ link: { from: sub, to: join(dir, 'X', 'deep') } }, { script }] });
+  expect(out.results[0]!.text).not.toBe('XY');
+  expect(out.results[0]!.text).toMatch(/^Y$|changed while it was read/);
+});
+
+const lateHandBack = (kind: 'whole' | 'pages') => {
+  const dir = scratch();
+  const p = join(dir, 'p.txt');
+  writeFileSync(p, 'alpha\nbeta\n');
+  const count = kind === 'whole' ? 2000 : 200;
+  const qs = Array.from({ length: count }, (_, i) => join(dir, 'q' + i + '.txt'));
+  for (const q of qs) writeFileSync(q, 'one\ntwo\n');
+  const gateFile = join(dir, 'gate');
+  const pf = JSON.stringify(p);
+  const older = '// @options: {"timeout_ms": 240000}\nfor (const q of ' + JSON.stringify(qs) + ') ' + (kind === 'whole' ? 'await read(q)' : 'await call("Read", { file_path: q, offset: 1, limit: 1 })') + '\nawait waitFor(() => sh("test -f ' + gateFile + '"), { every: 200, timeout: 200000 })\nreturn "older"';
+  const newer = kind === 'whole' ? 'await read(' + pf + ')\nreturn "newer"' : 'await call("Read", { file_path: ' + pf + ', offset: 1, limit: 1 })\nreturn "newer"';
+  const last = kind === 'whole' ? 'try { await edit(' + pf + ', "alpha", "ALPHA"); return "edited" } catch (e) { return String(e.message) }' : 'await call("Read", { file_path: ' + pf + ', offset: 2 })\nconst r = await call("Write", { file_path: ' + pf + ', content: "mine\\n" })\nreturn r.ok ? "wrote" : r.error';
+  const ready = join(dir, 'older-read');
+  const olderMarked = older.replace('\nawait waitFor', '\nawait sh("touch ' + ready + '")\nawait waitFor');
+  const out = run({ ...(kind === 'whole' ? { tools: [...NO_BASH] } : {}), steps: [
+    { script: olderMarked, keepTurn: true },
+    { untilFile: ready },
+    { script: newer, keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { touch: gateFile },
+    { untilRunDone: 'r1' },
+    { collect: true },
+    { script: last },
+  ] });
+  expect(out.results[out.results.length - 1]!.text).toBe(kind === 'whole' ? 'edited' : 'wrote');
+};
+
+test('A file read after an older run read two thousand others still counts once that older run is handed back', () => lateHandBack('whole'));
+test('A page chain started after an older run paged two hundred others still counts once that older run is handed back', () => lateHandBack('pages'));
+
+test('A patch batch climbing two symlinks to one file is refused when either moves while it waits for another write lock', () => {
+  const dir = scratch();
+  for (const d of ['X/deep', 'Y/deep']) mkdirSync(join(dir, d), { recursive: true });
+  writeFileSync(join(dir, 'X', 'f.txt'), 'bbbb\ncccc\naaaa\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'bbbb\ncccc\naaaa\n');
+  const [sub1, sub2] = ['sub1', 'sub2'].map((n) => join(dir, n));
+  const [aReady, bReady, bAsked, go, goB] = ['a-ready', 'b-ready', 'b-asked', 'go', 'go-b'].map((n) => join(dir, n));
+  const gate = (ready: string, start: string) => 'await sh("touch ' + ready + '")\nawait waitFor(() => sh("test -f ' + start + '"), { every: 20, timeout: 20000 })\n';
+  const a = 'await read(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ')\n' + gate(aReady, go) + 'await edit(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', "aaaa", "AAAA")\nreturn "A edited"';
+  const b = gate(bReady, goB) + 'await sh("touch ' + bAsked + '")\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + JSON.stringify(sub1 + '/../f.txt') + ', old_text: "bbbb", new_text: "BBBB" }, { op: "replace_unique", path: ' + JSON.stringify(sub2 + '/../f.txt') + ', old_text: "cccc", new_text: "CCCC" }] })\nreturn r.ok ? "B patched" : "B refused: " + r.error';
+  const out = run({ tools: NO_BASH, patchDelayMs: 1500, steps: [
+    { link: { from: sub1, to: join(dir, 'X', 'deep') } },
+    { link: { from: sub2, to: join(dir, 'X', 'deep') } },
+    { script: a, keepTurn: true },
+    { script: b, keepTurn: true },
+    { untilFile: aReady },
+    { untilFile: bReady },
+    { touch: go },
+    { untilTool: 'mcp__lean-ctx__ctx_patch' },
+    { touch: goB },
+    { untilFile: bAsked },
+    { script: 'await sh("ln -sfn ' + join(dir, 'Y', 'deep') + ' ' + sub1 + '")\nreturn "moved"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  expect(out.results.map((r) => r.text).join('\n')).toContain('B refused: ');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('bbbb\ncccc\nAAAA\n');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('bbbb\ncccc\naaaa\n');
+});
+
+test('A file edited through Edit at the end of a run that read two thousand other files first still counts as read once handed back', () => {
+  const dir = scratch();
+  const p = join(dir, 'p.txt');
+  writeFileSync(p, 'alpha\nbeta\n');
+  const qs = Array.from({ length: 2000 }, (_, i) => join(dir, 'q' + i + '.txt'));
+  for (const q of qs) writeFileSync(q, 'q\n');
+  const pf = JSON.stringify(p);
+  const out = run({ engineForgets: true, steps: [
+    { script: '// @options: {"timeout_ms": 240000}\nawait read(' + pf + ')\nfor (const q of ' + JSON.stringify(qs) + ') await read(q)\nawait edit(' + pf + ', "alpha", "ALPHA")\nreturn "edited-1"' },
+    { script: 'try { await edit(' + pf + ', "beta", "BETA"); return "edited-2" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results.map((r) => r.text)).toEqual(['edited-1', 'edited-2']);
+  expect(readFileSync(p, 'utf8')).toBe('ALPHA\nBETA\n');
+});

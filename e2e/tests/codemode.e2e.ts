@@ -4008,3 +4008,41 @@ test('A lean-ctx read path starting with ~ that climbs with .. reaches the tool 
   const out = run({ cwd: dir, home, tools: ['Read', 'ToolSearch', 'mcp__lean-ctx__ctx_read', 'mcp__lean-ctx__ctx_search'], steps: [{ script: 'await call("mcp__lean-ctx__ctx_read", { path: "~/sub/../f.txt" })\nawait call("mcp__lean-ctx__ctx_search", { pattern: "alpha", path: "~/sub/.." })\nreturn "sent"' }] });
   expect(out.calls.filter((c) => /ctx_(read|search)$/.test(c.tool)).map((c) => (c.args as { path?: string }).path)).toEqual(['~/sub/../f.txt', '~/sub/..']);
 });
+
+test('A newer edit survives an older read handed back after two thousand reads and a patch of an unread file', () => {
+  const dir = scratch();
+  const p = join(dir, 'p.txt');
+  writeFileSync(p, 'v1\n');
+  const u = join(dir, 'u.txt');
+  writeFileSync(u, 'unread\n');
+  const qs = Array.from({ length: 1999 }, (_, i) => join(dir, 'q' + i + '.txt'));
+  for (const q of qs) writeFileSync(q, 'q\n');
+  const [ready, gate] = ['ready', 'gate'].map((n) => join(dir, n));
+  const pf = JSON.stringify(p);
+  const out = run({ tools: NO_BASH, steps: [
+    { script: 'await read(' + pf + ')\nawait sh("touch ' + ready + '")\nawait waitFor(() => sh("test -f ' + gate + '"), { every: 200, timeout: 200000 })\nreturn "r1"', keepTurn: true },
+    { untilFile: ready },
+    { script: 'await read(' + pf + ')\nawait edit(' + pf + ', "v1", "v2")\nreturn "r2"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { script: '// @options: {"timeout_ms": 240000}\nfor (const q of ' + JSON.stringify(qs) + ') await read(q)\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + JSON.stringify(u) + ', old_text: "unread", new_text: "patched" })\nreturn "r3"', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { collect: true },
+    { touch: gate },
+    { untilRunDone: 'r1' },
+    { collect: true },
+    { script: 'try { await edit(' + pf + ', "v2", "v3"); return "edited" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[out.results.length - 1]!.text).toBe('edited');
+  expect(readFileSync(p, 'utf8')).toBe('v3\n');
+});
+
+test('A read() of a big file batched with a short Read of it still counts the file as read', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  writeFileSync(big, Array.from({ length: 2400 }, (_, i) => 'line ' + i).join('\n') + '\n');
+  const b = JSON.stringify(big);
+  const out = run({ steps: [{ script: 'const [full] = await Promise.all([read(' + b + '), tools.Read({ file_path: ' + b + ', limit: 10 })])\ntry { await edit(' + b + ', "line 0\\n", "LINE 0\\n"); return "edited " + full.split("\\n").length } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toBe('edited 2401');
+  expect(readFileSync(big, 'utf8').startsWith('LINE 0\n')).toBe(true);
+});

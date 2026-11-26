@@ -748,6 +748,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (!now) throw empty()
       r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
+      if (unreadWrite(r) && !MOVED.test(String(r.error))) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
       if (unreadWrite(r)) throw moved()
       throw toolError('write: ' + r.error + endings(r.error), r)
     }
@@ -804,6 +805,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       r = await req('call', { tool: patch, args, ...guardOf((await forcedRead(file, 'edit')).check) })
     }
     if (r.ok) return wrote(file, 'edited')
+    if (unreadWrite(r) && !force && !MOVED.test(String(r.error))) throw unread(r)
     if (unreadWrite(r)) throw moved(r)
     throw toolError('edit: ' + r.error + endings(r.error), r)
   }
@@ -1953,7 +1955,7 @@ const withHeld = (r: unknown, held: string) => {
   return { ...base, block: typeof base.block === 'string' && base.block ? `${base.block}\n\n${held}` : held }
 }
 const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: Record<string, string>, timeout: number, maxChars: number): Promise<{ result: RunResult }> => {
-  const pagesStarted = new Map<string, string | undefined>()
+  const pagesStarted = new Map<string, { version?: string; real?: string }>()
   const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
   const all = listing.map((t) => ({ name: t.name, description: t.description }))
   const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
@@ -2096,7 +2098,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (typeof p.expectedVersion === 'string' && /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && typeof args.path === 'string') {
       const path = normal(absolute(args.path.trim(), cwd, home))
       const real = typeof p.expectedReal === 'string' ? p.expectedReal : await realOf(path)
-      if ((await versionOf(real)) !== p.expectedVersion || (await movedSinceLocked(m, path, real))) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+      if (!job.reads.has(real) && !readPaths.has(real)) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
+      const recorded = job.reads.has(real) ? job.reads.get(real) : readVersions.get(real)
+      if (recorded !== p.expectedVersion || (await versionOf(real)) !== p.expectedVersion || (await movedSinceLocked(m, path, real))) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
       args.path = real
     }
     if (tool === 'Read' && typeof args.file_path === 'string') args.file_path = absolute(args.file_path.trim(), cwd, home)
@@ -2125,10 +2129,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const patchKeys = new Map<string, string>()
     for (const o of patchOps) if (!patchKeys.has(o.path)) patchKeys.set(o.path, await realOf(o.path))
     for (const o of patchOps)
-      if (o.op !== 'create' && !patchFresh.has(o.path)) {
+      if (o.op !== 'create' && !patchFresh.has(patchKeys.get(o.path) as string)) {
         const key = patchKeys.get(o.path) as string
         const was = job.reads.has(key) ? job.reads.get(key) : readPaths.has(key) ? readVersions.get(key) : undefined
-        patchFresh.set(o.path, was !== undefined && was === (await versionOf(o.path)))
+        patchFresh.set(key, was !== undefined && was === (await versionOf(o.path)))
       }
     if (late()) {
       release?.()
@@ -2244,15 +2248,17 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
       }
       const readNow: string[] = []
-      const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => o.path))
+      const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
       const forgetEverywhere = (k: string) => {
-        for (const j of [job, ...jobsById.values()].filter((j) => j === job || j.gen === sessionGen)) {
+        const forgetIn = (j: Job) => {
           j.reads.delete(k)
           j.readAt.delete(k)
           j.progress.delete(k)
           j.progressAt.delete(k)
         }
+        forgetIn(job)
         if (job.gen !== sessionGen) return
+        for (const j of jobsById.values()) if (j.gen === sessionGen) forgetIn(j)
         readPaths.delete(k)
         readVersions.delete(k)
         readProgress.delete(k)
@@ -2261,7 +2267,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       for (const o of patchOps) {
         const key = patchKeys.get(o.path) as string
-        if (created.has(o.path) || patchFresh.get(o.path) === true) {
+        if (created.has(key) || patchFresh.get(key) === true) {
           job.reads.set(key, await versionOf(o.path))
           job.readAt.set(key, ++readClock)
           readNow.push(o.path)
@@ -2273,8 +2279,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const from = typeof args.offset === 'number' ? args.offset : 1
         const pages = typeof p.readId === 'number' ? `${args.file_path}#${p.readId}` : args.file_path
         const first = pagesStarted.get(pages)
-        if (from === 1) pagesStarted.set(pages, readBefore)
-        else if (first !== undefined && (readBefore !== first || readAfter !== first)) {
+        const heldStill = readBefore !== undefined && readBefore === readAfter && realBefore === realAfter
+        if (from === 1) pagesStarted.set(pages, heldStill ? { version: readBefore, real: realBefore } : {})
+        else if (first !== undefined && (!heldStill || readBefore !== first.version || realBefore !== first.real)) {
           tally.ok--
           tally.failed++
           return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
@@ -2356,7 +2363,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const start = offset
     const file = String(args.file_path)
     const version = await versionOf(file)
-    const moved = async () => version === undefined || (await versionOf(file)) !== version
+    const real = await realOf(file)
+    const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real
     for (let guard = 0; guard < 10_000; guard++) {
       if (over) return undefined
       const r = late() ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)

@@ -3902,3 +3902,12 @@ test('A patch with an empty path is passed to the patch tool instead of being re
   expect(out.results[0]!.text).not.toContain('now names another file');
   expect(out.calls.filter((c) => c.tool === 'mcp__lean-ctx__ctx_patch')).toHaveLength(1);
 });
+
+test('A patch path starting with ~ that climbs with .. is refused like any other ~ path and leaves the home file alone', () => {
+  const dir = scratch();
+  const home = scratch();
+  writeFileSync(join(home, 'f.txt'), 'alpha\n');
+  const out = run({ cwd: dir, home, tools: NO_BASH, steps: [{ script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: "~/sub/../f.txt", old_text: "alpha", new_text: "CLIMBED" })\nconst b = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: "~/sub/../f.txt", old_text: "alpha", new_text: "CLIMBED" }] })\nreturn (r.ok ? "patched" : r.error) + " | " + (b.ok ? "patched" : b.error)' }] });
+  for (const part of out.results[0]!.text.split(' | ')) expect(part).toContain('full path');
+  expect(readFileSync(join(home, 'f.txt'), 'utf8')).toBe('alpha\n');
+});

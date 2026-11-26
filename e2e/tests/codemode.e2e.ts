@@ -3368,3 +3368,52 @@ test('Relative and LS paths whose .. climbs out of a symlinked folder name the f
   const out = run({ cwd: dir, tools: ['Read', 'ToolSearch', 'Grep', 'LS'], steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'await call("Grep", { pattern: "INTENDED", path: "sub/.." })\nawait call("LS", { path: ' + JSON.stringify(join(dir, 'sub') + '/..') + ' })\nreturn "listed"' }] });
   for (const tool of ['Grep', 'LS']) expect((out.calls.find((c) => c.tool === tool)?.args as { path?: string } | undefined)?.path).toBe(join(dir, 'x'));
 });
+
+const stalePatchBesideOpenRead = (patched: 'X' | 'Y') => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  const ref = join(dir, 'ref');
+  for (const f of [join(dir, 'X', 'f.txt'), join(dir, 'Y', 'f.txt'), ref]) {
+    writeFileSync(f, f === ref ? '' : 'xxxx\n');
+    utimesSync(f, 1_700_000_000, 1_700_000_000);
+  }
+  const link = join(dir, 'L');
+  const target = join(dir, patched, 'f.txt');
+  const [zRead, go] = ['z-read', 'go'].map((n) => join(dir, n));
+  const z = 'await read(' + JSON.stringify(join(link, 'f.txt')) + ')\nawait sh("touch ' + zRead + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nreturn "Z done"';
+  const y = 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nawait sh("printf wwww\\\\\\\\n > ' + target + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + JSON.stringify(target) + ', old_text: "wwww", new_text: "pppp" })\nawait sh("touch -r ' + ref + ' ' + target + '")\nreturn "Y patched"';
+  const last = 'try { await write(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', "new\\n"); return "wrote" } catch (e) { return "refused: " + String(e.message) }';
+  const out = run({ tools: NO_BASH, steps: [{ link: { from: link, to: join(dir, 'X') } }, { script: z, keepTurn: true }, { untilFile: zRead }, { script: y, keepTurn: true }, { untilRunDone: 'r2' }, { collect: true }, { touch: go }, { untilRunsDone: true }, { collect: true }, { script: last }] });
+  return { text: out.results[out.results.length - 1]!.text, x: readFileSync(join(dir, 'X', 'f.txt'), 'utf8') };
+};
+
+test('A patch of a changed file forgets an open run read of it through a symlink that was re-pointed since', () => {
+  const got = stalePatchBesideOpenRead('X');
+  expect(got.text).toContain('refused: ');
+  expect(got.text).toContain('has not read it');
+  expect(got.x).toBe('pppp\n');
+});
+
+test('A patch of a changed file keeps an open run read of another file through a symlink re-pointed to it since', () => {
+  const got = stalePatchBesideOpenRead('Y');
+  expect(got.text).toBe('wrote');
+  expect(got.x).toBe('new\n');
+});
+
+test('A read whose symlink is re-pointed while it is read counts for neither file', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  for (const f of [join(dir, 'X', 'f.txt'), join(dir, 'Y', 'f.txt')]) {
+    writeFileSync(f, 'xxxx\n');
+    utimesSync(f, 1_700_000_000, 1_700_000_000);
+  }
+  const link = join(dir, 'L');
+  const go = join(dir, 'go');
+  const a = 'await read(' + JSON.stringify(join(link, 'f.txt')) + ')\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ', content: "CLOBBER\\n" })\nreturn r.ok ? "wrote" : r.error';
+  const out = run({ readDelayMs: 1500, steps: [{ link: { from: link, to: join(dir, 'X') } }, { script: a, keepTurn: true }, { untilTool: 'Read' }, { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nreturn "moved"', keepTurn: true }, { untilRunDone: 'r2' }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).not.toContain('\nwrote');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
+});

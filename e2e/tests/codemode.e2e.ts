@@ -3417,3 +3417,100 @@ test('A read whose symlink is re-pointed while it is read counts for neither fil
   expect(said).not.toContain('\nwrote');
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
 });
+
+const twinFiles = (dir: string, names: string[]) => {
+  for (const n of names) {
+    mkdirSync(dirname(join(dir, n)), { recursive: true });
+    writeFileSync(join(dir, n), n.endsWith('ref') ? '' : 'xxxx\n');
+    utimesSync(join(dir, n), 1_700_000_000, 1_700_000_000);
+  }
+};
+
+const writeThroughRepointedLink = (tools: readonly string[] | undefined) => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt']);
+  const viaL = JSON.stringify(join(dir, 'L', 'f.txt'));
+  const out = run({ ...(tools ? { tools: [...tools] } : {}), steps: [{ link: { from: join(dir, 'L'), to: join(dir, 'X') } }, { script: 'await read(' + viaL + ')\nawait sh("ln -sfn ' + join(dir, 'Y') + ' ' + join(dir, 'L') + '")\ntry { await write(' + viaL + ', "CLOBBER\\n"); return "wrote" } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toContain('has not read it');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
+};
+
+test('A write through a symlink re-pointed since its read is refused as unread', () => writeThroughRepointedLink(undefined));
+test('A patch write through a symlink re-pointed since its read is refused as unread', () => writeThroughRepointedLink(NO_BASH));
+
+test('A read through a re-pointed symlink keeps the read of the file the symlink named before', () => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt']);
+  const viaL = JSON.stringify(join(dir, 'L', 'f.txt'));
+  const out = run({ tools: NO_BASH, steps: [
+    { link: { from: join(dir, 'L'), to: join(dir, 'X') } },
+    { script: 'await read(' + viaL + ')\nreturn "r1"' },
+    { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + join(dir, 'L') + '")\nawait read(' + viaL + ')\nreturn "r2"' },
+    { script: 'try { await edit(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', "xxxx", "zzzz"); return "edited" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[2]!.text).toBe('edited');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('zzzz\n');
+});
+
+test('A file read through a file symlink with another name counts as read for edits by its own name', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'f.txt'), 'alpha\nbeta\n');
+  const out = run({ tools: NO_BASH, steps: [{ link: { from: join(dir, 'link.txt'), to: join(dir, 'f.txt') } }, { script: 'await read(' + JSON.stringify(join(dir, 'link.txt')) + ')\ntry { await edit(' + JSON.stringify(join(dir, 'f.txt')) + ', "alpha", "ALPHA"); return "edited" } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toBe('edited');
+  expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('ALPHA\nbeta\n');
+});
+
+test('A patch of a changed file stops a file symlink with another name from counting as read', () => {
+  const dir = scratch();
+  twinFiles(dir, ['f.txt', 'ref']);
+  const file = join(dir, 'f.txt');
+  const link = JSON.stringify(join(dir, 'link.txt'));
+  const out = run({ tools: NO_BASH, steps: [{ link: { from: join(dir, 'link.txt'), to: file } }, { script: 'await read(' + link + ')\nawait sh("printf wwww\\\\\\\\n > ' + file + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + JSON.stringify(file) + ', old_text: "wwww", new_text: "pppp" })\nawait sh("touch -r ' + join(dir, 'ref') + ' ' + file + '")\ntry { await write(' + link + ', "clobber\\n"); return "wrote" } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toContain('has not read it');
+  expect(readFileSync(file, 'utf8')).toBe('pppp\n');
+});
+
+const patchBesideOtherRun = (otherState: 'open' | 'settled') => {
+  const dir = scratch();
+  twinFiles(dir, ['B/f.txt', 'ref']);
+  const file = join(dir, 'B', 'f.txt');
+  const viaA = JSON.stringify(join(dir, 'A', 'f.txt'));
+  const [r1Read, go] = ['r1-read', 'go'].map((n) => join(dir, n));
+  const change = 'await sh("printf wwww\\\\\\\\n > ' + file + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + JSON.stringify(file) + ', old_text: "wwww", new_text: "pppp" })\nawait sh("touch -r ' + join(dir, 'ref') + ' ' + file + '")\n';
+  const clobber = 'try { await write(' + JSON.stringify(file) + ', "clobber\\n"); return "clobbered" } catch (e) { return "refused: " + String(e.message) }';
+  const r1 = otherState === 'open' ? 'await read(' + viaA + ')\nawait sh("touch ' + r1Read + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\n' + clobber : 'await read(' + viaA + ')\nreturn "r1 read"';
+  const steps = otherState === 'open'
+    ? [{ script: r1, keepTurn: true }, { untilFile: r1Read }, { script: change + 'await sh("touch ' + go + '")\nreturn "r2 patched"', keepTurn: true }, { untilRunsDone: true }, { collect: true }]
+    : [{ script: r1, keepTurn: true }, { untilRunDone: 'r1' }, { script: change + 'return "r2 patched"', keepTurn: true }, { untilRunDone: 'r2' }, { collect: true }, { script: clobber }];
+  const out = run({ tools: NO_BASH, steps: [{ link: { from: join(dir, 'A'), to: join(dir, 'B') } }, ...steps] });
+  expect(out.results.map((r) => r.text).join('\n')).toContain('refused: ');
+  expect(readFileSync(file, 'utf8')).toBe('pppp\n');
+};
+
+test('A patch of a changed file stops an open run read of it from counting as read', () => patchBesideOtherRun('open'));
+test('A patch of a changed file stops a finished but not yet handed back run read of it from counting as read', () => patchBesideOtherRun('settled'));
+
+test('A file read again after two thousand other reads still counts as read', () => {
+  const dir = scratch();
+  const files = Array.from({ length: 2001 }, (_, i) => join(dir, 'f' + i + '.txt'));
+  for (const f of files) writeFileSync(f, 'hello\n');
+  const out = run({ tools: NO_BASH, steps: [
+    { script: '// @options: {"timeout_ms": 300000}\nfor (const f of ' + JSON.stringify(files.slice(0, 2000)) + ') await read(f)\nreturn "read 2000"' },
+    { script: 'await read(' + JSON.stringify(files[0]) + ')\nawait read(' + JSON.stringify(files[2000]) + ')\nreturn "read 2"' },
+    { script: 'try { await edit(' + JSON.stringify(files[0]) + ', "hello", "world"); return "edited" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[2]!.text).toBe('edited');
+  expect(readFileSync(files[0]!, 'utf8')).toBe('world\n');
+});
+
+test('A read through a re-pointed symlink whose reply fails lends no read to the new target and keeps the old one', () => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt']);
+  const viaL = JSON.stringify(join(dir, 'L', 'f.txt'));
+  const script = 'await call("Read", { file_path: ' + viaL + ' })\nawait call("Bash", { command: "ln -sfn ' + join(dir, 'Y') + ' ' + join(dir, 'L') + '" })\nconst second = call("Read", { file_path: ' + viaL + ' })\nawait call("Bash", { command: "true" })\nawait second\nconst wy = await call("Write", { file_path: ' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ', content: "CLOBBER\\n" })\nconst ex = await call("Edit", { file_path: ' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', old_string: "xxxx", new_string: "zzzz" })\nreturn (wy.ok ? "wrote" : wy.error) + " | " + (ex.ok ? "edited" : ex.error)';
+  const out = run({ failReplyAfter: { fail: 3, after: 4 }, steps: [{ link: { from: join(dir, 'L'), to: join(dir, 'X') } }, { script }] });
+  expect(out.results[0]!.text).toContain('has not been read yet');
+  expect(out.results[0]!.text).toMatch(/ \| edited$/);
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('zzzz\n');
+});

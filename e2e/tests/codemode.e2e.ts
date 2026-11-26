@@ -640,7 +640,7 @@ test('JSON.parse passes a reviver\'s own error through unchanged', () => {
 });
 
 test('A rejected tool call nobody awaited is labelled a tool failure', () => {
-  expect(one('tools.Read({ file_path: "/nope3" })\nawait sh("echo x")\nreturn 1')).toContain('[tool]');
+  expect(one('let settled = false\ntools.Read({ file_path: "/nope3" }).finally(() => { settled = true })\nawait waitFor(() => settled, { every: 20, timeout: 20000 })\nreturn 1')).toContain('[tool]');
 });
 
 test('The mod holds its own output cap even when a script writes past the runner', () => {

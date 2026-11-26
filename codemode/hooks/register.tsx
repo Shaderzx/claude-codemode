@@ -1993,10 +1993,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       return { ok: true }
     }
     if (m.kind === 'fresh') {
-      const path = await readKeyOf(normal(String(p.path)))
+      const asked = normal(String(p.path))
+      const path = await readKeyOf(asked)
       const read = job.reads.has(path) || readPaths.has(path)
       const was = job.reads.has(path) ? job.reads.get(path) : readPaths.has(path) ? readVersions.get(path) : undefined
-      const now = was === undefined ? undefined : await versionOf(path)
+      const now = was === undefined ? undefined : await versionOf(asked)
       return { ok: true, read, fresh: was !== undefined && now !== undefined && now === was, version: was }
     }
     if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
@@ -2466,8 +2467,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (m.kind !== 'call') return undefined
     const tool = String(m.payload.tool)
     const lean = /^mcp__lean[-_]ctx__/.test(tool)
-    if (!lean && !/^(?:Read|Write|Edit|MultiEdit|NotebookEdit)$/.test(tool)) return undefined
-    const relative = lean || tool === 'Read'
+    if (!lean && !/^(?:Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead|Grep|Glob|LS)$/.test(tool)) return undefined
+    const relative = lean || /^(?:Read|NotebookRead|Grep|Glob|LS)$/.test(tool)
     const given = (m.payload.args && typeof m.payload.args === 'object' ? m.payload.args : {}) as Record<string, unknown>
     const preset = defaults[tool] ?? {}
     const args = { ...given }
@@ -2499,8 +2500,14 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     for (const k of candidates) if ((await (realAtRead.get(k) ?? realOf(k))) === real) same.push(k)
     return same
   }
-  const recordedAt = (k: string) => (job.reads.has(k) ? (job.readAt.get(k) ?? 0) : readPaths.has(k) ? (versionAt.get(k) ?? 0) : -1)
-  const newestSpellingOf = async (path: string) => (await sameFileKeys(path, [...job.reads.keys(), ...readPaths])).reduce((best, k) => (recordedAt(k) > recordedAt(best) ? k : best), path)
+  const newest = (keys: string[], at: (k: string) => number) => keys.reduce((best, k) => (at(k) > at(best) ? k : best))
+  const newestSpellingOf = async (path: string) => {
+    const spellings = [path, ...(await sameFileKeys(path, [...job.reads.keys(), ...readPaths]))]
+    const own = spellings.filter((k) => job.reads.has(k))
+    if (own.length) return newest(own, (k) => job.readAt.get(k) ?? 0)
+    const shared = spellings.filter((k) => readPaths.has(k))
+    return shared.length ? newest(shared, (k) => versionAt.get(k) ?? 0) : path
+  }
   const readKeyOf = newestSpellingOf
   const respond = async (m: Request) => {
     const lost = await resolveClimbs(m)

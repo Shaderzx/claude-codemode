@@ -3058,3 +3058,25 @@ test('A Read the mod pages that a failing call beside it cuts off is named as cu
   expect(text).toMatch(/Read 1 cut off/);
   expect(text).not.toMatch(/Read 1 still running/);
 });
+
+test('A path that climbs out of a symlinked folder and then through a missing folder is refused and touches no file', () => {
+  const dir = climbingFolder();
+  const lost = join(dir, 'sub') + '/../sub/../real.txt';
+  const p = JSON.stringify(lost);
+  const attempt = (call: string) => 'try { ' + call + '; return "done" } catch (e) { return String(e.message) }';
+  const out = run({ steps: [
+    { link: { from: join(dir, 'sub'), to: 'x/y' } },
+    { script: attempt('await read(' + p + ')') },
+    { script: attempt('await write(' + p + ', "MINE\\n", { force: true })') },
+    { script: attempt('await edit(' + p + ', "INTENDED", "MINE", { force: true })') },
+  ] });
+  for (const r of out.results) expect(r.text).toContain('names no file on disk');
+  expect(readFileSync(join(dir, 'real.txt'), 'utf8')).toBe('DECOY\n');
+  expect(readFileSync(join(dir, 'x', 'real.txt'), 'utf8')).toBe('INTENDED\n');
+});
+
+test('Reading a folder says it is a folder', () => {
+  const dir = scratch();
+  const out = run({ steps: [{ script: 'try { await read(' + JSON.stringify(dir) + '); return "read" } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toContain(dir + ' is a folder, not a file');
+});

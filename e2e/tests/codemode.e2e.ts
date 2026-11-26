@@ -3724,7 +3724,8 @@ const patchWhileLinkMovesForLock = (what: 'create' | 'replace') => {
   const name = what === 'create' ? 'new.txt' : 'f.txt';
   const [aReady, bReady, bAsked, go, goB] = ['a-ready', 'b-ready', 'b-asked', 'go', 'go-b'].map((n) => join(dir, n));
   const gate = (ready: string, start: string) => 'await sh("touch ' + ready + '")\nawait waitFor(() => sh("test -f ' + start + '"), { every: 20, timeout: 20000 })\n';
-  const a = 'await read(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ')\n' + gate(aReady, go) + 'await edit(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', "xxxx", "AAAA")\nreturn "A edited"';
+  const aAct = what === 'create' ? 'await write(' + JSON.stringify(join(dir, 'X', name)) + ', "A\\n")' : 'await edit(' + JSON.stringify(join(dir, 'X', name)) + ', "xxxx", "AAAA")';
+  const a = (what === 'create' ? '' : 'await read(' + JSON.stringify(join(dir, 'X', name)) + ')\n') + gate(aReady, go) + aAct + '\nreturn "A edited"';
   const bCall = what === 'create' ? 'await write(' + JSON.stringify(join(link, name)) + ', "B\\n").then(() => "B wrote", (e) => "B refused: " + e.message)' : 'await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + JSON.stringify(join(link, name)) + ', old_text: "xxxx", new_text: "BBBB" }).then((r) => (r.ok ? "B patched" : "B refused: " + r.error))';
   const b = (what === 'create' ? '' : 'await read(' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ')\n') + gate(bReady, goB) + 'await sh("touch ' + bAsked + '")\nreturn ' + bCall;
   const out = run({ tools: NO_BASH, patchDelayMs: 1500, steps: [

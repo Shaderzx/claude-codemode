@@ -2131,6 +2131,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const patchFresh = new Map<string, boolean>()
     const patchKeys = new Map<string, string>()
     for (const o of patchOps) if (!patchKeys.has(o.path)) patchKeys.set(o.path, await realOf(o.path))
+    for (const [given, real] of patchKeys)
+      if (await movedSinceLocked(m, given, real)) return { ok: false, error: `${given} now names another file than the one this patch waited to lock, so nothing was changed; patch it again` }
     const pinned = (v: unknown) => patchKeys.get(patchPath(v) ?? '') ?? v
     if (patchOps.length) {
       if (typeof args.path === 'string') args.path = pinned(args.path)
@@ -2140,7 +2142,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (o.op !== 'create' && !patchFresh.has(patchKeys.get(o.path) as string)) {
         const key = patchKeys.get(o.path) as string
         const was = job.reads.has(key) ? job.reads.get(key) : readPaths.has(key) ? readVersions.get(key) : undefined
-        patchFresh.set(key, was !== undefined && was === (await versionOf(o.path)))
+        patchFresh.set(key, was !== undefined && was === (await versionOf(key)))
       }
     if (late()) {
       release?.()
@@ -2270,13 +2272,15 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         readPaths.delete(k)
         readVersions.delete(k)
         readProgress.delete(k)
+        versionAt.delete(k)
         versionAt.set(k, ++readClock)
+        progressAt.delete(k)
         progressAt.set(k, readClock)
       }
       for (const o of patchOps) {
         const key = patchKeys.get(o.path) as string
         if (created.has(key) || patchFresh.get(key) === true) {
-          job.reads.set(key, await versionOf(o.path))
+          job.reads.set(key, await versionOf(key))
           job.readAt.set(key, ++readClock)
           readNow.push(o.path)
         } else forgetEverywhere(key)

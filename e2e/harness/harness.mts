@@ -10,6 +10,7 @@ type Case = {
   killDelayMs?: number
   writeDelayMs?: number
   patchDelayMs?: number
+  patchLostAfterApply?: boolean
   existsGapMs?: number
   lastPartMayBeMissing?: boolean
   holdLaterPages?: { asked: string; gate: string }
@@ -526,6 +527,7 @@ const $ = {
         fakesPending--
         lastActivity = Date.now()
       })
+      if (c.patchLostAfterApply && tool === 'mcp__lean-ctx__ctx_patch' && r.isError !== true) throw new Error('MCP error -32000: Connection closed')
       const t = typeof r.text === 'string' ? r.text : undefined
       if (r.isError !== true && t !== undefined && t.length > 50000 && String(tool).startsWith('mcp__') && !c.noSwap) {
         const saved = join(c.env?.CLAUDE_CONFIG_DIR ?? join(home, '.claude'), 'projects', 'p', 's', 'tool-results', String(tool).slice(5).replace(/__/g, '-') + '-' + Date.now() + '-' + ++swapped + '.txt')

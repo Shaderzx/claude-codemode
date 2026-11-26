@@ -2198,17 +2198,18 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       forgetIn(job)
       for (const j of jobsById.values()) if (j.gen === sessionGen) forgetIn(j)
+      const stamp = ++readClock
       if (sawBeforeSent(k, readVersions.get(k), versionAt.get(k))) {
         readPaths.delete(k)
         readVersions.delete(k)
         readProgress.delete(k)
+        versionAt.delete(k)
+        versionAt.set(k, stamp)
       }
-      versionAt.delete(k)
-      versionAt.set(k, ++readClock)
       progressAt.delete(k)
-      progressAt.set(k, readClock)
+      progressAt.set(k, stamp)
       forgottenAt.delete(k)
-      forgottenAt.set(k, readClock)
+      forgottenAt.set(k, stamp)
       dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
     }
     const outdateEverywhere = (k: string) => {

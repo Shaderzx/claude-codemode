@@ -3333,3 +3333,38 @@ test('A forced write in a two-second run of a file that never stops changing say
   const out = run({ changeEveryRead: true, readDelayMs: 100, steps: [{ script: '// @options: {"timeout_ms": 2000}\ntry { await write(' + JSON.stringify(file) + ', "mine\\n", { force: true }); return "landed" } catch (x) { return String(x.message) }' }] });
   expect(out.results[0]!.text).toContain('the run ran out of time while it kept changing');
 });
+
+const otherRunRepoints = (tools: readonly string[] | undefined, act: 'edit-read' | 'write-unread') => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'xxxx\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'yyyy\n');
+  utimesSync(join(dir, 'X', 'f.txt'), 1_700_000_000, 1_700_000_000);
+  utimesSync(join(dir, 'Y', 'f.txt'), 1_700_000_000, 1_700_000_000);
+  const link = join(dir, 'L');
+  const viaL = JSON.stringify(join(link, 'f.txt'));
+  const [yRead, zRead, go] = ['y-read', 'z-read', 'go'].map((n) => join(dir, n));
+  const yAct = act === 'edit-read' ? 'await edit(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', "xxxx", "zzzz")' : 'await write(' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ', "CLOBBER\\n")';
+  const y = 'await read(' + viaL + ')\nawait sh("touch ' + yRead + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { ' + yAct + '; return "Y done" } catch (e) { return "Y refused: " + String(e.message) }';
+  const z = 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nawait read(' + viaL + ')\nawait sh("touch ' + zRead + '")\nawait waitFor(() => sh("test -f ' + join(dir, 'never') + '"), { every: 50, timeout: 20000 })\nreturn "Z"';
+  const out = run({ ...(tools ? { tools: [...tools] } : {}), steps: [{ link: { from: link, to: join(dir, 'X') } }, { script: y, keepTurn: true }, { untilFile: yRead }, { script: z, keepTurn: true }, { untilFile: zRead }, { touch: go }, { untilRunDone: 'r1' }, { collect: true }] });
+  const said = out.results.map((r) => r.text).join('\n');
+  if (act === 'edit-read') {
+    expect(said).toContain('Y done');
+    expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('zzzz\n');
+  } else {
+    expect(said).toContain('Y refused: ');
+    expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('yyyy\n');
+  }
+};
+
+test('A run read through a symlink still names the file it read after another run re-reads the re-pointed link', () => otherRunRepoints(NO_BASH, 'edit-read'));
+test('A run cannot write a file it never read because another run read a re-pointed link to it', () => otherRunRepoints(undefined, 'write-unread'));
+test('A run cannot patch a file it never read because another run read a re-pointed link to it', () => otherRunRepoints(NO_BASH, 'write-unread'));
+
+test('Relative and LS paths whose .. climbs out of a symlinked folder name the folder the disk names', () => {
+  const dir = climbingFolder();
+  const out = run({ cwd: dir, tools: ['Read', 'ToolSearch', 'Grep', 'LS'], steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'await call("Grep", { pattern: "INTENDED", path: "sub/.." })\nawait call("LS", { path: ' + JSON.stringify(join(dir, 'sub') + '/..') + ' })\nreturn "listed"' }] });
+  for (const tool of ['Grep', 'LS']) expect((out.calls.find((c) => c.tool === tool)?.args as { path?: string } | undefined)?.path).toBe(join(dir, 'x'));
+});

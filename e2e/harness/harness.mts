@@ -74,7 +74,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; untilReadlink?: string; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -465,6 +465,7 @@ let wakesPending = 0
 let wakesSeen = 0
 let statsPending = 0
 let existsAsked = 0
+const linksRead: string[] = []
 let existsAnswered = 0
 let bashWaits = 0
 let listsHanging = 0
@@ -614,6 +615,7 @@ const $ = {
       c.strictRealpath && argv[0] === 'realpath' && !existsSync(String(argv[1]))
         ? Promise.resolve({ exitCode: 1, stdout: '', stderr: 'realpath: ' + argv[1] + ': No such file or directory' })
         : (argv[0] === 'kill' ? kills.push([...argv]) : 0, (argv[0] === 'kill' && c.killDelayMs ? new Promise((r) => setTimeout(r, c.killDelayMs)) : Promise.resolve()).then(() => new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
+        if (argv[0] === 'readlink') linksRead.push(String(argv[1]))
         const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
         if (p.pid !== undefined) live.add(p.pid)
         if (argv[0] === 'bash') bashWaits++
@@ -799,6 +801,11 @@ for (const s of c.steps) {
   if (s.relink) {
     rmSync(s.relink.from, { force: true })
     symlinkSync(s.relink.to, s.relink.from)
+    continue
+  }
+  if (s.untilReadlink) {
+    const link = s.untilReadlink
+    await until(() => linksRead.some((p) => p === link || p.endsWith(link)), 30_000, 'the mod reading the link ' + link)
     continue
   }
   if (s.untilExists) {

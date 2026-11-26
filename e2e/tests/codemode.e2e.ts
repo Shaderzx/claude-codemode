@@ -4408,6 +4408,143 @@ test('A patch whose answer cannot be handed to the script still makes the patche
   expect(readFileSync(f, 'utf8')).toBe('ALPHA\nbeta\n');
 });
 
+const changeLandingAfterItsRunEnded = (how: 'patch beside a failing call' | 'create in a run that timed out' | 'write beside a failing call') => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const ref = join(dir, 'ref');
+  if (how !== 'create in a run that timed out') writeFileSync(f, 'aaaa\nbeta\n');
+  writeFileSync(ref, '');
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  if (how !== 'create in a run that timed out') utimesSync(f, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const first = how === 'patch beside a failing call'
+    ? 'await read(' + q + ')\nawait Promise.all([tools.mcp__lean_ctx__ctx_patch({ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "AAAA" }), tools.mcp__lean_ctx__ctx_shell({ command: "exit 1" })])'
+    : how === 'write beside a failing call'
+      ? 'await read(' + q + ')\nawait Promise.all([tools.Write({ file_path: ' + q + ', content: "AAAA\\nbeta\\n" }), tools.Bash({ command: "exit 1" })])'
+      : '// @options: {"timeout_ms": 1000}\nwhile (deadline() > 250) {}\nawait call("mcp__lean-ctx__ctx_patch", { op: "create", path: ' + q + ', new_text: "PRECIOUS\\n" })';
+  const out = run({ ...(how === 'write beside a failing call' ? { engineForgets: true, writeDelayMs: 300 } : { tools: NO_BASH, patchDelayMs: how === 'create in a run that timed out' ? 600 : 300 }), steps: [
+    { script: first, keepTurn: true },
+    { untilRunsDone: true },
+    { untilQuiet: true },
+    { collect: true },
+    { script: (how === 'write beside a failing call' ? 'await sh("touch -r ' + ref + ' ' + f + '")\n' : '') + 'try { await write(' + q + ', "ZZZZ\\nbeta\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('later refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(how === 'create in a run that timed out' ? 'PRECIOUS\n' : 'AAAA\nbeta\n');
+};
+
+test('A patch landing after its run failed beside it never lets a later run write over it unread', () => changeLandingAfterItsRunEnded('patch beside a failing call'));
+test('A file a timed-out run created after its end is never counted as read', () => changeLandingAfterItsRunEnded('create in a run that timed out'));
+test('A Write landing after its run failed beside it never lets a later run write over it unread', () => changeLandingAfterItsRunEnded('write beside a failing call'));
+
+test('A Write whose answer cannot be handed to the script makes the writer read the file again', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(f, 'aaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const script = 'await read(' + q + ')\nconst r = await call("Write", { file_path: ' + q + ', content: "bbbb\\n" })\nif (r.ok) return "wrote"\nawait sh("touch -r ' + ref + ' ' + f + '")\ntry { await write(' + q + ', "cccc\\n"); return "failed | writer wrote again" } catch (e) { return "failed | writer refused: " + e.message }';
+  const out = run({ engineForgets: true, failReplyAfter: { fail: 2, after: 2 }, steps: [{ script }] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('writer refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('bbbb\n');
+});
+
+const readStartedAfterLatePatchLanded = (reader: 'paged read' | 'page chain' | 'page chain handed back') => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  const lines = reader === 'paged read' ? 2400 : 3;
+  writeFileSync(file, ['alpha', ...Array.from({ length: lines - 1 }, (_, i) => 'line ' + String(i + 2).padStart(4, '0'))].join('\n') + '\n');
+  const f = JSON.stringify(file);
+  const [applied, answer, asked, gate, started, go] = ['applied', 'answer', 'later-asked', 'gate', 'started', 'go'].map((n) => join(dir, n));
+  const edit = 'try { await edit(' + f + ', "patched", "edited"); return "edited" } catch (e) { return "failed: " + e.message }';
+  const waitGo = 'await waitFor(() => sh("test -f ' + go + '"), { every: 2000, timeout: 60000 })\n';
+  const first = reader === 'paged read'
+    ? 'try { await read(' + f + ') } catch (e) { return "failed: " + e.message }\n' + edit
+    : reader === 'page chain'
+      ? 'await tools.Read({ file_path: ' + f + ', offset: 1, limit: 1 })\nawait sh("touch ' + started + '")\n' + waitGo + 'await tools.Read({ file_path: ' + f + ', offset: 2 })\n' + edit
+      : 'await tools.Read({ file_path: ' + f + ', offset: 1, limit: 1 })\nreturn "chain started"';
+  const out = run({ tools: NO_BASH, patchAnswerGate: { applied, gate: answer }, ...(reader === 'paged read' ? { holdLaterPages: { asked, gate } } : {}), steps: [
+    { script: 'await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + f + ', old_text: "alpha", new_text: "patched" })\nreturn "patched"', keepTurn: true },
+    { untilFile: applied },
+    { clear: true },
+    { reload: true },
+    { script: first, keepTurn: true },
+    ...(reader === 'paged read' ? [{ untilFile: asked }] : reader === 'page chain' ? [{ untilFile: started }] : [{ untilRunsDone: true }, { collect: true }]),
+    { touch: answer },
+    { untilQuiet: true },
+    ...(reader === 'paged read' ? [{ touch: gate }] : reader === 'page chain' ? [{ touch: go }] : []),
+    { untilRunsDone: true },
+    { collect: true },
+    ...(reader === 'page chain handed back' ? [{ script: 'await tools.Read({ file_path: ' + f + ', offset: 2 })\n' + edit }] : []),
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).not.toContain('failed: ');
+  expect(said).toContain('edited');
+  expect(readFileSync(file, 'utf8').startsWith('edited')).toBe(true);
+};
+
+test('A late patch from a cleared session never fails a paged read the new session started after it landed', () => readStartedAfterLatePatchLanded('paged read'));
+test('A late patch from a cleared session leaves a page chain the new session started after it landed intact', () => readStartedAfterLatePatchLanded('page chain'));
+test('A late patch from a cleared session leaves a handed-back page chain started after it landed intact', () => readStartedAfterLatePatchLanded('page chain handed back'));
+
+test('An open read() never stitches pages across a newer read that another run handed back', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const ref = join(dir, 'ref');
+  const lines = (tag: string) => Array.from({ length: 2400 }, (_, i) => tag + ' ' + String(i).padStart(4, '0')).join('\n') + '\n';
+  writeFileSync(big, lines('AAAA'));
+  writeFileSync(join(dir, 'b.txt'), lines('BBBBBB'));
+  writeFileSync(join(dir, 'c.txt'), lines('CCCC'));
+  writeFileSync(ref, '');
+  utimesSync(big, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const b = JSON.stringify(big);
+  const [asked, gate] = ['page-back', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, holdReplyContaining: { text: 'AAAA 0000', asked, gate }, steps: [
+    { script: 'try { await read(' + b + '); await write(' + b + ', "CLOBBERED\\n"); return "r1 wrote" } catch (e) { return "r1: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { script: 'await sh("cp ' + join(dir, 'b.txt') + ' ' + big + '")\nawait read(' + b + ')\nreturn "r2 read"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { script: 'await sh("cp ' + join(dir, 'c.txt') + ' ' + big + '")\nawait sh("touch -r ' + ref + ' ' + big + '")\nreturn "changed outside"', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('changed while it was read in pages');
+  expect(said).not.toContain('r1 wrote');
+  expect(readFileSync(big, 'utf8')).toBe(lines('CCCC'));
+});
+
+test('A page chain from before a newer handed-back read never completes into a read of the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const ref = join(dir, 'ref');
+  const lines = (tag: string) => Array.from({ length: 4 }, () => tag).join('\n') + '\n';
+  writeFileSync(f, lines('aaaa'));
+  writeFileSync(join(dir, 'b.txt'), lines('bbbbbb'));
+  writeFileSync(join(dir, 'c.txt'), lines('cccc'));
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const out = run({ engineForgets: true, steps: [
+    { script: 'await tools.Read({ file_path: ' + q + ', offset: 1, limit: 2 })\nreturn "r1 started"' },
+    { script: 'await sh("cp ' + join(dir, 'b.txt') + ' ' + f + '")\nawait read(' + q + ')\nreturn "r2 read"' },
+    { script: 'await sh("cp ' + join(dir, 'c.txt') + ' ' + f + ' && touch -r ' + ref + ' ' + f + '")\nawait tools.Read({ file_path: ' + q + ', offset: 3 })\nconst w = await call("Write", { file_path: ' + q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r3 wrote" : "r3 refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(lines('cccc'));
+});
+
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {
   const dir = scratch();
   const f = join(dir, 'f.txt');

@@ -705,7 +705,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (Date.now() >= settleBy) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
     }
   }
-  const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version } : {})
+  const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version, ...(typeof check.real === 'string' ? { expectedReal: check.real } : {}) } : {})
   const unreadWrite = (r) => !r.ok && !r.refused && !r.denied && UNREAD.test(String(r.error))
   const write = async (path, content, opts) => {
     const file = absOnly(path, 'write')
@@ -1797,7 +1797,9 @@ const promoteReads = (j: Job) => {
   for (const [p, chain] of j.progress) {
     const at = j.progressAt.get(p) ?? 0
     if (at < (progressAt.get(p) ?? 0)) continue
+    progressAt.delete(p)
     progressAt.set(p, at)
+    readProgress.delete(p)
     readProgress.set(p, chain)
   }
   while (progressAt.size > 2000) progressAt.delete(progressAt.keys().next().value as string)
@@ -1983,6 +1985,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const root = `${home}/.claude/codemode/runs`
   const dir = `${root}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${++runs}`
 
+  const lockedReals = new WeakMap<Request, Set<string>>()
+  const movedSinceLocked = async (m: Request, path: string, real: string) => (await realOf(path)) !== real || !(lockedReals.get(m)?.has(real) ?? true)
   const versionOf = (path: string): Promise<string | undefined> =>
     $.fs.stat(path, { resolve: true }).then(
       (s) => (typeof s?.mtimeMs === 'number' ? `${s.mtimeMs}:${s.size}` : undefined),
@@ -2004,7 +2008,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const read = job.reads.has(path) || readPaths.has(path)
       const was = job.reads.has(path) ? job.reads.get(path) : readPaths.has(path) ? readVersions.get(path) : undefined
       const now = was === undefined ? undefined : await versionOf(asked)
-      return { ok: true, read, fresh: was !== undefined && now !== undefined && now === was, version: was }
+      return { ok: true, read, fresh: was !== undefined && now !== undefined && now === was, version: was, real: path }
     }
     if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
     if (m.kind === 'jobs') return { ok: true, value: running(job) }
@@ -2083,14 +2087,17 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (!readPaths.has(key) && !job.reads.has(key) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
       if (exists) {
         const was = job.reads.has(key) ? job.reads.get(key) : readVersions.get(key)
-        const now = await versionOf(path)
-        if (was === undefined || now === undefined || now !== was)
+        const now = await versionOf(key)
+        if (was === undefined || now === undefined || now !== was || (await movedSinceLocked(m, path, key)))
           return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+        args.file_path = key
       }
     }
     if (typeof p.expectedVersion === 'string' && /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && typeof args.path === 'string') {
       const path = normal(absolute(args.path.trim(), cwd, home))
-      if ((await versionOf(path)) !== p.expectedVersion) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+      const real = typeof p.expectedReal === 'string' ? p.expectedReal : await realOf(path)
+      if ((await versionOf(real)) !== p.expectedVersion || (await movedSinceLocked(m, path, real))) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+      args.path = real
     }
     if (tool === 'Read' && typeof args.file_path === 'string') args.file_path = absolute(args.file_path.trim(), cwd, home)
     // Plugins cannot run the Agent tool; codemode-agents spawns instead.
@@ -2504,6 +2511,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     let out: Record<string, unknown>
     const unlocks: (() => void)[] = []
     const real = await Promise.all(writeTargets(m, cwd, home, defaults).map(realOf))
+    lockedReals.set(m, new Set(real))
     for (const path of [...new Set(real)].sort()) unlocks.push(await lockFile(path))
     try {
       out = lost ? { ok: false, error: lost } : await handle(m)

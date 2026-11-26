@@ -3551,8 +3551,8 @@ const linkMovesDuringWrite = (slow: { tools?: string[]; readDelayMs?: number; st
   const writer = 'await read(' + viaL + ')\nawait sh("touch ' + marker + '")\ntry { await write(' + viaL + ', "CLOBBER\\n"); return "wrote" } catch (e) { return String(e.message) }';
   const out = run({ ...slow, steps: [{ link: { from: link, to: join(dir, 'X') } }, { script: writer, keepTurn: true }, { untilFile: marker }, { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nreturn "moved"', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
-  expect(['xxxx\n', 'CLOBBER\n']).toContain(readFileSync(join(dir, 'X', 'f.txt'), 'utf8'));
-  expect(out.results.map((r) => r.text).join('\n')).toContain('moved');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('xxxx\n');
+  expect(out.results.map((r) => r.text).join('\n')).toMatch(/changed since this session read it|has not read it/);
 };
 
 test('A patch write through a symlink moved while the write runs never lands on the file the symlink moved to', () => linkMovesDuringWrite({ tools: [...NO_BASH], readDelayMs: 1500 }));
@@ -3656,3 +3656,36 @@ test('A patch batch that creates a file through a symlink and edits it by its re
   expect(out.results[0]!.text).toBe('edited');
   expect(readFileSync(join(dir, 'B', 'f.txt'), 'utf8')).toBe('ALPHA\nBETA\n');
 });
+
+const linkMovesWhileWaitingForLock = (target: 'existing' | 'new') => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt']);
+  const name = target === 'existing' ? 'f.txt' : 'new.txt';
+  const link = join(dir, 'L');
+  const [aReady, bReady, bAsked, go, goB] = ['a-ready', 'b-ready', 'b-asked', 'go', 'go-b'].map((n) => join(dir, n));
+  const gate = (ready: string, start: string) => 'await sh("touch ' + ready + '")\nawait waitFor(() => sh("test -f ' + start + '"), { every: 20, timeout: 20000 })\n';
+  const a = (target === 'existing' ? 'await read(' + JSON.stringify(join(dir, 'X', name)) + ')\n' : '') + gate(aReady, go) + 'const r = await call("Write", { file_path: ' + JSON.stringify(join(dir, 'X', name)) + ', content: "A\\n" })\nreturn r.ok ? "A wrote" : "A: " + r.error';
+  const b = (target === 'existing' ? 'await read(' + JSON.stringify(join(dir, 'Y', name)) + ')\n' : '') + gate(bReady, goB) + 'await sh("touch ' + bAsked + '")\nconst r = await call("Write", { file_path: ' + JSON.stringify(join(link, name)) + ', content: "B\\n" })\nreturn r.ok ? "B wrote" : "B refused: " + r.error';
+  const out = run({ writeDelayMs: 1500, steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script: a, keepTurn: true },
+    { script: b, keepTurn: true },
+    { untilFile: aReady },
+    { untilFile: bReady },
+    { touch: go },
+    { untilTool: 'Write' },
+    { touch: goB },
+    { untilFile: bAsked },
+    { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nreturn "moved"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('A wrote');
+  expect(said).toContain('B refused: ');
+  expect(readFileSync(join(dir, 'X', name), 'utf8')).toBe('A\n');
+  expect(existsSync(join(dir, 'Y', name)) ? readFileSync(join(dir, 'Y', name), 'utf8') : 'absent').toBe(target === 'existing' ? 'xxxx\n' : 'absent');
+};
+
+test('A Write through a symlink that moves while it waits for another write lock is refused and leaves the new target alone', () => linkMovesWhileWaitingForLock('existing'));
+test('A Write creating a file through a symlink that moves while it waits for another write lock is refused and creates nothing', () => linkMovesWhileWaitingForLock('new'));

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 type Case = {
   clockEarlyMs?: number
@@ -10,6 +10,7 @@ type Case = {
   writeDelayMs?: number
   patchDelayMs?: number
   existsGapMs?: number
+  lastPartMayBeMissing?: boolean
   holdLaterPages?: { asked: string; gate: string }
   statDelayMs?: number
   hangListMs?: number
@@ -471,6 +472,7 @@ let wakesPending = 0
 let wakesSeen = 0
 let statsPending = 0
 let existsAsked = 0
+const lstatSafe = (p: string) => { try { return lstatSync(p) } catch { return undefined } }
 const linksRead: string[] = []
 let existsAnswered = 0
 let bashWaits = 0
@@ -618,7 +620,9 @@ const $ = {
       })()
     },
     run: (argv: string[], _init?: unknown) =>
-      c.strictRealpath && argv[0] === 'realpath' && !existsSync(String(argv[1]))
+      c.lastPartMayBeMissing && argv[0] === 'realpath' && !lstatSafe(String(argv[1])) && existsSync(dirname(String(argv[1])))
+        ? Promise.resolve({ exitCode: 0, stdout: join(realpathSync(dirname(String(argv[1]))), basename(String(argv[1]))) + '\n', stderr: '' })
+        : c.strictRealpath && argv[0] === 'realpath' && !existsSync(String(argv[1]))
         ? Promise.resolve({ exitCode: 1, stdout: '', stderr: 'realpath: ' + argv[1] + ': No such file or directory' })
         : (argv[0] === 'kill' ? kills.push([...argv]) : 0, (argv[0] === 'kill' && c.killDelayMs ? new Promise((r) => setTimeout(r, c.killDelayMs)) : Promise.resolve()).then(() => new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
         if (argv[0] === 'readlink') linksRead.push(String(argv[1]))

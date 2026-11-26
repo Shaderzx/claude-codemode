@@ -2311,9 +2311,28 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         forgottenAt.set(k, readClock)
         dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
       }
+      const outdateEverywhere = (k: string) => {
+        const outdateIn = (j: Job) => {
+          if (j !== job && j.reads.has(k)) j.reads.set(k, undefined)
+          if (j !== job) {
+            j.progress.delete(k)
+            j.progressAt.delete(k)
+          }
+          for (const [id, started] of j.pages) if (started.real === k) j.pages.set(id, {})
+        }
+        outdateIn(job)
+        if (job.gen !== sessionGen) return
+        for (const j of jobsById.values()) if (j.gen === sessionGen) outdateIn(j)
+        readVersions.delete(k)
+        readProgress.delete(k)
+        forgottenAt.delete(k)
+        forgottenAt.set(k, ++readClock)
+        dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
+      }
       for (const o of patchOps) {
         const key = patchKeys.get(o.path) as string
         if (created.has(key) || patchFresh.get(key) === true) {
+          outdateEverywhere(key)
           const version = await versionOf(key)
           job.progress.delete(key)
           job.progressAt.delete(key)

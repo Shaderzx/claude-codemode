@@ -3237,3 +3237,99 @@ test('A Grep or Glob path whose .. climbs out of a symlinked folder searches the
   const out = run({ tools: ['Read', 'ToolSearch', 'Grep', 'Glob'], steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'await call("Grep", { pattern: "INTENDED", path: ' + JSON.stringify(climbing) + ' })\nawait call("Glob", { pattern: "*.txt", path: ' + JSON.stringify(climbing) + ' })\nreturn "searched"' }] });
   for (const tool of ['Grep', 'Glob']) expect((out.calls.find((c) => c.tool === tool)?.args as { path?: string } | undefined)?.path).toBe(join(dir, 'x'));
 });
+
+test('A cancelled run that read through a re-pointed symlink lends no read to the new target and keeps the delivered read of the old one', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'xxxx\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'yyyy\n');
+  utimesSync(join(dir, 'X', 'f.txt'), 1_700_000_000, 1_700_000_000);
+  utimesSync(join(dir, 'Y', 'f.txt'), 1_700_000_000, 1_700_000_000);
+  const link = join(dir, 'L');
+  const viaL = JSON.stringify(join(link, 'f.txt'));
+  const mark = join(dir, 'r2-read');
+  const out = run({ steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script: 'await read(' + viaL + ')\nreturn "r1"', keepTurn: true },
+    { untilRunDone: 'r1' },
+    { collect: true },
+    { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nawait read(' + viaL + ')\nawait sh("touch ' + mark + '")\nawait waitFor(() => sh("test -f ' + join(dir, 'never') + '"), { every: 50, timeout: 30000 })\nreturn "r2"', keepTurn: true },
+    { untilFile: mark },
+    { script: 'return String(await cancel("r2"))', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'const wy = await call("Write", { file_path: ' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ', content: "clobbered\\n" })\nconst wx = await call("Write", { file_path: ' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', content: "updated-x\\n" })\nreturn (wy.ok ? "wrote" : wy.error) + " | " + (wx.ok ? "wrote" : wx.error)' },
+  ] });
+  const last = out.results[out.results.length - 1]!.text;
+  expect(last).toContain('has not been read yet');
+  expect(last).toMatch(/ \| wrote$/);
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('yyyy\n');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('updated-x\n');
+});
+
+test('A patch after the file changed stops every spelling of it from counting as read', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'B'));
+  const file = join(dir, 'B', 'f.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(file, 'initial\n');
+  writeFileSync(ref, '');
+  utimesSync(file, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const viaA = JSON.stringify(join(dir, 'A', 'f.txt'));
+  const viaB = JSON.stringify(file);
+  const out = run({ tools: NO_BASH, steps: [
+    { link: { from: join(dir, 'A'), to: join(dir, 'B') } },
+    { script: 'await read(' + viaA + ')\nawait read(' + viaB + ')\nawait sh("printf changed\\\\\\\\n > ' + file + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + viaB + ', old_text: "changed", new_text: "patched" })\nawait sh("touch -r ' + ref + ' ' + file + '")\ntry { await write(' + viaB + ', "clobber\\n"); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[0]!.text).toContain('has not read it');
+  expect(readFileSync(file, 'utf8')).toBe('patched\n');
+});
+
+test('A cancelled patch edit under one spelling leaves a delivered read under another spelling counted, and changed', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'B'));
+  writeFileSync(join(dir, 'B', 'f.txt'), 'alpha\nbeta\n');
+  const viaA = JSON.stringify(join(dir, 'A', 'f.txt'));
+  const viaB = JSON.stringify(join(dir, 'B', 'f.txt'));
+  const edited = join(dir, 'edited');
+  const out = run({ tools: NO_BASH, steps: [
+    { link: { from: join(dir, 'A'), to: join(dir, 'B') } },
+    { script: 'await read(' + viaA + ')\nreturn "r1"' },
+    { script: 'await edit(' + viaB + ', "alpha", "ALPHA")\nawait sh("touch ' + edited + '")\nawait waitFor(() => sh("test -f ' + join(dir, 'never') + '"), { every: 50, timeout: 30000 })\nreturn "r2"', keepTurn: true },
+    { untilFile: edited },
+    { script: 'return String(await cancel("r2"))', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await edit(' + viaA + ', "beta", "BETA"); return "edited" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[out.results.length - 1]!.text).toContain('changed since this session read it');
+  expect(readFileSync(join(dir, 'B', 'f.txt'), 'utf8')).toBe('ALPHA\nbeta\n');
+});
+
+test('A forced write in a two-second run lands while hundreds of other files of the same name count as read', () => {
+  const dir = scratch();
+  const names = Array.from({ length: 400 }, (_, i) => join(dir, 'd' + i, 'index.ts'));
+  for (const n of names) {
+    mkdirSync(dirname(n), { recursive: true });
+    writeFileSync(n, 'x\n');
+  }
+  const target = join(dir, 'target', 'index.ts');
+  mkdirSync(dirname(target));
+  writeFileSync(target, 'old\n');
+  const out = run({ steps: [
+    { script: '// @options: {"timeout_ms": 120000}\nfor (const n of ' + JSON.stringify(names) + ') await read(n)\nreturn "read"' },
+    { script: '// @options: {"timeout_ms": 2000}\ntry { await write(' + JSON.stringify(target) + ', "new\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[1]!.text).toBe('wrote');
+  expect(readFileSync(target, 'utf8')).toBe('new\n');
+});
+
+test('A forced write in a two-second run of a file that never stops changing says the run ran out of time', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'original\n');
+  const out = run({ changeEveryRead: true, readDelayMs: 100, steps: [{ script: '// @options: {"timeout_ms": 2000}\ntry { await write(' + JSON.stringify(file) + ', "mine\\n", { force: true }); return "landed" } catch (x) { return String(x.message) }' }] });
+  expect(out.results[0]!.text).toContain('the run ran out of time while it kept changing');
+});

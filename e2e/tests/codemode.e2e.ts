@@ -3230,3 +3230,10 @@ test('An edit of a file read through a symlink that was then pointed elsewhere c
   expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('zzzz\n');
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('yyyyyy\n');
 });
+
+test('A Grep or Glob path whose .. climbs out of a symlinked folder searches the folder the disk names', () => {
+  const dir = climbingFolder();
+  const climbing = join(dir, 'sub') + '/..';
+  const out = run({ tools: ['Read', 'ToolSearch', 'Grep', 'Glob'], steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'await call("Grep", { pattern: "INTENDED", path: ' + JSON.stringify(climbing) + ' })\nawait call("Glob", { pattern: "*.txt", path: ' + JSON.stringify(climbing) + ' })\nreturn "searched"' }] });
+  for (const tool of ['Grep', 'Glob']) expect((out.calls.find((c) => c.tool === tool)?.args as { path?: string } | undefined)?.path).toBe(join(dir, 'x'));
+});

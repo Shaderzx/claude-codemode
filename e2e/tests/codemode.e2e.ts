@@ -3183,7 +3183,7 @@ const shortRace = (tools: readonly string[] | undefined, readFirst: boolean, op:
   const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
   const act = (from: string, to: string) => (op === 'write' ? 'await write(' + f + ', "' + to + '\\n", { force: true })' : 'await edit(' + f + ', "' + from + '", "' + to + '", { force: true })');
   const racer = (from: string, to: string, marker: string) => '// @options: {"timeout_ms": 2000}\n' + (readFirst ? 'await read(' + f + ')\n' : '') + 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 1500 })\ntry { ' + act(from, to) + '; return "landed" } catch (e) { return String(e.message) }';
-  const out = run({ ...(tools ? { tools: [...tools] } : {}), statDelayMs: 120, steps: [{ script: racer('alpha', 'ALPHA', a), keepTurn: true }, { script: racer('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const out = run({ ...(tools ? { tools: [...tools] } : {}), statDelayMs: 50, steps: [{ script: racer('alpha', 'ALPHA', a), keepTurn: true }, { script: racer('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
   expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['landed', 'landed']);
   const text = readFileSync(file, 'utf8');
   if (op === 'edit') expect(text).toBe('ALPHA\nBETA\n');

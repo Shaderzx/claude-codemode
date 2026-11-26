@@ -680,8 +680,13 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     seen.add(file)
     return verb + ' ' + file
   }
-  const timeToRetry = () => started + timeout - Date.now() > 2000
-  const pause = (n) => sleep(Math.min(500, 10 * 2 ** n) * (1 + Math.random()))
+  const timeToRetry = (tryStarted) => started + timeout - Date.now() > Math.max(500, Date.now() - tryStarted + 100)
+  const pause = (n) => sleep(Math.min(Math.min(500, 10 * 2 ** n) * (1 + Math.random()), Math.max(0, started + timeout - Date.now() - 400)))
+  const freshOf = async (file, what) => {
+    const check = await req('fresh', { path: file })
+    if (!check || check.ok === false) throw toolError(what + ': ' + (check && check.error), check)
+    return check
+  }
   const forcedRead = async (file, what) => {
     const settleBy = Date.now() + 5000
     for (let n = 0; ; n++) {
@@ -693,7 +698,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         if (!/changed while it was read/i.test(String(err && err.message))) throw err
       }
       if (text !== undefined) {
-        const check = await req('fresh', { path: file })
+        const check = await freshOf(file, what)
         if (check.fresh === true && typeof check.version === 'string') return { text, check }
       }
       if (Date.now() >= settleBy || started + timeout - Date.now() < 300) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
@@ -711,9 +716,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (unreadWrite(r) && !force) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace it unread', r)
       for (let n = 0; unreadWrite(r); n++) {
         if (n) await pause(n)
+        const tryStarted = Date.now()
         await forcedRead(file, 'write')
         r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
-        if (!timeToRetry()) break
+        if (!timeToRetry(tryStarted)) break
       }
       if (r.ok) return wrote(file)
       if (r.denied && r.alt) denied.add('Write')
@@ -734,7 +740,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       return crlf ? once(now.split('\n').join('\r\n')) : first
     }
     if (!force) {
-      const check = await req('fresh', { path: file })
+      const check = await freshOf(file, 'write')
       if (!check.read) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
       if (check.fresh === false) throw moved()
       const now = await readText(file, true)
@@ -746,11 +752,12 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     }
     for (let n = 0; ; n++) {
       if (n) await pause(n)
+      const tryStarted = Date.now()
       const { text: now, check } = await forcedRead(file, 'write')
       if (!now) throw empty()
       r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
-      if (!unreadWrite(r) || !timeToRetry()) break
+      if (!unreadWrite(r) || !timeToRetry(tryStarted)) break
     }
     throw toolError('write: ' + r.error + endings(r.error), r)
   }
@@ -767,9 +774,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (unreadWrite(r) && !force) throw unread(r)
       for (let n = 0; unreadWrite(r); n++) {
         if (n) await pause(n)
+        const tryStarted = Date.now()
         await forcedRead(file, 'edit')
         r = await req('call', { tool: 'Edit', args })
-        if (!timeToRetry()) break
+        if (!timeToRetry(tryStarted)) break
       }
       if (r.ok) return wrote(file, 'edited')
       if (r.denied && r.alt) denied.add('Edit')
@@ -778,7 +786,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const patch = patcher()
     if (!patch) throw toolError('edit: this session has no Edit tool and no patch tool')
     const moved = (r) => toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
-    let check = await req('fresh', { path: file })
+    let tryStarted = Date.now()
+    let check = await freshOf(file, 'edit')
     let reread = false
     if (!check.read || check.fresh === false) {
       if (!force) throw check.read ? moved() : unread()
@@ -787,9 +796,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     }
     const args = { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }
     let r = await req('call', { tool: patch, args, ...guardOf(check) })
-    for (let n = 1; force && unreadWrite(r) && (!reread || timeToRetry()); n++) {
+    for (let n = 1; force && unreadWrite(r) && (!reread || timeToRetry(tryStarted)); n++) {
       if (reread) await pause(n)
       reread = true
+      tryStarted = Date.now()
       r = await req('call', { tool: patch, args, ...guardOf((await forcedRead(file, 'edit')).check) })
     }
     if (r.ok) return wrote(file, 'edited')
@@ -2419,6 +2429,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
   }
   const climbs = (v: unknown) => typeof v === 'string' && /(^|\/)\.\.(\/|$)/.test(v.trim())
+  const isFolder = (p: string) => $.fs.stat(p, { resolve: true }).then((st) => st?.kind === 'dir', () => false)
   const climb = async (p: string, hops = 0): Promise<string | undefined> => {
     const segs = p.split('/').filter((seg) => seg !== '' && seg !== '.')
     const kept: string[] = []
@@ -2427,9 +2438,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         kept.push(segs[i] as string)
         continue
       }
-      const link = kept.length && hops < 40 ? await readlink('/' + kept.join('/')) : undefined
+      if (hops >= 40) return undefined
+      const link = kept.length ? await readlink('/' + kept.join('/')) : undefined
       if (link === undefined) {
-        if (hops && kept.length && !(await $.fs.exists('/' + kept.join('/')).catch(() => false))) return undefined
+        if (hops && kept.length && !(await isFolder('/' + kept.join('/')))) return undefined
         kept.pop()
         continue
       }
@@ -2444,8 +2456,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (e.startsWith('/')) return climb(e)
     return relative && cwd ? climb(`${cwd.replace(/\/$/, '')}/${e}`) : v
   }
+  const namesNoFile = (v: string) => `${v} climbs out of a symlinked folder and then through a folder that does not exist there, so it names no file on disk`
   const resolveClimbs = async (m: Request): Promise<string | undefined> => {
-    if (m.kind === 'fresh' && climbs(m.payload.path)) m.payload.path = (await onDisk(String(m.payload.path))) ?? m.payload.path
+    if (m.kind === 'fresh' && climbs(m.payload.path)) {
+      const found = await onDisk(String(m.payload.path))
+      if (found === undefined) return namesNoFile(String(m.payload.path).trim())
+      m.payload.path = found
+    }
     if (m.kind !== 'call') return undefined
     const tool = String(m.payload.tool)
     const lean = /^mcp__lean[-_]ctx__/.test(tool)
@@ -2466,22 +2483,25 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     if (Array.isArray(args.ops)) args.ops = await Promise.all((args.ops as Record<string, unknown>[]).map(async (o) => (o && climbs(o.path) ? { ...o, path: await place(o.path) } : o)))
     m.payload.args = args
-    return lost.length ? `${lost[0]} climbs out of a symlinked folder and then through a folder that does not exist there, so it names no file on disk` : undefined
+    return lost.length ? namesNoFile(lost[0] as string) : undefined
   }
   const recordReal = (path: string) => {
     realAtRead.delete(path)
     realAtRead.set(path, realOf(path))
     while (realAtRead.size > 2000) realAtRead.delete(realAtRead.keys().next().value as string)
   }
-  const sameFileKey = async (path: string, keys: Iterable<string>) => {
+  const sameFileKeys = async (path: string, keys: Iterable<string>) => {
     const name = path.slice(path.lastIndexOf('/'))
     const candidates = [...new Set(keys)].filter((k) => k !== path && k.endsWith(name))
-    if (!candidates.length) return undefined
+    if (!candidates.length) return []
     const real = await realOf(path)
-    for (const k of candidates) if ((await (realAtRead.get(k) ?? realOf(k))) === real) return k
-    return undefined
+    const same: string[] = []
+    for (const k of candidates) if ((await (realAtRead.get(k) ?? realOf(k))) === real) same.push(k)
+    return same
   }
-  const readKeyOf = async (path: string) => (job.reads.has(path) || readPaths.has(path) ? path : ((await sameFileKey(path, [...job.reads.keys(), ...readPaths])) ?? path))
+  const recordedAt = (k: string) => (job.reads.has(k) ? (job.readAt.get(k) ?? 0) : readPaths.has(k) ? (versionAt.get(k) ?? 0) : -1)
+  const newestSpellingOf = async (path: string) => (await sameFileKeys(path, [...job.reads.keys(), ...readPaths])).reduce((best, k) => (recordedAt(k) > recordedAt(best) ? k : best), path)
+  const readKeyOf = newestSpellingOf
   const respond = async (m: Request) => {
     const lost = await resolveClimbs(m)
     let out: Record<string, unknown>

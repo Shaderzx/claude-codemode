@@ -1697,6 +1697,7 @@ type Job = {
   quiet: boolean
   reads: Map<string, string | undefined>
   readAt: Map<string, number>
+  pages: Map<string, { version?: string; real?: string; next?: number }>
   progress: Map<string, { next: number; version?: string }>
   progressAt: Map<string, number>
   gen: number
@@ -1760,7 +1761,7 @@ const expire = (j: Job) => {
 export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string, timeout: number): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), pages: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
   job.pidKnown = new Promise<void>((r) => (job.onPid = r))
   jobsById.set(job.id, job)
   return job
@@ -1962,7 +1963,6 @@ const withHeld = (r: unknown, held: string) => {
   return { ...base, block: typeof base.block === 'string' && base.block ? `${base.block}\n\n${held}` : held }
 }
 const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: Record<string, string>, timeout: number, maxChars: number): Promise<{ result: RunResult }> => {
-  const pagesStarted = new Map<string, { version?: string; real?: string; next?: number }>()
   const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
   const all = listing.map((t) => ({ name: t.name, description: t.description }))
   const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
@@ -2017,6 +2017,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (late()) return refusal('request')
     if (m.kind === 'store') {
       const key = `script:${String(p.key)}`
+      const loadReply = p.value === undefined ? 0 : Buffer.byteLength(JSON.stringify({ ok: true, value: p.value }) ?? '')
+      if (loadReply > 4 * 1024 * 1024) return { ok: false, error: `the value is ${loadReply} bytes as JSON, too large to load back (the most is 4 MiB); store it in a file instead` }
       if (p.value === undefined) await $.store.delete(key)
       else await $.store.set(key, p.value as never)
       return { ok: true }
@@ -2286,6 +2288,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           j.readAt.delete(k)
           j.progress.delete(k)
           j.progressAt.delete(k)
+          for (const [id, started] of j.pages) if (started.real === k) j.pages.set(id, {})
         }
         forgetIn(job)
         if (job.gen !== sessionGen) return
@@ -2316,16 +2319,16 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
         const from = typeof args.offset === 'number' ? args.offset : 1
         const pages = typeof p.readId === 'number' ? `#${p.readId}` : args.file_path
-        const first = pagesStarted.get(pages)
+        const first = job.pages.get(pages)
         const heldStill = readBefore !== undefined && readBefore === readAfter && realBefore === realAfter
-        if (from === 1) pagesStarted.set(pages, heldStill ? { version: readBefore, real: realBefore } : {})
+        if (from === 1) job.pages.set(pages, heldStill ? { version: readBefore, real: realBefore } : {})
         else if (first !== undefined && (!heldStill || readBefore !== first.version || realBefore !== first.real)) {
           tally.ok--
           tally.failed++
           return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
         }
       }
-      const ownPages = tool === 'Read' && p.handled === true && typeof p.readId === 'number' ? pagesStarted.get(`#${p.readId}`) : undefined
+      const ownPages = tool === 'Read' && p.handled === true && typeof p.readId === 'number' ? job.pages.get(`#${p.readId}`) : undefined
       const ownChain = ownPages?.next !== undefined ? { next: ownPages.next, version: ownPages.version } : undefined
       const receipt =
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
@@ -2485,7 +2488,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     let missing = ''
     for (let head = p; ; ) {
       const found = await realpath(head)
-      if (found) return { done: true, path: found.replace(/\/$/, '') + missing }
+      if (found) {
+        const base = found.replace(/\/$/, '')
+        const tail = base === '' ? missing.replace(/^\/\.\.(?=\/|$)/, '') : missing
+        const folded = tail.replace(/\/(?!\.\.(?:\/|$))[^/]+\/\.\.(?=\/|$)/, '')
+        return { done: folded === missing, path: base + folded || '/' }
+      }
       const target = await readlink(head)
       if (target) {
         const parent = head.slice(0, head.lastIndexOf('/')) || '/'
@@ -2493,9 +2501,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         return { done: false, path: (base + target + missing).replace(/\/(?:\.?\/)+/g, '/') }
       }
       const slash = head.lastIndexOf('/')
-      if (slash <= 0) return { done: true, path: p }
+      if (slash < 0 || head === '/') return { done: true, path: p }
       missing = head.slice(slash) + missing
-      head = head.slice(0, slash)
+      head = slash ? head.slice(0, slash) : '/'
     }
   }
   const climbs = (v: unknown) => typeof v === 'string' && /(^|\/)\.\.(\/|$)/.test(v.trim())
@@ -2620,12 +2628,14 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (await $.fs.write(file, JSON.stringify(out)).then(() => true, () => false)) return true
       const size = typeof out.text === 'string' ? out.text.length : 0
       const tool = String((m.payload as { tool?: unknown }).tool ?? 'the tool')
-      const sameText = out.result === out.text
-      const base = { ok: out.ok, error: out.error, text: out.shellText ?? out.text, exitCode: out.exitCode, whole: out.whole }
-      const slim = sameText ? { ...base, resultIsText: true } : { ...base, result: out.result }
-      if (await $.fs.write(file, JSON.stringify(slim)).then(() => true, () => false)) return true
-      if (!sameText && (await $.fs.write(file, JSON.stringify({ ...base, droppedResult: true })).then(() => true, () => false))) return true
-      const failed = { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
+      if (m.kind === 'call') {
+        const sameText = out.result === out.text
+        const base = { ok: out.ok, error: out.error, text: out.shellText ?? out.text, exitCode: out.exitCode, whole: out.whole }
+        const slim = sameText ? { ...base, resultIsText: true } : { ...base, result: out.result }
+        if (await $.fs.write(file, JSON.stringify(slim)).then(() => true, () => false)) return true
+        if (!sameText && (await $.fs.write(file, JSON.stringify({ ...base, droppedResult: true })).then(() => true, () => false))) return true
+      }
+      const failed = m.kind !== 'call' ? { ok: false, error: `The answer to ${m.kind} is too large to pass to the script whole.` } : { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
       const t = calls.get(tool)
       if (t && out.ok) {
         t.ok--

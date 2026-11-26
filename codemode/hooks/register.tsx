@@ -1697,6 +1697,7 @@ const MAIN = 'main'
 const jobsById = new Map<string, Job>()
 const deliveredIds = new Map<string, string>()
 const handedSpills = new Map<string, number>()
+const realAtRead = new Map<string, Promise<string>>()
 const ownSpills = new Set<string>()
 const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
@@ -2096,9 +2097,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))
       : []
     const patchFresh = new Map<string, boolean>()
+    const patchKeys = new Map<string, string>()
     for (const o of patchOps)
       if (o.op !== 'create' && !patchFresh.has(o.path)) {
-        const was = job.reads.has(o.path) ? job.reads.get(o.path) : readPaths.has(o.path) ? readVersions.get(o.path) : undefined
+        const key = await readKeyOf(o.path)
+        patchKeys.set(o.path, key)
+        const was = job.reads.has(key) ? job.reads.get(key) : readPaths.has(key) ? readVersions.get(key) : undefined
         patchFresh.set(o.path, was !== undefined && was === (await versionOf(o.path)))
       }
     if (late()) {
@@ -2216,20 +2220,23 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       const readNow: string[] = []
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => o.path))
+      const forget = (k: string) => {
+        job.reads.delete(k)
+        if (job.gen !== sessionGen) return
+        readPaths.delete(k)
+        readVersions.delete(k)
+        versionAt.set(k, ++readClock)
+      }
       for (const o of patchOps) {
+        const alias = patchKeys.get(o.path)
+        if (alias && alias !== o.path) forget(alias)
         if (created.has(o.path) || patchFresh.get(o.path) === true) {
           const version = await versionOf(o.path)
           job.reads.set(o.path, version)
           job.readAt.set(o.path, ++readClock)
+          recordReal(o.path)
           readNow.push(o.path)
-        } else {
-          job.reads.delete(o.path)
-          if (job.gen === sessionGen) {
-            readPaths.delete(o.path)
-            readVersions.delete(o.path)
-            versionAt.set(o.path, ++readClock)
-          }
-        }
+        } else forget(o.path)
       }
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
@@ -2431,21 +2438,25 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     return '/' + kept.join('/')
   }
-  const onDisk = async (v: string) => {
+  const onDisk = async (v: string, relative = true) => {
     const t = v.trim()
     const e = t === '~' || t.startsWith('~/') ? home + t.slice(1) : t
     if (e.startsWith('/')) return climb(e)
-    return cwd ? climb(`${cwd.replace(/\/$/, '')}/${e}`) : v
+    return relative && cwd ? climb(`${cwd.replace(/\/$/, '')}/${e}`) : v
   }
   const resolveClimbs = async (m: Request): Promise<string | undefined> => {
     if (m.kind === 'fresh' && climbs(m.payload.path)) m.payload.path = (await onDisk(String(m.payload.path))) ?? m.payload.path
     if (m.kind !== 'call') return undefined
+    const tool = String(m.payload.tool)
+    const lean = /^mcp__lean[-_]ctx__/.test(tool)
+    if (!lean && !/^(?:Read|Write|Edit|MultiEdit|NotebookEdit)$/.test(tool)) return undefined
+    const relative = lean || tool === 'Read'
     const given = (m.payload.args && typeof m.payload.args === 'object' ? m.payload.args : {}) as Record<string, unknown>
-    const preset = defaults[String(m.payload.tool)] ?? {}
+    const preset = defaults[tool] ?? {}
     const args = { ...given }
     const lost: string[] = []
     const place = async (v: unknown) => {
-      const found = await onDisk(String(v))
+      const found = await onDisk(String(v), relative)
       if (found === undefined) lost.push(String(v).trim())
       return found ?? String(v)
     }
@@ -2457,12 +2468,17 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     m.payload.args = args
     return lost.length ? `${lost[0]} climbs out of a symlinked folder and then through a folder that does not exist there, so it names no file on disk` : undefined
   }
+  const recordReal = (path: string) => {
+    realAtRead.delete(path)
+    realAtRead.set(path, realOf(path))
+    while (realAtRead.size > 2000) realAtRead.delete(realAtRead.keys().next().value as string)
+  }
   const sameFileKey = async (path: string, keys: Iterable<string>) => {
     const name = path.slice(path.lastIndexOf('/'))
     const candidates = [...new Set(keys)].filter((k) => k !== path && k.endsWith(name))
     if (!candidates.length) return undefined
     const real = await realOf(path)
-    for (const k of candidates) if ((await realOf(k)) === real) return k
+    for (const k of candidates) if ((await (realAtRead.get(k) ?? realOf(k))) === real) return k
     return undefined
   }
   const readKeyOf = async (path: string) => (job.reads.has(path) || readPaths.has(path) ? path : ((await sameFileKey(path, [...job.reads.keys(), ...readPaths])) ?? path))
@@ -2500,6 +2516,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.progress.delete(f)
         job.reads.set(f, receipt.version)
         job.readAt.set(f, stamp)
+        recordReal(f)
         undo = () => {
           if (job.readAt.get(f) !== stamp) return
           if (read.had) job.reads.set(f, read.value)

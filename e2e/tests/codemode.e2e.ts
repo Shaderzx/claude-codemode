@@ -3037,14 +3037,14 @@ test('A file read by its plain path can be written through a climbing path whose
   expect(readFileSync(join(dir, 'w', 'B', 'other', 'f.txt'), 'utf8')).toBe('mine\n');
 });
 
-test('Two forced patch edits in two-second runs that read the file first both land', () => {
+test('Two forced patch edits with under two seconds left in their runs both land', () => {
   const dir = scratch();
   const file = join(dir, 'f.txt');
   writeFileSync(file, 'alpha\nbeta\n');
   const f = JSON.stringify(file);
   const go = join(dir, 'go');
   const [a, b] = ['a-read', 'b-read'].map((n) => join(dir, n));
-  const editor = (from: string, to: string, marker: string) => '// @options: {"timeout_ms": 2000}\nawait read(' + f + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 1500 })\ntry { await edit(' + f + ', "' + from + '", "' + to + '", { force: true }); return "edited" } catch (e) { return String(e.message) }';
+  const editor = (from: string, to: string, marker: string) => '// @options: {"timeout_ms": 2600}\nawait read(' + f + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 2000 })\nawait waitFor(() => deadline() < 1900, { every: 20, timeout: 2000 })\ntry { await edit(' + f + ', "' + from + '", "' + to + '", { force: true }); return "edited" } catch (e) { return String(e.message) }';
   const out = run({ tools: NO_BASH, statDelayMs: 120, steps: [{ script: editor('alpha', 'ALPHA', a), keepTurn: true }, { script: editor('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
   expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['edited', 'edited']);
   expect(readFileSync(file, 'utf8')).toBe('ALPHA\nBETA\n');

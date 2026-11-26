@@ -4074,7 +4074,7 @@ test('A patch write through a symlink climbing out of a missing folder is refuse
 test('A Write to the root folder is checked as the root folder and never sent with an empty path', () => {
   const out = run({ engineForgets: true, steps: [{ script: 'const r = await call("Write", { file_path: "/", content: "x" })\nreturn r.ok ? "wrote" : r.error' }] });
   expect(out.calls.filter((c) => c.tool === 'Write' && (c.args as { file_path?: string }).file_path === '')).toHaveLength(0);
-  expect(out.results[0]!.text).toContain('/');
+  expect(out.results[0]!.text).toBe('File has not been read yet. Read it first before writing to it: /');
 });
 
 test('A stale patch between the pages of an open read() makes that read fail and leaves the file unread', () => {
@@ -4107,4 +4107,12 @@ test('A stale patch between the pages of an open read() makes that read fail and
 test('A stored value too large to load back is refused when stored', () => {
   const out = run({ steps: [{ script: 'try { await store("big", "x".repeat(4_300_000)); return "stored " + String((await load("big"))?.length) } catch (e) { return String(e.message) }' }] });
   expect(out.results[0]!.text).toContain('too large');
+});
+
+test('A relative patch path whose .. climbs out of a symlinked folder patches the file Read showed for it', () => {
+  const dir = climbingFolder();
+  const out = run({ cwd: dir, tools: NO_BASH, steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'const shown = String(await tools.Read({ file_path: "sub/../real.txt" }))\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "set_line", path: "sub/../real.txt", line: 1, new_text: "PATCHED" })\nreturn (shown.includes("INTENDED") ? "showed intended" : "showed other") + " | " + (r.ok ? "patched" : r.error)' }] });
+  expect(out.results[0]!.text).toBe('showed intended | patched');
+  expect(readFileSync(join(dir, 'x', 'real.txt'), 'utf8')).toContain('PATCHED');
+  expect(readFileSync(join(dir, 'real.txt'), 'utf8')).toBe('DECOY\n');
 });

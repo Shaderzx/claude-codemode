@@ -9,6 +9,7 @@ type Case = {
   killDelayMs?: number
   writeDelayMs?: number
   patchDelayMs?: number
+  existsGapMs?: number
   statDelayMs?: number
   hangListMs?: number
   hangListCount?: number
@@ -73,7 +74,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -463,6 +464,8 @@ let sessionStarted = false
 let wakesPending = 0
 let wakesSeen = 0
 let statsPending = 0
+let existsAsked = 0
+let existsAnswered = 0
 let bashWaits = 0
 let listsHanging = 0
 let rewrittenDuringRead = false
@@ -551,7 +554,15 @@ const $ = {
     },
     read: async (p: string) => readFileSync(p, 'utf8'),
     list: async (p: string) => readdirSync(p).map((n) => ({ name: n, mtimeMs: statSync(join(p, n)).mtimeMs })),
-    exists: async (p: string) => existsSync(p),
+    exists: async (p: string) => {
+      if (!c.existsGapMs || !sessionStarted) return existsSync(p)
+      existsAsked++
+      await new Promise((r) => setTimeout(r, c.existsGapMs))
+      const found = existsSync(p)
+      existsAnswered++
+      await new Promise((r) => setTimeout(r, c.existsGapMs))
+      return found
+    },
     stat: async (p: string) => {
       if (c.statDelayMs && sessionStarted) {
         statsPending++
@@ -783,6 +794,16 @@ for (const s of c.steps) {
   }
   if (s.link) {
     symlinkSync(s.link.to, s.link.from)
+    continue
+  }
+  if (s.relink) {
+    rmSync(s.relink.from, { force: true })
+    symlinkSync(s.relink.to, s.relink.from)
+    continue
+  }
+  if (s.untilExists) {
+    const phase = s.untilExists
+    await until(() => (phase === 'asked' ? existsAsked : existsAnswered) > 0, 30_000, 'a file existence check ' + phase)
     continue
   }
   if (s.untilQuiet) {

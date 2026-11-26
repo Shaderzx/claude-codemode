@@ -2535,11 +2535,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       else climbed.set(found, [String(v), relative])
       return found ?? String(v)
     }
+    const patchTool = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+    const climbable = (v: unknown) => climbs(v) && !(patchTool && String(v).trim().startsWith('~'))
     for (const k of ['file_path', 'notebook_path', 'path']) {
       const v = k in given ? given[k] : preset[k]
-      if (climbs(v)) args[k] = await place(v)
+      if (climbable(v)) args[k] = await place(v)
     }
-    if (Array.isArray(args.ops)) args.ops = await Promise.all((args.ops as Record<string, unknown>[]).map(async (o) => (o && climbs(o.path) ? { ...o, path: await place(o.path) } : o)))
+    if (Array.isArray(args.ops)) args.ops = await Promise.all((args.ops as Record<string, unknown>[]).map(async (o) => (o && climbable(o.path) ? { ...o, path: await place(o.path) } : o)))
     m.payload.args = args
     return lost.length ? namesNoFile(lost[0] as string) : undefined
   }

@@ -1799,7 +1799,6 @@ const promoteReads = (j: Job) => {
   for (const [p, chain] of j.progress) {
     const at = j.progressAt.get(p) ?? 0
     if (at < (progressAt.get(p) ?? 0)) continue
-    progressAt.delete(p)
     progressAt.set(p, at)
     readProgress.delete(p)
     readProgress.set(p, chain)
@@ -2009,7 +2008,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const path = await realOf(asked)
       const read = job.reads.has(path) || readPaths.has(path)
       const was = job.reads.has(path) ? job.reads.get(path) : readPaths.has(path) ? readVersions.get(path) : undefined
-      const now = was === undefined ? undefined : await versionOf(asked)
+      const now = was === undefined ? undefined : await versionOf(path)
       return { ok: true, read, fresh: was !== undefined && now !== undefined && now === was, version: was, real: path }
     }
     if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
@@ -2092,6 +2091,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const now = await versionOf(key)
         if (was === undefined || now === undefined || now !== was || (await movedSinceLocked(m, path, key)))
           return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+        args.file_path = key
+      } else {
+        if (await movedSinceLocked(m, path, key)) return { ok: false, error: `${path} now names another file than the one this write waited to lock, so nothing was created; write it again` }
         args.file_path = key
       }
     }

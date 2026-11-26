@@ -2926,8 +2926,15 @@ test('Two paged reads of one file in a run never stitch an old first page to a n
   const newer = join(dir, 'newer.txt');
   writeFileSync(newer, lines('new'));
   const f = JSON.stringify(file);
-  const out = run({ readLagMs: 400, steps: [{ script: 'const first = read(' + f + ').then((t) => (t.includes("old 0") && t.includes("new 2399") ? "stitched" : "clean"), (e) => "refused: " + e.message)\nawait sh("cp ' + newer + ' ' + file + '")\nawait read(' + f + ')\nreturn await first' }] });
-  expect(out.results[0]!.text).toContain('refused: read: ' + file + ' changed while it was read in pages');
+  const copied = join(dir, 'copied');
+  const out = run({ readLagMs: 400, steps: [
+    { script: 'const first = read(' + f + ').then((t) => (t.includes("old 0") && t.includes("new 2399") ? "stitched" : "clean"), (e) => "refused: " + e.message)\nawait waitFor(() => sh("test -f ' + copied + '"), { every: 20, timeout: 20000 })\nawait read(' + f + ')\nreturn await first', keepTurn: true },
+    { untilCalls: { tool: 'Read', count: 1 } },
+    { script: 'await sh("cp ' + newer + ' ' + file + ' && touch ' + copied + '")\nreturn "copied"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  expect(out.results.map((r) => r.text).join('\n')).toContain('refused: read: ' + file + ' changed while it was read in pages');
 });
 
 test('A forced patch edit in a short run whose read races a change retries and keeps the file counted as read', () => {
@@ -3689,3 +3696,23 @@ const linkMovesWhileWaitingForLock = (target: 'existing' | 'new') => {
 
 test('A Write through a symlink that moves while it waits for another write lock is refused and leaves the new target alone', () => linkMovesWhileWaitingForLock('existing'));
 test('A Write creating a file through a symlink that moves while it waits for another write lock is refused and creates nothing', () => linkMovesWhileWaitingForLock('new'));
+
+test('A direct patch through a symlink that moves while it is checked lands on the file it checked', () => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt']);
+  const link = join(dir, 'L');
+  const marker = join(dir, 'read');
+  const script = 'await read(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ')\nawait sh("touch ' + marker + '")\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + JSON.stringify(join(link, 'f.txt')) + ', old_text: "xxxx", new_text: "BBBB" })\nreturn r.ok ? "patched" : "refused: " + r.error';
+  const out = run({ tools: NO_BASH, statDelayMs: 700, steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script, keepTurn: true },
+    { untilFile: marker },
+    { untilStatPending: true },
+    { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nreturn "moved"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  expect(out.results.map((r) => r.text).join('\n')).toContain('moved');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
+  expect(['xxxx\n', 'BBBB\n']).toContain(readFileSync(join(dir, 'X', 'f.txt'), 'utf8'));
+});

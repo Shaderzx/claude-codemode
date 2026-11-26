@@ -1487,7 +1487,7 @@ const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number)
   for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
   return 0
 }
-type Receipt = { file: string; whole: boolean; next?: number; version?: string }
+type Receipt = { file: string; whole: boolean; next?: number; version?: string; real?: string }
 type FileInfo = { startLine?: unknown; numLines?: unknown; totalLines?: unknown; truncatedByTokenCap?: unknown }
 const infoOf = (result: unknown): FileInfo | undefined => {
   const f = result && typeof result === 'object' ? (result as { file?: unknown }).file : undefined
@@ -2107,6 +2107,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
     const since = skillSeq
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+    const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
     const patchPath = (v: unknown) => (typeof v === 'string' && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
     const patchOps = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
       ? (Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : [args])
@@ -2250,11 +2251,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           recordReal(o.path)
           readNow.push(o.path)
         } else {
-          const others = [...jobsById.values()].filter((j) => j !== job && !j.settled).flatMap((j) => [...j.reads.keys()])
-          for (const k of [o.path, ...(await sameFileKeys(o.path, [...job.reads.keys(), ...readPaths, ...others]))]) forget(k)
+          for (const k of [o.path, ...(await sameFileKeys(o.path, [...job.reads.keys(), ...readPaths])), ...(await openReadsOf(o.path))]) forget(k)
         }
       }
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+      const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
         const from = typeof args.offset === 'number' ? args.offset : 1
         const pages = typeof p.readId === 'number' ? `${args.file_path}#${p.readId}` : args.file_path
@@ -2268,11 +2269,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       const receipt =
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined, [job.progress.get(args.file_path), readProgress.get(args.file_path)])
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter ? readBefore : undefined, [job.progress.get(args.file_path), readProgress.get(args.file_path)])
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
             : undefined
       if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
+      if (receipt && realAfter !== undefined) receipt.real = realAfter
       if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
       else if (isStub(text, tool) && p.handled !== true) {
         stubs.add(tool)
@@ -2491,13 +2493,23 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     m.payload.args = args
     return lost.length ? namesNoFile(lost[0] as string) : undefined
   }
-  const recordReal = (path: string) => {
+  const recordReal = (path: string, known?: string) => {
     const before = job.realAt.get(path)
-    job.realAt.set(path, realOf(path))
+    job.realAt.set(path, known === undefined ? realOf(path) : Promise.resolve(known))
     return () => {
       if (before) job.realAt.set(path, before)
       else job.realAt.delete(path)
     }
+  }
+  const openReadsOf = async (path: string) => {
+    const name = path.slice(path.lastIndexOf('/'))
+    const real = await realOf(path)
+    const found: string[] = []
+    for (const j of jobsById.values()) {
+      if (j === job || j.settled) continue
+      for (const k of j.reads.keys()) if (k !== path && k.endsWith(name) && (await (j.realAt.get(k) ?? realOf(k))) === real) found.push(k)
+    }
+    return found
   }
   const recordedReal = (k: string) => (job.reads.has(k) ? job.realAt.get(k) : realAtRead.get(k))
   const sameFileKeys = async (path: string, keys: Iterable<string>) => {
@@ -2552,7 +2564,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.progress.delete(f)
         job.reads.set(f, receipt.version)
         job.readAt.set(f, stamp)
-        const unrecordReal = recordReal(f)
+        const unrecordReal = recordReal(f, receipt.real)
         undo = () => {
           if (job.readAt.get(f) !== stamp) return
           unrecordReal()

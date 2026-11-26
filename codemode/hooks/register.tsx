@@ -2490,8 +2490,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const found = await realpath(head)
       if (found) {
         const base = found.replace(/\/$/, '')
-        const tail = base === '' ? missing.replace(/^\/\.\.(?=\/|$)/, '') : missing
-        const folded = tail.replace(/\/(?!\.\.(?:\/|$))[^/]+\/\.\.(?=\/|$)/, '')
+        if (/^\/\.\.(?=\/|$)/.test(missing)) return { done: false, path: base.slice(0, base.lastIndexOf('/')) + missing.slice(3) || '/' }
+        const folded = missing.replace(/\/(?!\.\.(?:\/|$))[^/]+\/\.\.(?=\/|$)/, '')
         return { done: folded === missing, path: base + folded || '/' }
       }
       const target = await readlink(head)

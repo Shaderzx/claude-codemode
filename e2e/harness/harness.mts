@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import { spawn } from 'node:child_process'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -94,6 +95,7 @@ process.on('exit', () => {
   if (c.home === undefined) rmSync(home, { recursive: true, force: true })
 })
 copyFileSync(join(root, 'codemode/hooks/register.tsx'), join(work, 'register.mts'))
+Reflect.deleteProperty(globalThis, 'Buffer')
 const mod = await import(join(work, 'register.mts'))
 let cwd = c.cwd ?? home
 const store: Record<string, unknown> = { ...(c.store ?? {}) }

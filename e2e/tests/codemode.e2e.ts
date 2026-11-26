@@ -4090,16 +4090,19 @@ test('A stale patch between the pages of an open read() makes that read fail and
   const b = JSON.stringify(big);
   const reader = 'try { const t = await read(' + b + '); return "read " + (t.includes("A 0000") ? "A" : "") + (t.includes("2399") && !t.includes("A 2399") ? "B" : "") } catch (e) { return "reader: " + e.message }';
   const patcher = 'await sh("cp ' + join(dir, 'b.txt') + ' ' + big + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + b + ', old_text: "B 0000", new_text: "C 0000" })\nawait sh("touch -r ' + ref + ' ' + big + '")\nreturn "patched"';
-  const out = run({ tools: NO_BASH, readDelayMs: 600, steps: [
+  const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, holdLaterPages: { asked, gate }, steps: [
     { script: reader, keepTurn: true },
-    { untilCalls: { tool: 'Read', count: 2 } },
+    { untilFile: asked },
     { script: patcher, keepTurn: true },
+    { untilRunDone: 'r2' },
+    { touch: gate },
     { untilRunsDone: true },
     { collect: true },
     { script: 'try { await write(' + b + ', "CLOBBERED\\n"); return "wrote" } catch (e) { return String(e.message) }' },
   ] });
   const said = out.results.map((r) => r.text).join('\n');
-  expect(said).not.toContain('read AB');
+  expect(said).toContain('changed while it was read in pages');
   expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
   expect(readFileSync(big, 'utf8').startsWith('C 0000')).toBe(true);
 });
@@ -4115,4 +4118,68 @@ test('A relative patch path whose .. climbs out of a symlinked folder patches th
   expect(out.results[0]!.text).toBe('showed intended | patched');
   expect(readFileSync(join(dir, 'x', 'real.txt'), 'utf8')).toContain('PATCHED');
   expect(readFileSync(join(dir, 'real.txt'), 'utf8')).toBe('DECOY\n');
+});
+
+test('A value a script stores loads back in a later run', () => {
+  const out = run({ steps: [{ script: 'await store("note", { n: 42, s: "été" })\nreturn "stored"' }, { script: 'return JSON.stringify(await load("note"))' }] });
+  expect(out.results.map((r) => r.text)).toEqual(['stored', '{"n":42,"s":"été"}']);
+});
+
+test('A stored value too large to pass back fails when loaded instead of coming back empty', () => {
+  const out = run({ store: { 'script:big': 'x'.repeat(4_300_000) }, steps: [{ script: 'try { const v = await load("big"); return "loaded " + typeof v } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toContain('too large');
+});
+
+test('A describeTool answer that fails to arrive never counts against the tool it describes', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'x\n');
+  const out = run({ failReplyAfter: { fail: 2, after: 3 }, steps: [{ script: 'await tools.Read({ file_path: ' + JSON.stringify(f) + ' })\nconst d = describeTool("Read")\nawait tools.Bash({ command: "true" })\nawait d\nreturn "described"' }] });
+  expect(out.results[0]!.text).not.toMatch(/Read 1 failed/);
+});
+
+const stalePatchDuringRead = (reader: 'tools.Read' | 'read') => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const ref = join(dir, 'ref');
+  const count = reader === 'tools.Read' ? 15000 : 2400;
+  const lines = (tag: string) => Array.from({ length: count }, (_, i) => tag + ' ' + String(i).padStart(5, '0') + (reader === 'tools.Read' ? ' ' + 'x'.repeat(60) : '')).join('\n') + '\n';
+  writeFileSync(big, lines('A'));
+  writeFileSync(join(dir, 'b.txt'), lines('B'));
+  writeFileSync(ref, '');
+  utimesSync(big, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const b = JSON.stringify(big);
+  const last = String(count - 1).padStart(5, '0');
+  const start = reader === 'tools.Read' ? 'String(await tools.Read({ file_path: ' + b + ' }))' : 'await read(' + b + ')';
+  const readerScript = 'try { const t = ' + start + '; return "read " + (t.includes("A 00000") ? "A" : "") + (t.includes("B ' + last + '") ? "B" : "") } catch (e) { return "reader: " + e.message }';
+  const patcher = 'await sh("cp ' + join(dir, 'b.txt') + ' ' + big + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + b + ', old_text: "B 00000", new_text: "C 00000" })\nawait sh("touch -r ' + ref + ' ' + big + '")\nreturn "patched"';
+  const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
+  const holdFirst = reader === 'read';
+  const out = run({ tools: NO_BASH, ...(holdFirst ? { readLagMs: 1500 } : { holdLaterPages: { asked, gate } }), steps: [
+    { script: readerScript, keepTurn: true },
+    ...(holdFirst ? [{ untilCalls: { tool: 'Read', count: 1 } }] : [{ untilFile: asked }]),
+    { script: patcher, keepTurn: true },
+    { untilRunDone: 'r2' },
+    ...(holdFirst ? [] : [{ touch: gate }]),
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + b + ', "CLOBBERED\\n"); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).not.toContain('read AB');
+  expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
+  expect(readFileSync(big, 'utf8').startsWith('C 00000')).toBe(true);
+};
+
+test('A stale patch while the mod pages a big tools.Read fails that read and leaves the file unread', () => stalePatchDuringRead('tools.Read'));
+test('A stale patch while the first page of a read() is in flight fails that read and leaves the file unread', () => stalePatchDuringRead('read'));
+
+test('A symlink whose target climbs out of forty missing folders never overwrites the unread file it lands on', () => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'secret.txt'), 'PRECIOUS\n');
+  const link = join(dir, 'link.txt');
+  const out = run({ engineForgets: true, steps: [{ link: { from: link, to: 'm/../'.repeat(40) + 'secret.txt' } }, { script: 'const r = await call("Write", { file_path: ' + JSON.stringify(link) + ', content: "CLOBBER\\n" })\nreturn r.ok ? "wrote" : "refused: " + r.error' }] });
+  expect(out.results[0]!.text).toContain('refused: ');
+  expect(readFileSync(join(dir, 'secret.txt'), 'utf8')).toBe('PRECIOUS\n');
 });

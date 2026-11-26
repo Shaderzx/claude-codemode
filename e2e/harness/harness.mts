@@ -11,6 +11,7 @@ type Case = {
   writeDelayMs?: number
   patchDelayMs?: number
   patchLostAfterApply?: boolean
+  patchErrorWrapped?: boolean
   patchAnswerGate?: { applied: string; gate: string }
   existsGapMs?: number
   lastPartMayBeMissing?: boolean
@@ -134,6 +135,7 @@ const firewalled = (id: string, body: string) => '[Firewalled ctx_shell output â
 const archive = (id: string) => join(home, '.local', 'share', 'lean-ctx', 'archives', id.slice(0, 2), id + '.txt')
 let archived = 0
 let replyHeld = false
+let heldFakes = 0
 let swapped = 0
 const tokensOf = (rows: string[]) => rows.reduce((n, l) => n + (l.length > 200 && !/\s/.test(l) ? l.length : Math.ceil(l.length / 4)) + 1, 0)
 const leanReply = (tool: string, r: { code: number; out: string }) => {
@@ -197,7 +199,9 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       const hold = c.holdLaterPages
       if (hold && Number(a.offset ?? 1) > 1) {
         writeFileSync(hold.asked, '')
+        heldFakes++
         for (let waited = 0; !existsSync(hold.gate) && waited < 30_000; waited += 20) await new Promise((r) => setTimeout(r, 20))
+        heldFakes--
       }
       if (c.readDelayMs) await new Promise((r) => setTimeout(r, c.readDelayMs))
       if ((c.denyReadPaths ?? []).some((d) => String(a.file_path ?? '').endsWith(d))) return { deny: 'Permission to read ' + String(a.file_path) + ' has been denied.' }
@@ -339,7 +343,10 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
         for (const [i, o] of (a.ops as Record<string, unknown>[]).entries()) {
           const r = await fake('mcp__lean-ctx__ctx_patch', { ...(a.path === undefined ? {} : { path: a.path }), ...o })
           const text = String((r as { text?: string }).text)
-          if ((r as { isError?: boolean }).isError) return i === 0 ? r : err('ops[' + i + '] (' + String(o.op) + '): ' + text + '\nEarlier ops in this batch were already applied:\n' + said.join('\n\n'))
+          if ((r as { isError?: boolean }).isError) {
+            const failed = i === 0 ? text : 'ops[' + i + '] (' + String(o.op) + '): ' + text + '\nEarlier ops in this batch were already applied:\n' + said.join('\n\n')
+            return err(c.patchErrorWrapped ? '<tool_use_error>' + failed + '</tool_use_error>' : failed)
+          }
           said.push(text)
         }
         return ok(said.join('\n'))
@@ -843,7 +850,7 @@ for (const s of c.steps) {
     continue
   }
   if (s.untilQuiet) {
-    await until(() => listsHanging === 0 && inflight === 0 && fakesPending === 0 && statsPending === 0 && Date.now() - lastActivity > 500, 60_000, 'the mod going quiet')
+    await until(() => listsHanging === 0 && inflight === 0 && fakesPending - heldFakes === 0 && statsPending === 0 && Date.now() - lastActivity > 500, 60_000, 'the mod going quiet')
     continue
   }
   if (s.untilFile) {

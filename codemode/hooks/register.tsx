@@ -1789,6 +1789,13 @@ const running = (asker: Job) =>
     .filter((j) => j !== asker)
     .map((j) => ({ id: j.id, state: j.exited ? 'finishing' : 'running', seconds: Math.round((Date.now() - j.started) / 1000) }))
 const LATER_ROOM = 300
+const sessionReadIsNewer = (j: Job, k: string) => readPaths.has(k) && (versionAt.get(k) ?? 0) > (j.readAt.get(k) ?? 0)
+const readVersionFor = (j: Job, k: string) => {
+  if (!j.reads.has(k)) return readPaths.has(k) ? readVersions.get(k) : undefined
+  const own = j.reads.get(k)
+  return sessionReadIsNewer(j, k) && readVersions.get(k) !== own ? undefined : own
+}
+const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionReadIsNewer(j, k) ? j.reads.get(k) : readPaths.has(k) ? readVersions.get(k) : undefined)
 const promoteReads = (j: Job) => {
   if (j.stopped || j.gen !== sessionGen) return
   for (const [p, v] of j.reads) {
@@ -2032,7 +2039,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const asked = normal(String(p.path))
       const path = await realOf(asked)
       const read = job.reads.has(path) || readPaths.has(path)
-      const was = job.reads.has(path) ? job.reads.get(path) : readPaths.has(path) ? readVersions.get(path) : undefined
+      const was = readVersionFor(job, path)
       const now = was === undefined ? undefined : await versionOf(path)
       return { ok: true, read, fresh: was !== undefined && now !== undefined && now === was, version: was, real: path }
     }
@@ -2112,7 +2119,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const exists = await $.fs.exists(key).catch(() => true)
       if (!readPaths.has(key) && !job.reads.has(key) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
       if (exists) {
-        const was = job.reads.has(key) ? job.reads.get(key) : readVersions.get(key)
+        const was = readVersionFor(job, key)
         const now = await versionOf(key)
         if (was === undefined || now === undefined || now !== was || (await movedSinceLocked(m, path, key)))
           return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
@@ -2126,7 +2133,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const path = normal(absolute(args.path.trim(), cwd, home))
       const real = typeof p.expectedReal === 'string' ? p.expectedReal : await realOf(path)
       if (!job.reads.has(real) && !readPaths.has(real)) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
-      const recorded = job.reads.has(real) ? job.reads.get(real) : readVersions.get(real)
+      const recorded = readVersionFor(job, real)
       if (recorded !== p.expectedVersion || (await versionOf(real)) !== p.expectedVersion || (await movedSinceLocked(m, path, real))) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
       args.path = real
     }
@@ -2172,7 +2179,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     for (const o of patchOps)
       if (o.op !== 'create' && !patchFresh.has(patchKeys.get(o.path) as string)) {
         const key = patchKeys.get(o.path) as string
-        const was = job.reads.has(key) ? job.reads.get(key) : readPaths.has(key) ? readVersions.get(key) : undefined
+        const was = latestReadVersion(job, key)
         const now = await versionOf(key)
         sentVersions.set(key, now)
         patchFresh.set(key, was !== undefined && was === now)
@@ -2991,7 +2998,6 @@ export const register: Register = (on) => {
       progressAt.clear()
       readVersions.clear()
       versionAt.clear()
-      forgottenAt.clear()
     }
     return r
   }).catch(($, e, next) => next(e))

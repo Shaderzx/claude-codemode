@@ -3576,3 +3576,82 @@ test('A page chain refreshed by a later run outlives two hundred chains started 
   expect(out.results[4]!.text).toBe('wrote');
   expect(readFileSync(p, 'utf8')).toBe('mine\n');
 });
+
+test('A patch write whose read record a compaction clears mid-write is refused and leaves the file alone', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const marker = join(dir, 'writing');
+  const out = run({ tools: NO_BASH, readDelayMs: 600, steps: [
+    { script: 'await read(' + f + ')\nreturn "read"' },
+    { script: 'await sh("touch ' + marker + '")\ntry { await write(' + f + ', "CLOBBER\\nbeta\\n"); return "wrote" } catch (e) { return String(e.message) }', keepTurn: true },
+    { untilFile: marker },
+    { compact: true },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  expect(out.results.map((r) => r.text).join('\n')).toContain('has not read it');
+  expect(readFileSync(file, 'utf8')).toBe('alpha\nbeta\n');
+});
+
+const bigTwins = (dir: string, lines: number, line: (tag: string, i: number) => string) => {
+  for (const [d, tag] of [['X', 'XXXX'], ['Y', 'YYYY']] as const) {
+    mkdirSync(join(dir, d));
+    writeFileSync(join(dir, d, 'big.txt'), Array.from({ length: lines }, (_, i) => line(tag, i)).join('\n') + '\n');
+    utimesSync(join(dir, d, 'big.txt'), 1_700_000_000, 1_700_000_000);
+  }
+};
+
+const stitchAcrossMovedLink = (reader: 'read' | 'tools.Read') => {
+  const dir = scratch();
+  const lines = reader === 'read' ? 2400 : 15000;
+  const line = (tag: string, i: number) => (reader === 'read' ? tag + ' ' + String(i).padStart(4, '0') : tag + ' ' + String(i).padStart(5, '0') + ' ' + 'x'.repeat(60));
+  bigTwins(dir, lines, line);
+  const small = join(dir, 'small.txt');
+  writeFileSync(small, 'small\n');
+  const viaL = JSON.stringify(join(dir, 'L', 'big.txt'));
+  const start = reader === 'read' ? 'read(' + viaL + ')' : 'tools.Read({ file_path: ' + viaL + ' }).then(String)';
+  const midway = reader === 'read' ? '' : 'await read(' + JSON.stringify(small) + ')\nawait read(' + JSON.stringify(small) + ')\n';
+  const last = line('YYYY', lines - 1).split(' ').slice(0, 2).join(' ');
+  const first = line('XXXX', 0).split(' ').slice(0, 2).join(' ');
+  const script = 'const p = ' + start + '\n' + midway + 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + join(dir, 'L') + '")\ntry { const t = await p; return (t.includes("' + first + '") ? "X" : "") + (t.includes("' + last + '") ? "Y" : "") } catch (e) { return String(e.message) }';
+  const out = run({ readLagMs: 400, steps: [{ link: { from: join(dir, 'L'), to: join(dir, 'X') } }, { script }] });
+  expect(out.results[0]!.text).not.toBe('XY');
+  expect(out.results[0]!.text).toMatch(/^Y$|changed while it was read/);
+};
+
+test('A read() in pages whose symlink moves between pages never stitches two files', () => stitchAcrossMovedLink('read'));
+test('A tools.Read the mod pages whose symlink moves between pages never stitches two files', () => stitchAcrossMovedLink('tools.Read'));
+
+test('A patch still finishing from a cleared session leaves the new session reads alone', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\n');
+  const f = JSON.stringify(file);
+  const creates = Array.from({ length: 8 }, (_, i) => '{ op: "create", path: ' + JSON.stringify(join(dir, 'g' + i + '.txt')) + ', new_text: "g\\n" }').join(', ');
+  const go = join(dir, 'go');
+  const out = run({ tools: NO_BASH, statDelayMs: 350, steps: [
+    { script: 'await call("mcp__lean-ctx__ctx_patch", { ops: [' + creates + ', { op: "replace_unique", path: ' + f + ', old_text: "alpha", new_text: "patched" }] })\nreturn "patched"', keepTurn: true },
+    { untilFile: join(dir, 'g0.txt') },
+    { clear: true },
+    { reload: true },
+    { script: 'await read(' + f + ')\nawait waitFor(() => sh("test -f ' + go + '"), { every: 1500, timeout: 40000 })\ntry { await edit(' + f + ', "patched", "edited"); return "edited" } catch (e) { return String(e.message) }', keepTurn: true },
+    { untilQuiet: true },
+    { touch: go },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  expect(out.results.map((r) => r.text).join('\n')).toContain('edited');
+  expect(readFileSync(file, 'utf8')).toBe('edited\n');
+});
+
+test('A patch batch that creates a file through a symlink and edits it by its real path leaves it counted as read', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'B'));
+  const viaA = JSON.stringify(join(dir, 'A', 'f.txt'));
+  const viaB = JSON.stringify(join(dir, 'B', 'f.txt'));
+  const out = run({ tools: NO_BASH, steps: [{ link: { from: join(dir, 'A'), to: join(dir, 'B') } }, { script: 'await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "create", path: ' + viaA + ', new_text: "alpha\\nbeta\\n" }, { op: "replace_unique", path: ' + viaB + ', old_text: "alpha", new_text: "ALPHA" }] })\ntry { await edit(' + viaB + ', "beta", "BETA"); return "edited" } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toBe('edited');
+  expect(readFileSync(join(dir, 'B', 'f.txt'), 'utf8')).toBe('ALPHA\nBETA\n');
+});

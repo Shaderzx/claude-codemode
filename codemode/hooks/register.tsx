@@ -2123,7 +2123,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
     const patchPath = (v: unknown) => (typeof v === 'string' && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
-    const patchOps = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+    const isPatch = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+    const patchPaths = isPatch ? [args.path, ...(Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).map((o) => o?.path) : [])] : []
+    if (patchPaths.some((v) => typeof v === 'string' && v.trim().startsWith('~')))
+      return { ok: false, error: 'The patch tool reads a path starting with ~ as a folder named ~ inside its working folder, not as your home folder; give the full path' }
+    const patchOps = isPatch
       ? (Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : [args])
           .map((o) => ({ op: String(o?.op ?? ''), path: patchPath(o?.path ?? args.path) }))
           .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))

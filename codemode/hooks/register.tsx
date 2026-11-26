@@ -701,7 +701,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         const check = await freshOf(file, what)
         if (check.fresh === true && typeof check.version === 'string') return { text, check }
       }
-      if (Date.now() >= settleBy || started + timeout - Date.now() < 300) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
+      if (started + timeout - Date.now() < 300) throw toolError(what + ': ' + file + ' was not replaced: the run ran out of time while it kept changing; try again once it settles, or give the run a longer timeout_ms')
+      if (Date.now() >= settleBy) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
     }
   }
   const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version } : {})
@@ -1694,6 +1695,7 @@ type Job = {
   quiet: boolean
   reads: Map<string, string | undefined>
   readAt: Map<string, number>
+  realAt: Map<string, Promise<string>>
   progress: Map<string, { next: number; version?: string }>
   progressAt: Map<string, number>
   gen: number
@@ -1758,7 +1760,7 @@ const expire = (j: Job) => {
 export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string, timeout: number): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), realAt: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
   job.pidKnown = new Promise<void>((r) => (job.onPid = r))
   jobsById.set(job.id, job)
   return job
@@ -1788,10 +1790,14 @@ const promoteReads = (j: Job) => {
     if (at < (versionAt.get(p) ?? 0)) continue
     readPaths.add(p)
     versionAt.set(p, at)
+    const real = j.realAt.get(p)
+    realAtRead.delete(p)
+    if (real) realAtRead.set(p, real)
     if (v === undefined) readVersions.delete(p)
     else readVersions.set(p, v)
   }
   while (versionAt.size > 2000) versionAt.delete(versionAt.keys().next().value as string)
+  while (realAtRead.size > 2000) realAtRead.delete(realAtRead.keys().next().value as string)
   for (const [p, chain] of j.progress) {
     const at = j.progressAt.get(p) ?? 0
     if (at < (progressAt.get(p) ?? 0)) continue
@@ -2108,11 +2114,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))
       : []
     const patchFresh = new Map<string, boolean>()
-    const patchKeys = new Map<string, string>()
     for (const o of patchOps)
       if (o.op !== 'create' && !patchFresh.has(o.path)) {
         const key = await readKeyOf(o.path)
-        patchKeys.set(o.path, key)
         const was = job.reads.has(key) ? job.reads.get(key) : readPaths.has(key) ? readVersions.get(key) : undefined
         patchFresh.set(o.path, was !== undefined && was === (await versionOf(o.path)))
       }
@@ -2239,15 +2243,16 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         versionAt.set(k, ++readClock)
       }
       for (const o of patchOps) {
-        const alias = patchKeys.get(o.path)
-        if (alias && alias !== o.path) forget(alias)
         if (created.has(o.path) || patchFresh.get(o.path) === true) {
           const version = await versionOf(o.path)
           job.reads.set(o.path, version)
           job.readAt.set(o.path, ++readClock)
           recordReal(o.path)
           readNow.push(o.path)
-        } else forget(o.path)
+        } else {
+          const others = [...jobsById.values()].filter((j) => j !== job && !j.settled).flatMap((j) => [...j.reads.keys()])
+          for (const k of [o.path, ...(await sameFileKeys(o.path, [...job.reads.keys(), ...readPaths, ...others]))]) forget(k)
+        }
       }
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
@@ -2487,17 +2492,21 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     return lost.length ? namesNoFile(lost[0] as string) : undefined
   }
   const recordReal = (path: string) => {
-    realAtRead.delete(path)
-    realAtRead.set(path, realOf(path))
-    while (realAtRead.size > 2000) realAtRead.delete(realAtRead.keys().next().value as string)
+    const before = job.realAt.get(path)
+    job.realAt.set(path, realOf(path))
+    return () => {
+      if (before) job.realAt.set(path, before)
+      else job.realAt.delete(path)
+    }
   }
+  const recordedReal = (k: string) => (job.reads.has(k) ? job.realAt.get(k) : realAtRead.get(k))
   const sameFileKeys = async (path: string, keys: Iterable<string>) => {
     const name = path.slice(path.lastIndexOf('/'))
     const candidates = [...new Set(keys)].filter((k) => k !== path && k.endsWith(name))
     if (!candidates.length) return []
     const real = await realOf(path)
     const same: string[] = []
-    for (const k of candidates) if ((await (realAtRead.get(k) ?? realOf(k))) === real) same.push(k)
+    for (const k of candidates) if ((await (recordedReal(k) ?? realOf(k))) === real) same.push(k)
     return same
   }
   const newest = (keys: string[], at: (k: string) => number) => keys.reduce((best, k) => (at(k) > at(best) ? k : best))
@@ -2543,9 +2552,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.progress.delete(f)
         job.reads.set(f, receipt.version)
         job.readAt.set(f, stamp)
-        recordReal(f)
+        const unrecordReal = recordReal(f)
         undo = () => {
           if (job.readAt.get(f) !== stamp) return
+          unrecordReal()
           if (read.had) job.reads.set(f, read.value)
           else job.reads.delete(f)
           if (read.at === undefined) job.readAt.delete(f)
@@ -2850,6 +2860,7 @@ export const register: Register = (on) => {
     mainTurn = false
     mainTurnId = undefined
     readPaths.clear()
+    realAtRead.clear()
     readProgress.clear()
     progressAt.clear()
     readVersions.clear()
@@ -2862,6 +2873,7 @@ export const register: Register = (on) => {
     const skipped = !!r && typeof r === 'object' && 'skip' in r && (r as { skip?: unknown }).skip !== undefined
     if (!e.agentId && e.trigger !== 'precompute' && !skipped) {
       readPaths.clear()
+      realAtRead.clear()
       readProgress.clear()
       progressAt.clear()
       readVersions.clear()

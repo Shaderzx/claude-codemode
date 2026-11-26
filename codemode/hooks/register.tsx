@@ -1485,6 +1485,7 @@ const deniedTools = new Map<string, { alt?: string; at: number }>()
 const failedScripts = new Map<string, { first: string; at: number }>()
 
 const READ = Symbol('read')
+const UNDELIVERED = Symbol('undelivered')
 const readProgress = new Map<string, { next: number; version?: string }>()
 const readVersions = new Map<string, string>()
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
@@ -1701,7 +1702,7 @@ type Job = {
   quiet: boolean
   reads: Map<string, string | undefined>
   readAt: Map<string, number>
-  pages: Map<string, { version?: string; real?: string; next?: number }>
+  pages: Map<string, { version?: string; real?: string; next?: number; at?: number }>
   progress: Map<string, { next: number; version?: string }>
   progressAt: Map<string, number>
   gen: number
@@ -1801,6 +1802,8 @@ const promoteReads = (j: Job) => {
   for (const [p, v] of j.reads) {
     const at = j.readAt.get(p) ?? 0
     if (at < (versionAt.get(p) ?? 0)) continue
+    for (const other of jobsById.values())
+      if (other !== j && other.gen === sessionGen && other.reads.has(p) && (other.readAt.get(p) ?? 0) < at && other.reads.get(p) !== v) other.reads.set(p, undefined)
     readPaths.delete(p)
     readPaths.add(p)
     versionAt.delete(p)
@@ -2109,6 +2112,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const fill = p.fill && typeof p.fill === 'object' && /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? (p.fill as Record<string, unknown>) : undefined
     if (fill && typeof fill.raw === 'boolean' && !('raw' in args)) args.raw = fill.raw
     if (fill && typeof fill.timeout_ms === 'number' && Number.isFinite(fill.timeout_ms) && !('timeout_ms' in args)) args.timeout_ms = fill.timeout_ms
+    let writeKey: string | undefined
+    let writeVersion: string | undefined
     if ((tool === 'Write' || tool === 'Edit') && args.file_path !== undefined) {
       const given = String(args.file_path).trim()
       const expanded = given === '~' || given.startsWith('~/') ? home + given.slice(1) : given
@@ -2124,9 +2129,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (was === undefined || now === undefined || now !== was || (await movedSinceLocked(m, path, key)))
           return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
         args.file_path = key
+        writeKey = key
+        writeVersion = now
       } else {
         if (await movedSinceLocked(m, path, key)) return { ok: false, error: `${path} now names another file than the one this write waited to lock, so nothing was created; write it again` }
         args.file_path = key
+        writeKey = key
       }
     }
     if (typeof p.expectedVersion === 'string' && isPatchTool(tool) && typeof args.path === 'string') {
@@ -2184,52 +2192,63 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         sentVersions.set(key, now)
         patchFresh.set(key, was !== undefined && was === now)
       }
+    if (writeKey !== undefined) sentVersions.set(writeKey, writeVersion)
     const sentAt = readClock
+    let settledAt = sentAt
     const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) => at === undefined || at <= sentAt || version === undefined || version === sentVersions.get(k)
+    const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt + 0.5)
+    const stampForgotten = (k: string) => {
+      const at = Math.max(forgottenAt.get(k) ?? 0, settledAt)
+      forgottenAt.delete(k)
+      forgottenAt.set(k, at)
+      dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
+    }
+    const resetOpenPages = (j: Job, k: string) => {
+      for (const [id, started] of j.pages) if (started.real === k && sawBeforeSent(k, started.version, started.at)) j.pages.set(id, {})
+    }
     const forgetEverywhere = (k: string) => {
       const forgetIn = (j: Job) => {
         if (j === job || sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) {
           j.reads.delete(k)
           j.readAt.delete(k)
+        }
+        if (j === job || sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
           j.progress.delete(k)
           j.progressAt.delete(k)
         }
-        for (const [id, started] of j.pages) if (started.real === k) j.pages.set(id, {})
+        resetOpenPages(j, k)
       }
       forgetIn(job)
       for (const j of jobsById.values()) if (j.gen === sessionGen) forgetIn(j)
-      const stamp = ++readClock
       if (sawBeforeSent(k, readVersions.get(k), versionAt.get(k))) {
+        const at = beforeSent(versionAt.get(k))
         readPaths.delete(k)
         readVersions.delete(k)
-        readProgress.delete(k)
         versionAt.delete(k)
-        versionAt.set(k, stamp)
+        versionAt.set(k, at)
       }
-      progressAt.delete(k)
-      progressAt.set(k, stamp)
-      forgottenAt.delete(k)
-      forgottenAt.set(k, stamp)
-      dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
+      if (sawBeforeSent(k, readProgress.get(k)?.version, progressAt.get(k))) {
+        const at = beforeSent(progressAt.get(k))
+        readProgress.delete(k)
+        progressAt.delete(k)
+        progressAt.set(k, at)
+      }
+      stampForgotten(k)
     }
     const outdateEverywhere = (k: string) => {
       const outdateIn = (j: Job) => {
-        if (j !== job && j.reads.has(k) && sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) {
-          j.reads.set(k, undefined)
+        if (j !== job && j.reads.has(k) && sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) j.reads.set(k, undefined)
+        if (j !== job && sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
           j.progress.delete(k)
           j.progressAt.delete(k)
         }
-        for (const [id, started] of j.pages) if (started.real === k) j.pages.set(id, {})
+        resetOpenPages(j, k)
       }
       outdateIn(job)
       for (const j of jobsById.values()) if (j.gen === sessionGen) outdateIn(j)
-      if (sawBeforeSent(k, readVersions.get(k), versionAt.get(k))) {
-        readVersions.delete(k)
-        readProgress.delete(k)
-      }
-      forgottenAt.delete(k)
-      forgottenAt.set(k, ++readClock)
-      dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
+      if (sawBeforeSent(k, readVersions.get(k), versionAt.get(k))) readVersions.delete(k)
+      if (sawBeforeSent(k, readProgress.get(k)?.version, progressAt.get(k))) readProgress.delete(k)
+      stampForgotten(k)
     }
     const patchUnsure = (appliedBefore = Infinity) => {
       const opPaths = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).slice(0, appliedBefore).map((o) => patchPath(o?.path ?? args.path)) : appliedBefore > 0 ? [patchPath(args.path)] : []
@@ -2242,6 +2261,15 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         outdateEverywhere(key)
         if (job.reads.has(key)) job.reads.set(key, undefined)
       }
+    }
+    const writeUnsure = () => {
+      if (writeKey === undefined) return
+      outdateEverywhere(writeKey)
+      if (job.reads.has(writeKey)) job.reads.set(writeKey, undefined)
+    }
+    const changeUnsure = () => {
+      if (isPatch) patchUnsure()
+      writeUnsure()
     }
     if (late()) {
       release?.()
@@ -2257,16 +2285,18 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       tally.failed++
       tally.arg ??= firstArg(args)
       release?.()
-      if (isPatch) patchUnsure()
+      settledAt = ++readClock
+      changeUnsure()
       const msg = (err as Error)?.message ?? String(err)
       // A tool a setting or another mod removed: name what may replace it.
       const near = msg.includes('no tool named') ? similar(tool, all.map((x) => x.name)) : []
       throw new Error(near.length ? `${msg}; similar: ${near.join(', ')}` : msg)
     })
+    settledAt = ++readClock
     const body = release ? skillTexts.get(key) : undefined
     release?.()
     if (isPatch && r.isError) {
-      const said = String(r.text ?? show(r.result))
+      const said = String(r.text ?? show(r.result)).replace(/^\s*(?:<tool_use_error>)?\s*/, '')
       const failedAt = /^ops\[(\d+)\]/.exec(said)
       if (failedAt && /Earlier ops in this batch were already applied/.test(said)) patchUnsure(Number(failedAt[1]))
     }
@@ -2348,7 +2378,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const exit = shell ? { ...(shell.code === undefined ? {} : { exitCode: shell.code }), shellText: shell.out } : {}
     if (!r.isError) {
       if (text.length > MAX_REPLY) {
-        if (isPatch) patchUnsure()
+        changeUnsure()
         tally.ok--
         tally.failed++
         tally.arg ??= firstArg(args)
@@ -2379,6 +2409,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           readNow.push(o.path)
         } else forgetEverywhere(key)
       }
+      if (wrote && writeKey !== undefined) outdateEverywhere(writeKey)
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
@@ -2386,7 +2417,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const pages = typeof p.readId === 'number' ? `#${p.readId}` : args.file_path
         const first = job.pages.get(pages)
         const heldStill = readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter)
-        if (from === 1) job.pages.set(pages, heldStill ? { version: readBefore, real: realBefore } : {})
+        if (from === 1) job.pages.set(pages, heldStill ? { version: readBefore, real: realBefore, at: askedAt } : {})
         else if (first !== undefined && (!heldStill || readBefore !== first.version || realBefore !== first.real)) {
           tally.ok--
           tally.failed++
@@ -2410,7 +2441,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (/read-dedup/.test(text)) deduped = true
       }
       const leanJob = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
-      return { ok: true, text, result, ...exit, ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}) }
+      return { ok: true, text, result, ...exit, ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}), ...(isPatch || writeKey !== undefined ? { [UNDELIVERED]: changeUnsure } : {}) }
     }
     const bad = tidy(tool, text)
     if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
@@ -2713,7 +2744,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       return false
     })()
     const reply = delivered.then((ok) => {
-      if (!ok) undo?.()
+      if (ok) return
+      undo?.()
+      ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
     })
     writes.add(reply)
     void reply.finally(() => writes.delete(reply))

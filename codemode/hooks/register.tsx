@@ -1487,7 +1487,7 @@ const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number)
   for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
   return 0
 }
-type Receipt = { file: string; whole: boolean; next?: number; version?: string; real?: string }
+type Receipt = { file: string; whole: boolean; next?: number; version?: string }
 type FileInfo = { startLine?: unknown; numLines?: unknown; totalLines?: unknown; truncatedByTokenCap?: unknown }
 const infoOf = (result: unknown): FileInfo | undefined => {
   const f = result && typeof result === 'object' ? (result as { file?: unknown }).file : undefined
@@ -1695,7 +1695,6 @@ type Job = {
   quiet: boolean
   reads: Map<string, string | undefined>
   readAt: Map<string, number>
-  realAt: Map<string, Promise<string>>
   progress: Map<string, { next: number; version?: string }>
   progressAt: Map<string, number>
   gen: number
@@ -1709,7 +1708,6 @@ const MAIN = 'main'
 const jobsById = new Map<string, Job>()
 const deliveredIds = new Map<string, string>()
 const handedSpills = new Map<string, number>()
-const realAtRead = new Map<string, Promise<string>>()
 const ownSpills = new Set<string>()
 const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
@@ -1760,7 +1758,7 @@ const expire = (j: Job) => {
 export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string, timeout: number): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), realAt: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
   job.pidKnown = new Promise<void>((r) => (job.onPid = r))
   jobsById.set(job.id, job)
   return job
@@ -1788,16 +1786,14 @@ const promoteReads = (j: Job) => {
   for (const [p, v] of j.reads) {
     const at = j.readAt.get(p) ?? 0
     if (at < (versionAt.get(p) ?? 0)) continue
+    readPaths.delete(p)
     readPaths.add(p)
+    versionAt.delete(p)
     versionAt.set(p, at)
-    const real = j.realAt.get(p)
-    realAtRead.delete(p)
-    if (real) realAtRead.set(p, real)
-    if (v === undefined) readVersions.delete(p)
-    else readVersions.set(p, v)
+    readVersions.delete(p)
+    if (v !== undefined) readVersions.set(p, v)
   }
   while (versionAt.size > 2000) versionAt.delete(versionAt.keys().next().value as string)
-  while (realAtRead.size > 2000) realAtRead.delete(realAtRead.keys().next().value as string)
   for (const [p, chain] of j.progress) {
     const at = j.progressAt.get(p) ?? 0
     if (at < (progressAt.get(p) ?? 0)) continue
@@ -1805,7 +1801,11 @@ const promoteReads = (j: Job) => {
     readProgress.set(p, chain)
   }
   while (progressAt.size > 2000) progressAt.delete(progressAt.keys().next().value as string)
-  while (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
+  for (const oldest of readPaths) {
+    if (readPaths.size <= 2000) break
+    readPaths.delete(oldest)
+    readVersions.delete(oldest)
+  }
   while (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
   while (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
 }
@@ -2000,7 +2000,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     if (m.kind === 'fresh') {
       const asked = normal(String(p.path))
-      const path = await readKeyOf(asked)
+      const path = await realOf(asked)
       const read = job.reads.has(path) || readPaths.has(path)
       const was = job.reads.has(path) ? job.reads.get(path) : readPaths.has(path) ? readVersions.get(path) : undefined
       const now = was === undefined ? undefined : await versionOf(asked)
@@ -2079,7 +2079,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const path = normal(expanded)
       args.file_path = path
       const exists = await $.fs.exists(path).catch(() => true)
-      const key = exists ? await readKeyOf(path) : path
+      const key = await realOf(path)
       if (!readPaths.has(key) && !job.reads.has(key) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
       if (exists) {
         const was = job.reads.has(key) ? job.reads.get(key) : readVersions.get(key)
@@ -2115,9 +2115,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))
       : []
     const patchFresh = new Map<string, boolean>()
+    const patchKeys = new Map<string, string>()
+    for (const o of patchOps) if (!patchKeys.has(o.path)) patchKeys.set(o.path, await realOf(o.path))
     for (const o of patchOps)
       if (o.op !== 'create' && !patchFresh.has(o.path)) {
-        const key = await readKeyOf(o.path)
+        const key = patchKeys.get(o.path) as string
         const was = job.reads.has(key) ? job.reads.get(key) : readPaths.has(key) ? readVersions.get(key) : undefined
         patchFresh.set(o.path, was !== undefined && was === (await versionOf(o.path)))
       }
@@ -2236,23 +2238,27 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       const readNow: string[] = []
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => o.path))
-      const forget = (k: string) => {
-        job.reads.delete(k)
+      const forgetEverywhere = (k: string) => {
+        for (const j of [job, ...jobsById.values()].filter((j) => j === job || j.gen === sessionGen)) {
+          j.reads.delete(k)
+          j.readAt.delete(k)
+          j.progress.delete(k)
+          j.progressAt.delete(k)
+        }
         if (job.gen !== sessionGen) return
         readPaths.delete(k)
         readVersions.delete(k)
+        readProgress.delete(k)
         versionAt.set(k, ++readClock)
+        progressAt.set(k, readClock)
       }
       for (const o of patchOps) {
+        const key = patchKeys.get(o.path) as string
         if (created.has(o.path) || patchFresh.get(o.path) === true) {
-          const version = await versionOf(o.path)
-          job.reads.set(o.path, version)
-          job.readAt.set(o.path, ++readClock)
-          recordReal(o.path)
+          job.reads.set(key, await versionOf(o.path))
+          job.readAt.set(key, ++readClock)
           readNow.push(o.path)
-        } else {
-          for (const k of [o.path, ...(await sameFileKeys(o.path, [...job.reads.keys(), ...readPaths])), ...(await openReadsOf(o.path))]) forget(k)
-        }
+        } else forgetEverywhere(key)
       }
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
@@ -2269,12 +2275,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       const receipt =
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter ? readBefore : undefined, [job.progress.get(args.file_path), readProgress.get(args.file_path)])
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter ? readBefore : undefined, [job.progress.get(realAfter ?? args.file_path), readProgress.get(realAfter ?? args.file_path)])
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
             : undefined
       if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
-      if (receipt && realAfter !== undefined) receipt.real = realAfter
+      if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : await realOf(receipt.file)
       if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
       else if (isStub(text, tool) && p.handled !== true) {
         stubs.add(tool)
@@ -2493,43 +2499,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     m.payload.args = args
     return lost.length ? namesNoFile(lost[0] as string) : undefined
   }
-  const recordReal = (path: string, known?: string) => {
-    const before = job.realAt.get(path)
-    job.realAt.set(path, known === undefined ? realOf(path) : Promise.resolve(known))
-    return () => {
-      if (before) job.realAt.set(path, before)
-      else job.realAt.delete(path)
-    }
-  }
-  const openReadsOf = async (path: string) => {
-    const name = path.slice(path.lastIndexOf('/'))
-    const real = await realOf(path)
-    const found: string[] = []
-    for (const j of jobsById.values()) {
-      if (j === job || j.settled) continue
-      for (const k of j.reads.keys()) if (k !== path && k.endsWith(name) && (await (j.realAt.get(k) ?? realOf(k))) === real) found.push(k)
-    }
-    return found
-  }
-  const recordedReal = (k: string) => (job.reads.has(k) ? job.realAt.get(k) : realAtRead.get(k))
-  const sameFileKeys = async (path: string, keys: Iterable<string>) => {
-    const name = path.slice(path.lastIndexOf('/'))
-    const candidates = [...new Set(keys)].filter((k) => k !== path && k.endsWith(name))
-    if (!candidates.length) return []
-    const real = await realOf(path)
-    const same: string[] = []
-    for (const k of candidates) if ((await (recordedReal(k) ?? realOf(k))) === real) same.push(k)
-    return same
-  }
-  const newest = (keys: string[], at: (k: string) => number) => keys.reduce((best, k) => (at(k) > at(best) ? k : best))
-  const newestSpellingOf = async (path: string) => {
-    const spellings = [path, ...(await sameFileKeys(path, [...job.reads.keys(), ...readPaths]))]
-    const own = spellings.filter((k) => job.reads.has(k))
-    if (own.length) return newest(own, (k) => job.readAt.get(k) ?? 0)
-    const shared = spellings.filter((k) => readPaths.has(k))
-    return shared.length ? newest(shared, (k) => versionAt.get(k) ?? 0) : path
-  }
-  const readKeyOf = newestSpellingOf
   const respond = async (m: Request) => {
     const lost = await resolveClimbs(m)
     let out: Record<string, unknown>
@@ -2564,10 +2533,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.progress.delete(f)
         job.reads.set(f, receipt.version)
         job.readAt.set(f, stamp)
-        const unrecordReal = recordReal(f, receipt.real)
         undo = () => {
           if (job.readAt.get(f) !== stamp) return
-          unrecordReal()
           if (read.had) job.reads.set(f, read.value)
           else job.reads.delete(f)
           if (read.at === undefined) job.readAt.delete(f)
@@ -2872,7 +2839,6 @@ export const register: Register = (on) => {
     mainTurn = false
     mainTurnId = undefined
     readPaths.clear()
-    realAtRead.clear()
     readProgress.clear()
     progressAt.clear()
     readVersions.clear()
@@ -2885,7 +2851,6 @@ export const register: Register = (on) => {
     const skipped = !!r && typeof r === 'object' && 'skip' in r && (r as { skip?: unknown }).skip !== undefined
     if (!e.agentId && e.trigger !== 'precompute' && !skipped) {
       readPaths.clear()
-      realAtRead.clear()
       readProgress.clear()
       progressAt.clear()
       readVersions.clear()

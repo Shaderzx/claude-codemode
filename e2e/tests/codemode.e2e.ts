@@ -3541,3 +3541,38 @@ test('A read in pages whose symlink is re-pointed between pages counts for neith
   expect(out.results[0]!.text).toContain('has not been read yet');
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('yyyy\nYYYY\n');
 });
+
+const linkMovesDuringWrite = (slow: { tools?: string[]; readDelayMs?: number; statDelayMs?: number }) => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt']);
+  const link = join(dir, 'L');
+  const viaL = JSON.stringify(join(link, 'f.txt'));
+  const marker = join(dir, 'writing');
+  const writer = 'await read(' + viaL + ')\nawait sh("touch ' + marker + '")\ntry { await write(' + viaL + ', "CLOBBER\\n"); return "wrote" } catch (e) { return String(e.message) }';
+  const out = run({ ...slow, steps: [{ link: { from: link, to: join(dir, 'X') } }, { script: writer, keepTurn: true }, { untilFile: marker }, { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nreturn "moved"', keepTurn: true }, { untilRunsDone: true }, { collect: true }] });
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
+  expect(['xxxx\n', 'CLOBBER\n']).toContain(readFileSync(join(dir, 'X', 'f.txt'), 'utf8'));
+  expect(out.results.map((r) => r.text).join('\n')).toContain('moved');
+};
+
+test('A patch write through a symlink moved while the write runs never lands on the file the symlink moved to', () => linkMovesDuringWrite({ tools: [...NO_BASH], readDelayMs: 1500 }));
+test('A Write through a symlink moved while the write runs never lands on the file the symlink moved to', () => linkMovesDuringWrite({ statDelayMs: 1500 }));
+
+test('A page chain refreshed by a later run outlives two hundred chains started before it', () => {
+  const dir = scratch();
+  const two = 'one\ntwo\n';
+  const p = join(dir, 'p.txt');
+  writeFileSync(p, two);
+  const qs = Array.from({ length: 200 }, (_, i) => join(dir, 'q' + i + '.txt'));
+  for (const q of qs) writeFileSync(q, two);
+  const firstPage = (f: string) => 'await call("Read", { file_path: ' + JSON.stringify(f) + ', limit: 1 })\n';
+  const out = run({ steps: [
+    { script: firstPage(p) + 'return "p"' },
+    { script: '// @options: {"timeout_ms": 120000}\nfor (const q of ' + JSON.stringify(qs.slice(0, 199)) + ') await call("Read", { file_path: q, limit: 1 })\nreturn "q"' },
+    { script: firstPage(p) + 'return "p again"' },
+    { script: firstPage(qs[199]!) + 'return "q199"' },
+    { script: 'await call("Read", { file_path: ' + JSON.stringify(p) + ', offset: 2 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(p) + ', content: "mine\\n" })\nreturn r.ok ? "wrote" : r.error' },
+  ] });
+  expect(out.results[4]!.text).toBe('wrote');
+  expect(readFileSync(p, 'utf8')).toBe('mine\n');
+});

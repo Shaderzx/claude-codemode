@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'e2e';
@@ -3768,6 +3768,8 @@ const linkMovesInsideTheCall = (tool: 'Write' | 'patch') => {
     { collect: true },
   ] });
   expect(out.results.map((r) => r.text).join('\n')).toContain('landed');
+  const sent = out.calls.filter((c) => c.tool === (tool === 'Write' ? 'Write' : 'mcp__lean-ctx__ctx_patch')).at(-1)?.args as { file_path?: string; path?: string } | undefined;
+  expect(tool === 'Write' ? sent?.file_path : sent?.path).toBe(realpathSync(join(dir, 'X', 'f.txt')));
   expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('MINE\n');
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
 };

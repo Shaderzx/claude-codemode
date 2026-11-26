@@ -10,6 +10,7 @@ type Case = {
   writeDelayMs?: number
   patchDelayMs?: number
   existsGapMs?: number
+  holdLaterPages?: { asked: string; gate: string }
   statDelayMs?: number
   hangListMs?: number
   hangListCount?: number
@@ -186,6 +187,11 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
   if (!names.includes(tool)) throw new Error('codemode: $.tool.call: no tool named "' + tool + '" in this session')
   switch (tool) {
     case 'Read': {
+      const hold = c.holdLaterPages
+      if (hold && Number(a.offset ?? 1) > 1) {
+        writeFileSync(hold.asked, '')
+        for (let waited = 0; !existsSync(hold.gate) && waited < 30_000; waited += 20) await new Promise((r) => setTimeout(r, 20))
+      }
       if (c.readDelayMs) await new Promise((r) => setTimeout(r, c.readDelayMs))
       if ((c.denyReadPaths ?? []).some((d) => String(a.file_path ?? '').endsWith(d))) return { deny: 'Permission to read ' + String(a.file_path) + ' has been denied.' }
       if (c.readRewrite !== undefined) return ok(c.readRewrite)

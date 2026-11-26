@@ -1799,6 +1799,7 @@ const promoteReads = (j: Job) => {
   for (const [p, chain] of j.progress) {
     const at = j.progressAt.get(p) ?? 0
     if (at < (progressAt.get(p) ?? 0)) continue
+    progressAt.delete(p)
     progressAt.set(p, at)
     readProgress.delete(p)
     readProgress.set(p, chain)
@@ -2130,6 +2131,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const patchFresh = new Map<string, boolean>()
     const patchKeys = new Map<string, string>()
     for (const o of patchOps) if (!patchKeys.has(o.path)) patchKeys.set(o.path, await realOf(o.path))
+    const pinned = (v: unknown) => patchKeys.get(patchPath(v) ?? '') ?? v
+    if (patchOps.length) {
+      if (typeof args.path === 'string') args.path = pinned(args.path)
+      if (Array.isArray(args.ops)) args.ops = (args.ops as Record<string, unknown>[]).map((o) => (o && typeof o.path === 'string' ? { ...o, path: pinned(o.path) } : o))
+    }
     for (const o of patchOps)
       if (o.op !== 'create' && !patchFresh.has(patchKeys.get(o.path) as string)) {
         const key = patchKeys.get(o.path) as string

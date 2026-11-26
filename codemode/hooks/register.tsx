@@ -2545,8 +2545,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       else climbed.set(found, [...(climbed.get(found) ?? []), [String(v), relative]])
       return found ?? String(v)
     }
-    const patchTool = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
-    const climbable = (v: unknown) => climbs(v) && !(patchTool && String(v).trim().startsWith('~'))
+    const climbable = (v: unknown) => climbs(v) && !(lean && String(v).trim().startsWith('~'))
     for (const k of ['file_path', 'notebook_path', 'path']) {
       const v = k in given ? given[k] : preset[k]
       if (climbable(v)) args[k] = await place(v)

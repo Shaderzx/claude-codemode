@@ -4054,3 +4054,55 @@ test('A relative lean-ctx path whose .. climbs out of a symlinked folder reaches
   const out = run({ cwd: dir, tools: ['Read', 'ToolSearch', 'mcp__lean-ctx__ctx_read'], steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'await call("mcp__lean-ctx__ctx_read", { path: "sub/../real.txt" })\nreturn "sent"' }] });
   expect((out.calls.find((c) => c.tool === 'mcp__lean-ctx__ctx_read')?.args as { path?: string } | undefined)?.path).toBe('sub/../real.txt');
 });
+
+const linkThroughMissingFolder = (tools: readonly string[] | undefined) => {
+  const dir = scratch();
+  writeFileSync(join(dir, 'secret.txt'), 'PRECIOUS\n');
+  const link = join(dir, 'link.txt');
+  const act = tools ? 'try { await write(' + JSON.stringify(link) + ', "CLOBBER\\n"); return "wrote" } catch (e) { return "refused: " + e.message }' : 'const r = await call("Write", { file_path: ' + JSON.stringify(link) + ', content: "CLOBBER\\n" })\nreturn r.ok ? "wrote" : "refused: " + r.error';
+  const out = run({ ...(tools ? { tools: [...tools] } : { engineForgets: true }), steps: [{ link: { from: link, to: 'missing_dir/../secret.txt' } }, { script: act }] });
+  expect(out.results[0]!.text).toContain('refused: ');
+  expect(readFileSync(join(dir, 'secret.txt'), 'utf8')).toBe('PRECIOUS\n');
+  expect(existsSync(join(dir, 'missing_dir'))).toBe(false);
+};
+
+test('A Write through a symlink whose target climbs out of a missing folder never overwrites the unread file it lands on', () => linkThroughMissingFolder(undefined));
+test('A patch write through a symlink whose target climbs out of a missing folder never overwrites the unread file it lands on', () => linkThroughMissingFolder(NO_BASH));
+
+test('A Write to the root folder is checked as the root folder and never sent with an empty path', () => {
+  const out = run({ engineForgets: true, steps: [{ script: 'const r = await call("Write", { file_path: "/", content: "x" })\nreturn r.ok ? "wrote" : r.error' }] });
+  expect(out.calls.filter((c) => c.tool === 'Write' && (c.args as { file_path?: string }).file_path === '')).toHaveLength(0);
+  expect(out.results[0]!.text).toContain('/');
+});
+
+test('A stale patch between the pages of an open read() makes that read fail and leaves the file unread', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const ref = join(dir, 'ref');
+  const lines = (tag: string) => Array.from({ length: 2400 }, (_, i) => tag + ' ' + String(i).padStart(4, '0')).join('\n') + '\n';
+  writeFileSync(big, lines('A'));
+  writeFileSync(join(dir, 'b.txt'), lines('B'));
+  writeFileSync(ref, '');
+  utimesSync(big, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const b = JSON.stringify(big);
+  const reader = 'try { const t = await read(' + b + '); return "read " + (t.includes("A 0000") ? "A" : "") + (t.includes("2399") && !t.includes("A 2399") ? "B" : "") } catch (e) { return "reader: " + e.message }';
+  const patcher = 'await sh("cp ' + join(dir, 'b.txt') + ' ' + big + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + b + ', old_text: "B 0000", new_text: "C 0000" })\nawait sh("touch -r ' + ref + ' ' + big + '")\nreturn "patched"';
+  const out = run({ tools: NO_BASH, readDelayMs: 600, steps: [
+    { script: reader, keepTurn: true },
+    { untilCalls: { tool: 'Read', count: 2 } },
+    { script: patcher, keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + b + ', "CLOBBERED\\n"); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).not.toContain('read AB');
+  expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
+  expect(readFileSync(big, 'utf8').startsWith('C 0000')).toBe(true);
+});
+
+test('A stored value too large to load back is refused when stored', () => {
+  const out = run({ steps: [{ script: 'try { await store("big", "x".repeat(4_300_000)); return "stored " + String((await load("big"))?.length) } catch (e) { return String(e.message) }' }] });
+  expect(out.results[0]!.text).toContain('too large');
+});

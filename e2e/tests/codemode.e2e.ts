@@ -3122,3 +3122,74 @@ test('A read through a symlink never counts for the file the symlink is later po
   expect(out.results[0]!.text).toContain('has not been read yet');
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('yyyy\n');
 });
+
+test('A file read by its plain path and written through another spelling can be edited by its plain path again', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'w', 'B', 'other', 'deep'), { recursive: true });
+  mkdirSync(join(dir, 'w', 'B', 'real'), { recursive: true });
+  writeFileSync(join(dir, 'w', 'B', 'other', 'f.txt'), 'theirs\n');
+  const plain = JSON.stringify(join(dir, 'w', 'A', 'other', 'f.txt'));
+  const climbing = JSON.stringify(join(dir, 'w', 'A', 'real', 'L') + '/../f.txt');
+  const out = run({ engineForgets: true, steps: [
+    { link: { from: join(dir, 'w', 'A'), to: join(dir, 'w', 'B') } },
+    { link: { from: join(dir, 'w', 'B', 'real', 'L'), to: join(dir, 'w', 'B', 'other', 'deep') } },
+    { script: 'await read(' + plain + ')\ntry { await write(' + climbing + ', "mine\\n"); await edit(' + plain + ', "mine", "mine2"); return "done" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[0]!.text).toBe('done');
+  expect(readFileSync(join(dir, 'w', 'B', 'other', 'f.txt'), 'utf8')).toBe('mine2\n');
+});
+
+test('A file read under one spelling takes a patch edit under another spelling and then one under the first', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'B'));
+  writeFileSync(join(dir, 'B', 'f.txt'), 'alpha\nbeta\n');
+  const viaA = JSON.stringify(join(dir, 'A', 'f.txt'));
+  const viaB = JSON.stringify(join(dir, 'B', 'f.txt'));
+  const out = run({ tools: NO_BASH, steps: [{ link: { from: join(dir, 'A'), to: join(dir, 'B') } }, { script: 'await read(' + viaA + ')\nconst seen = []\nfor (const [p, from, to] of [[' + viaB + ', "alpha", "ALPHA"], [' + viaA + ', "beta", "BETA"]]) { try { await edit(p, from, to); seen.push("edited") } catch (e) { seen.push(String(e.message)) } }\nreturn seen.join(" | ")' }] });
+  expect(out.results[0]!.text).toBe('edited | edited');
+  expect(readFileSync(join(dir, 'B', 'f.txt'), 'utf8')).toBe('ALPHA\nBETA\n');
+});
+
+test('A path that climbs out of a symlinked folder and then through a plain file is refused and touches no file', () => {
+  const dir = climbingFolder();
+  writeFileSync(join(dir, 'x', 'notadir'), 'FILE\n');
+  const p = JSON.stringify(join(dir, 'sub') + '/../notadir/../real.txt');
+  const out = run({ steps: [
+    { link: { from: join(dir, 'sub'), to: 'x/y' } },
+    { script: 'try { await write(' + p + ', "MINE\\n", { force: true }); return "done" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[0]!.text).toContain('names no file on disk');
+  expect(readFileSync(join(dir, 'x', 'real.txt'), 'utf8')).toBe('INTENDED\n');
+  expect(readFileSync(join(dir, 'real.txt'), 'utf8')).toBe('DECOY\n');
+});
+
+test('An unforced patch edit of a path that names no file on disk says so', () => {
+  const dir = climbingFolder();
+  const p = JSON.stringify(join(dir, 'sub') + '/../sub/../real.txt');
+  const out = run({ tools: NO_BASH, steps: [
+    { link: { from: join(dir, 'sub'), to: 'x/y' } },
+    { script: 'try { await edit(' + p + ', "INTENDED", "MINE"); return "done" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[0]!.text).toContain('names no file on disk');
+  expect(readFileSync(join(dir, 'x', 'real.txt'), 'utf8')).toBe('INTENDED\n');
+});
+
+const shortRace = (tools: readonly string[] | undefined, readFirst: boolean, op: 'write' | 'edit') => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nbeta\n');
+  const f = JSON.stringify(file);
+  const go = join(dir, 'go');
+  const [a, b] = ['a-ready', 'b-ready'].map((n) => join(dir, n));
+  const act = (from: string, to: string) => (op === 'write' ? 'await write(' + f + ', "' + to + '\\n", { force: true })' : 'await edit(' + f + ', "' + from + '", "' + to + '", { force: true })');
+  const racer = (from: string, to: string, marker: string) => '// @options: {"timeout_ms": 2000}\n' + (readFirst ? 'await read(' + f + ')\n' : '') + 'await sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 1500 })\ntry { ' + act(from, to) + '; return "landed" } catch (e) { return String(e.message) }';
+  const out = run({ ...(tools ? { tools: [...tools] } : {}), statDelayMs: 120, steps: [{ script: racer('alpha', 'ALPHA', a), keepTurn: true }, { script: racer('beta', 'BETA', b), keepTurn: true }, { untilFile: a }, { untilFile: b }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  expect([out.results[0]!.text, out.results[1]!.text]).toEqual(['landed', 'landed']);
+  const text = readFileSync(file, 'utf8');
+  if (op === 'edit') expect(text).toBe('ALPHA\nBETA\n');
+  else expect(['ALPHA\n', 'BETA\n']).toContain(text);
+};
+
+test('Two forced patch writes in two-second runs that read the file first both land', () => shortRace(NO_BASH, true, 'write'));
+test('Two unread forced edits through Edit in two-second runs both land', () => shortRace(undefined, false, 'edit'));
+test('Two unread forced patch edits in two-second runs both land', () => shortRace(NO_BASH, false, 'edit'));

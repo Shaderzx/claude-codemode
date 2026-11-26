@@ -3080,3 +3080,45 @@ test('Reading a folder says it is a folder', () => {
   const out = run({ steps: [{ script: 'try { await read(' + JSON.stringify(dir) + '); return "read" } catch (e) { return String(e.message) }' }] });
   expect(out.results[0]!.text).toContain(dir + ' is a folder, not a file');
 });
+
+test('A relative path with .. given to a tool that does not take local files arrives unchanged', () => {
+  const dir = scratch();
+  const out = run({ cwd: dir, tools: ['Read', 'ToolSearch', 'mcp__github__get_file_contents'], steps: [{ script: 'await call("mcp__github__get_file_contents", { owner: "o", repo: "r", path: "docs/../README.md" })\nreturn "sent"' }] });
+  const sent = out.calls.find((c) => c.tool === 'mcp__github__get_file_contents');
+  expect((sent?.args as { path?: string } | undefined)?.path).toBe('docs/../README.md');
+});
+
+test('A relative Write path with .. is refused as relative and creates no file', () => {
+  const dir = climbingFolder();
+  const out = run({ cwd: dir, steps: [{ link: { from: join(dir, 'sub'), to: 'x/y' } }, { script: 'const r = await call("Write", { file_path: "sub/../new.txt", content: "x\\n" })\nreturn r.ok ? "wrote" : r.error' }] });
+  expect(out.results[0]!.text).toContain('is relative');
+  expect(existsSync(join(dir, 'x', 'new.txt'))).toBe(false);
+  expect(existsSync(join(dir, 'new.txt'))).toBe(false);
+});
+
+test('A file read under one spelling takes two patch edits under another spelling', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'B'));
+  writeFileSync(join(dir, 'B', 'f.txt'), 'alpha\nbeta\n');
+  const viaA = JSON.stringify(join(dir, 'A', 'f.txt'));
+  const viaB = JSON.stringify(join(dir, 'B', 'f.txt'));
+  const out = run({ tools: NO_BASH, steps: [{ link: { from: join(dir, 'A'), to: join(dir, 'B') } }, { script: 'await read(' + viaA + ')\nconst seen = []\nfor (const [from, to] of [["alpha", "ALPHA"], ["beta", "BETA"]]) { try { await edit(' + viaB + ', from, to); seen.push("edited") } catch (e) { seen.push(String(e.message)) } }\nreturn seen.join(" | ")' }] });
+  expect(out.results[0]!.text).toBe('edited | edited');
+  expect(readFileSync(join(dir, 'B', 'f.txt'), 'utf8')).toBe('ALPHA\nBETA\n');
+});
+
+test('A read through a symlink never counts for the file the symlink is later pointed at', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'xxxx\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'yyyy\n');
+  const link = join(dir, 'L');
+  const viaL = JSON.stringify(join(link, 'f.txt'));
+  const out = run({ steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script: 'await read(' + viaL + ')\nawait sh("touch -r ' + join(dir, 'X', 'f.txt') + ' ' + join(dir, 'Y', 'f.txt') + '; ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nconst r = await call("Write", { file_path: ' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ', content: "mine\\n" })\nreturn r.ok ? "wrote" : r.error' },
+  ] });
+  expect(out.results[0]!.text).toContain('has not been read yet');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('yyyy\n');
+});

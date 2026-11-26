@@ -1988,7 +1988,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const dir = `${root}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${++runs}`
 
   const lockedReals = new WeakMap<Request, Set<string>>()
-  const movedSinceLocked = async (m: Request, path: string, real: string) => (await realOf(path)) !== real || !(lockedReals.get(m)?.has(real) ?? true)
+  const climbedFrom = new WeakMap<Request, Map<string, [string, boolean]>>()
+  const movedSinceLocked = async (m: Request, path: string, real: string) => {
+    const climbed = climbedFrom.get(m)?.get(path)
+    const now = climbed ? await onDisk(climbed[0], climbed[1]) : path
+    return now === undefined || (await realOf(now)) !== real || !(lockedReals.get(m)?.has(real) ?? true)
+  }
   const versionOf = (path: string): Promise<string | undefined> =>
     $.fs.stat(path, { resolve: true }).then(
       (s) => (typeof s?.mtimeMs === 'number' ? `${s.mtimeMs}:${s.size}` : undefined),
@@ -2084,8 +2089,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (!expanded.startsWith('/')) return { ok: false, error: `${tool} takes an absolute path from a script: ${given} is relative, and a shell cd can move where it lands` }
       const path = normal(expanded)
       args.file_path = path
-      const exists = await $.fs.exists(path).catch(() => true)
       const key = await realOf(path)
+      const exists = await $.fs.exists(key).catch(() => true)
       if (!readPaths.has(key) && !job.reads.has(key) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
       if (exists) {
         const was = job.reads.has(key) ? job.reads.get(key) : readVersions.get(key)
@@ -2122,7 +2127,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const since = skillSeq
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
-    const patchPath = (v: unknown) => (typeof v === 'string' && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
+    const patchPath = (v: unknown) => (typeof v === 'string' && !!v.trim() && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
     const isPatch = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
     const patchPaths = isPatch ? [args.path, ...(Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).map((o) => o?.path) : [])] : []
     if (patchPaths.some((v) => typeof v === 'string' && v.trim().startsWith('~')))
@@ -2284,7 +2289,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       for (const o of patchOps) {
         const key = patchKeys.get(o.path) as string
         if (created.has(key) || patchFresh.get(key) === true) {
-          job.reads.set(key, await versionOf(key))
+          const version = await versionOf(key)
+          job.progress.delete(key)
+          job.progressAt.delete(key)
+          job.reads.delete(key)
+          job.reads.set(key, version)
+          job.readAt.delete(key)
           job.readAt.set(key, ++readClock)
           readNow.push(o.path)
         } else forgetEverywhere(key)
@@ -2517,9 +2527,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const preset = defaults[tool] ?? {}
     const args = { ...given }
     const lost: string[] = []
+    const climbed = new Map<string, [string, boolean]>()
+    climbedFrom.set(m, climbed)
     const place = async (v: unknown) => {
       const found = await onDisk(String(v), relative)
       if (found === undefined) lost.push(String(v).trim())
+      else climbed.set(found, [String(v), relative])
       return found ?? String(v)
     }
     for (const k of ['file_path', 'notebook_path', 'path']) {
@@ -2563,7 +2576,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       if (receipt.whole) {
         job.progress.delete(f)
+        job.progressAt.delete(f)
+        job.reads.delete(f)
         job.reads.set(f, receipt.version)
+        job.readAt.delete(f)
         job.readAt.set(f, stamp)
         undo = () => {
           if (job.readAt.get(f) !== stamp) return
@@ -2574,7 +2590,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           if (!job.progress.has(f)) restorePage()
         }
       } else if (receipt.next !== undefined) {
+        job.progress.delete(f)
         job.progress.set(f, { next: receipt.next, version: receipt.version })
+        job.progressAt.delete(f)
         job.progressAt.set(f, stamp)
         undo = () => {
           if (job.progressAt.get(f) === stamp) restorePage()

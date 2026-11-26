@@ -14,6 +14,7 @@ type Case = {
   existsGapMs?: number
   lastPartMayBeMissing?: boolean
   holdLaterPages?: { asked: string; gate: string }
+  holdReplyContaining?: { text: string; asked: string; gate: string }
   statDelayMs?: number
   hangListMs?: number
   hangListCount?: number
@@ -131,6 +132,7 @@ const shellOk = (t: string) => ok(t, [{ type: 'text', text: t }])
 const firewalled = (id: string, body: string) => '[Firewalled ctx_shell output — ' + body.length + ' chars, ' + body.split('\n').length + ' lines stored out-of-band]\n--- head ---\n' + body.slice(0, 200) + '\n--- retrieve full output ---\nFull:    ctx_expand(id="' + id + '")'
 const archive = (id: string) => join(home, '.local', 'share', 'lean-ctx', 'archives', id.slice(0, 2), id + '.txt')
 let archived = 0
+let replyHeld = false
 let swapped = 0
 const tokensOf = (rows: string[]) => rows.reduce((n, l) => n + (l.length > 200 && !/\s/.test(l) ? l.length : Math.ceil(l.length / 4)) + 1, 0)
 const leanReply = (tool: string, r: { code: number; out: string }) => {
@@ -547,6 +549,12 @@ const $ = {
   env: { get: async (k: string) => (lastActivity = Date.now(), { HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },
   fs: {
     write: async (p: string, t: string) => {
+      const holding = c.holdReplyContaining
+      if (holding && !replyHeld && p.endsWith('.json') && t.includes(holding.text)) {
+        replyHeld = true
+        writeFileSync(holding.asked, '')
+        await until(() => existsSync(holding.gate), 30_000, holding.gate + ' appearing')
+      }
       inflight++
       try {
         writtenReplies.add(p)

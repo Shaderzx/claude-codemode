@@ -3481,7 +3481,7 @@ const patchBesideOtherRun = (otherState: 'open' | 'settled') => {
   const r1 = otherState === 'open' ? 'await read(' + viaA + ')\nawait sh("touch ' + r1Read + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\n' + clobber : 'await read(' + viaA + ')\nreturn "r1 read"';
   const steps = otherState === 'open'
     ? [{ script: r1, keepTurn: true }, { untilFile: r1Read }, { script: change + 'await sh("touch ' + go + '")\nreturn "r2 patched"', keepTurn: true }, { untilRunsDone: true }, { collect: true }]
-    : [{ script: r1, keepTurn: true }, { untilRunDone: 'r1' }, { script: change + 'return "r2 patched"', keepTurn: true }, { untilRunDone: 'r2' }, { collect: true }, { script: clobber }];
+    : [{ script: 'await waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\n' + change + 'return "r1 patched"', keepTurn: true }, { script: r1, keepTurn: true }, { untilRunDone: 'r2' }, { touch: go }, { untilRunDone: 'r1' }, { collect: true }, { script: clobber }];
   const out = run({ tools: NO_BASH, steps: [{ link: { from: join(dir, 'A'), to: join(dir, 'B') } }, ...steps] });
   expect(out.results.map((r) => r.text).join('\n')).toContain('refused: ');
   expect(readFileSync(file, 'utf8')).toBe('pppp\n');
@@ -3513,4 +3513,31 @@ test('A read through a re-pointed symlink whose reply fails lends no read to the
   expect(out.results[0]!.text).toMatch(/ \| edited$/);
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
   expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('zzzz\n');
+});
+
+test('A patch of a changed file stops a finished but not yet handed back run read of it through a since re-pointed symlink', () => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt', 'ref']);
+  const link = join(dir, 'L');
+  const target = join(dir, 'X', 'f.txt');
+  const y = 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nawait sh("printf wwww\\\\\\\\n > ' + target + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + JSON.stringify(target) + ', old_text: "wwww", new_text: "pppp" })\nawait sh("touch -r ' + join(dir, 'ref') + ' ' + target + '")\nreturn "Y patched"';
+  const last = 'try { await write(' + JSON.stringify(target) + ', "new\\n"); return "wrote" } catch (e) { return "refused: " + String(e.message) }';
+  const go = join(dir, 'go');
+  const out = run({ tools: NO_BASH, steps: [{ link: { from: link, to: join(dir, 'X') } }, { script: 'await waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\n' + y, keepTurn: true }, { script: 'await read(' + JSON.stringify(join(link, 'f.txt')) + ')\nreturn "Z done"', keepTurn: true }, { untilRunDone: 'r2' }, { touch: go }, { untilRunDone: 'r1' }, { collect: true }, { script: last }] });
+  expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
+  expect(readFileSync(target, 'utf8')).toBe('pppp\n');
+});
+
+test('A read in pages whose symlink is re-pointed between pages counts for neither file', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'xxxx\nXXXX\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'yyyy\nYYYY\n');
+  for (const f of ['X', 'Y']) utimesSync(join(dir, f, 'f.txt'), 1_700_000_000, 1_700_000_000);
+  const viaL = JSON.stringify(join(dir, 'L', 'f.txt'));
+  const script = 'await call("Read", { file_path: ' + viaL + ', limit: 1 })\nawait call("Bash", { command: "ln -sfn ' + join(dir, 'Y') + ' ' + join(dir, 'L') + '" })\nawait call("Read", { file_path: ' + viaL + ', offset: 2 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ', content: "CLOBBER\\n" })\nreturn r.ok ? "wrote" : r.error';
+  const out = run({ steps: [{ link: { from: join(dir, 'L'), to: join(dir, 'X') } }, { script }] });
+  expect(out.results[0]!.text).toContain('has not been read yet');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('yyyy\nYYYY\n');
 });

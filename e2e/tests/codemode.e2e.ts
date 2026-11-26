@@ -4232,6 +4232,39 @@ const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {
 test('A stale patch while a one-page tools.Read is in flight leaves the file unread', () => stalePatchDuringOnePageRead('tools.Read'));
 test('A stale patch while a one-page read() is in flight leaves the file unread', () => stalePatchDuringOnePageRead('read'));
 
+const readBeforeAnotherRunsPatch = (writer: 'same run' | 'later run') => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const ref = join(dir, 'ref');
+  const [readDone, gate] = ['read-done', 'gate'].map((n) => join(dir, n));
+  writeFileSync(f, Array.from({ length: 50 }, (_, i) => 'A ' + String(i).padStart(4, '0')).join('\n') + '\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const clobber = 'try { await write(' + q + ', "CLOBBERED\\n"); return "wrote" } catch (e) { return "refused: " + e.message }';
+  const reader = 'await read(' + q + ')\nawait sh("touch ' + readDone + '")' + (writer === 'same run' ? '\nawait waitFor(async () => (await sh("test -f ' + gate + '")).ok, { every: 100, timeout: 30000 })\n' + clobber : '\nreturn "read"');
+  const patcher = 'await tools.Read({ file_path: ' + q + ' })\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "A 0000", new_text: "C 0000" })\nawait sh("touch -r ' + ref + ' ' + f + '")\nreturn r.ok ? "patched" : r.error';
+  const out = run({ tools: NO_BASH, steps: [
+    { script: reader, keepTurn: true },
+    { untilFile: readDone },
+    { script: patcher, keepTurn: true },
+    { untilRunDone: 'r2' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    ...(writer === 'later run' ? [{ script: clobber }] : []),
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('patched');
+  expect(said).toContain('refused: ');
+  expect(said).not.toContain('wrote');
+  expect(readFileSync(f, 'utf8').startsWith('C 0000')).toBe(true);
+};
+
+test('A run that read a file before another run patched it cannot write over the patch', () => readBeforeAnotherRunsPatch('same run'));
+test('A read finished before another run patched the file never lets a later run write over the patch', () => readBeforeAnotherRunsPatch('later run'));
+
 test('A symlink whose target climbs out of forty missing folders never overwrites the unread file it lands on', () => {
   const dir = scratch();
   writeFileSync(join(dir, 'secret.txt'), 'PRECIOUS\n');

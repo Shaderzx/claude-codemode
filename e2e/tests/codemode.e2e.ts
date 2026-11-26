@@ -4167,6 +4167,7 @@ const stalePatchDuringRead = (reader: 'tools.Read' | 'read') => {
     { script: 'try { await write(' + b + ', "CLOBBERED\\n"); return "wrote" } catch (e) { return String(e.message) }' },
   ] });
   const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('changed while it was read in pages');
   expect(said).not.toContain('read AB');
   expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
   expect(readFileSync(big, 'utf8').startsWith('C 00000')).toBe(true);
@@ -4174,6 +4175,62 @@ const stalePatchDuringRead = (reader: 'tools.Read' | 'read') => {
 
 test('A stale patch while the mod pages a big tools.Read fails that read and leaves the file unread', () => stalePatchDuringRead('tools.Read'));
 test('A stale patch while the first page of a read() is in flight fails that read and leaves the file unread', () => stalePatchDuringRead('read'));
+
+test('A patch from a run that read the file fails another run\'s open read() so its write never undoes the patch', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(big, Array.from({ length: 2400 }, (_, i) => 'A ' + String(i).padStart(4, '0')).join('\n') + '\n');
+  writeFileSync(ref, '');
+  utimesSync(big, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const b = JSON.stringify(big);
+  const reader = 'try { const t = await read(' + b + '); await write(' + b + ', t.replace("A 2399", "Z 2399")); return "reader wrote" } catch (e) { return "reader: " + e.message }';
+  const patcher = 'await tools.Read({ file_path: ' + b + ' })\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + b + ', old_text: "A 0001", new_text: "C 0001" })\nawait sh("touch -r ' + ref + ' ' + big + '")\nreturn r.ok ? "patched" : r.error';
+  const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, holdLaterPages: { asked, gate }, steps: [
+    { script: reader, keepTurn: true },
+    { untilFile: asked },
+    { script: patcher, keepTurn: true },
+    { untilRunDone: 'r2' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('patched');
+  expect(said).toContain('changed while it was read in pages');
+  expect(said).not.toContain('reader wrote');
+  expect(readFileSync(big, 'utf8')).toContain('C 0001');
+});
+
+const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const ref = join(dir, 'ref');
+  const lines = (tag: string) => Array.from({ length: 50 }, (_, i) => tag + ' ' + String(i).padStart(4, '0')).join('\n') + '\n';
+  writeFileSync(f, lines('A'));
+  writeFileSync(join(dir, 'b.txt'), lines('B'));
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const readerScript = reader === 'tools.Read' ? 'await tools.Read({ file_path: ' + q + ' })\nreturn "read"' : 'await read(' + q + ')\nreturn "read"';
+  const patcher = 'await sh("cp ' + join(dir, 'b.txt') + ' ' + f + '")\nawait call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "B 0000", new_text: "C 0000" })\nawait sh("touch -r ' + ref + ' ' + f + '")\nreturn "patched"';
+  const out = run({ tools: NO_BASH, readLagMs: 1500, steps: [
+    { script: readerScript, keepTurn: true },
+    { untilCalls: { tool: 'Read', count: 1 } },
+    { script: patcher, keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
+  expect(readFileSync(f, 'utf8').startsWith('C 0000')).toBe(true);
+};
+
+test('A stale patch while a one-page tools.Read is in flight leaves the file unread', () => stalePatchDuringOnePageRead('tools.Read'));
+test('A stale patch while a one-page read() is in flight leaves the file unread', () => stalePatchDuringOnePageRead('read'));
 
 test('A symlink whose target climbs out of forty missing folders never overwrites the unread file it lands on', () => {
   const dir = scratch();

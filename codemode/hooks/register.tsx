@@ -2159,6 +2159,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))
       : []
     const patchFresh = new Map<string, boolean>()
+    const sentVersions = new Map<string, string | undefined>()
     const patchKeys = new Map<string, string>()
     for (const o of patchOps) if (!patchKeys.has(o.path)) patchKeys.set(o.path, await realOf(o.path))
     for (const [given, real] of patchKeys)
@@ -2172,8 +2173,68 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (o.op !== 'create' && !patchFresh.has(patchKeys.get(o.path) as string)) {
         const key = patchKeys.get(o.path) as string
         const was = job.reads.has(key) ? job.reads.get(key) : readPaths.has(key) ? readVersions.get(key) : undefined
-        patchFresh.set(key, was !== undefined && was === (await versionOf(key)))
+        const now = await versionOf(key)
+        sentVersions.set(key, now)
+        patchFresh.set(key, was !== undefined && was === now)
       }
+    const sentAt = readClock
+    const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) => at === undefined || at <= sentAt || version === undefined || version === sentVersions.get(k)
+    const forgetEverywhere = (k: string) => {
+      const forgetIn = (j: Job) => {
+        if (j === job || sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) {
+          j.reads.delete(k)
+          j.readAt.delete(k)
+          j.progress.delete(k)
+          j.progressAt.delete(k)
+        }
+        for (const [id, started] of j.pages) if (started.real === k) j.pages.set(id, {})
+      }
+      forgetIn(job)
+      for (const j of jobsById.values()) if (j.gen === sessionGen) forgetIn(j)
+      if (sawBeforeSent(k, readVersions.get(k), versionAt.get(k))) {
+        readPaths.delete(k)
+        readVersions.delete(k)
+        readProgress.delete(k)
+      }
+      versionAt.delete(k)
+      versionAt.set(k, ++readClock)
+      progressAt.delete(k)
+      progressAt.set(k, readClock)
+      forgottenAt.delete(k)
+      forgottenAt.set(k, readClock)
+      dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
+    }
+    const outdateEverywhere = (k: string) => {
+      const outdateIn = (j: Job) => {
+        if (j !== job && j.reads.has(k) && sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) {
+          j.reads.set(k, undefined)
+          j.progress.delete(k)
+          j.progressAt.delete(k)
+        }
+        for (const [id, started] of j.pages) if (started.real === k) j.pages.set(id, {})
+      }
+      outdateIn(job)
+      for (const j of jobsById.values()) if (j.gen === sessionGen) outdateIn(j)
+      if (sawBeforeSent(k, readVersions.get(k), versionAt.get(k))) {
+        readVersions.delete(k)
+        readProgress.delete(k)
+      }
+      forgottenAt.delete(k)
+      forgottenAt.set(k, ++readClock)
+      dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
+    }
+    const patchUnsure = (appliedBefore = Infinity) => {
+      const opPaths = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).slice(0, appliedBefore).map((o) => patchPath(o?.path ?? args.path)) : appliedBefore > 0 ? [patchPath(args.path)] : []
+      const changed = new Set(opPaths.map((v) => patchKeys.get(v ?? '') ?? (v ? [...patchKeys.values()].find((k) => k === v) : undefined)).filter((k): k is string => !!k))
+      for (const key of changed) {
+        if (patchFresh.get(key) !== true) {
+          forgetEverywhere(key)
+          continue
+        }
+        outdateEverywhere(key)
+        if (job.reads.has(key)) job.reads.set(key, undefined)
+      }
+    }
     if (late()) {
       release?.()
       return refusal('call')
@@ -2188,6 +2249,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       tally.failed++
       tally.arg ??= firstArg(args)
       release?.()
+      if (isPatch) patchUnsure()
       const msg = (err as Error)?.message ?? String(err)
       // A tool a setting or another mod removed: name what may replace it.
       const near = msg.includes('no tool named') ? similar(tool, all.map((x) => x.name)) : []
@@ -2195,6 +2257,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     })
     const body = release ? skillTexts.get(key) : undefined
     release?.()
+    if (isPatch && r.isError) {
+      const said = String(r.text ?? show(r.result))
+      const failedAt = /^ops\[(\d+)\]/.exec(said)
+      if (failedAt && /Earlier ops in this batch were already applied/.test(said)) patchUnsure(Number(failedAt[1]))
+    }
     const capped =
       tool === 'Read' &&
       !r.isError &&
@@ -2273,6 +2340,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const exit = shell ? { ...(shell.code === undefined ? {} : { exitCode: shell.code }), shellText: shell.out } : {}
     if (!r.isError) {
       if (text.length > MAX_REPLY) {
+        if (isPatch) patchUnsure()
         tally.ok--
         tally.failed++
         tally.arg ??= firstArg(args)
@@ -2289,46 +2357,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       const readNow: string[] = []
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
-      const forgetEverywhere = (k: string) => {
-        const forgetIn = (j: Job) => {
-          j.reads.delete(k)
-          j.readAt.delete(k)
-          j.progress.delete(k)
-          j.progressAt.delete(k)
-          for (const [id, started] of j.pages) if (started.real === k) j.pages.set(id, {})
-        }
-        forgetIn(job)
-        if (job.gen !== sessionGen) return
-        for (const j of jobsById.values()) if (j.gen === sessionGen) forgetIn(j)
-        readPaths.delete(k)
-        readVersions.delete(k)
-        readProgress.delete(k)
-        versionAt.delete(k)
-        versionAt.set(k, ++readClock)
-        progressAt.delete(k)
-        progressAt.set(k, readClock)
-        forgottenAt.delete(k)
-        forgottenAt.set(k, readClock)
-        dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
-      }
-      const outdateEverywhere = (k: string) => {
-        const outdateIn = (j: Job) => {
-          if (j !== job && j.reads.has(k)) j.reads.set(k, undefined)
-          if (j !== job) {
-            j.progress.delete(k)
-            j.progressAt.delete(k)
-          }
-          for (const [id, started] of j.pages) if (started.real === k) j.pages.set(id, {})
-        }
-        outdateIn(job)
-        if (job.gen !== sessionGen) return
-        for (const j of jobsById.values()) if (j.gen === sessionGen) outdateIn(j)
-        readVersions.delete(k)
-        readProgress.delete(k)
-        forgottenAt.delete(k)
-        forgottenAt.set(k, ++readClock)
-        dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
-      }
       for (const o of patchOps) {
         const key = patchKeys.get(o.path) as string
         if (created.has(key) || patchFresh.get(key) === true) {

@@ -333,10 +333,11 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       if (c.patchDelayMs) await new Promise((r) => setTimeout(r, c.patchDelayMs))
       if (Array.isArray(a.ops)) {
         const said: string[] = []
-        for (const o of a.ops as Record<string, unknown>[]) {
+        for (const [i, o] of (a.ops as Record<string, unknown>[]).entries()) {
           const r = await fake('mcp__lean-ctx__ctx_patch', { ...(a.path === undefined ? {} : { path: a.path }), ...o })
-          if ((r as { isError?: boolean }).isError) return r
-          said.push(String((r as { text?: string }).text))
+          const text = String((r as { text?: string }).text)
+          if ((r as { isError?: boolean }).isError) return i === 0 ? r : err('ops[' + i + '] (' + String(o.op) + '): ' + text + '\nEarlier ops in this batch were already applied:\n' + said.join('\n\n'))
+          said.push(text)
         }
         return ok(said.join('\n'))
       }

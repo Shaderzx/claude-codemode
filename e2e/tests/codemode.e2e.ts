@@ -3193,3 +3193,40 @@ const shortRace = (tools: readonly string[] | undefined, readFirst: boolean, op:
 test('Two forced patch writes in two-second runs that read the file first both land', () => shortRace(NO_BASH, true, 'write'));
 test('Two unread forced edits through Edit in two-second runs both land', () => shortRace(undefined, false, 'edit'));
 test('Two unread forced patch edits in two-second runs both land', () => shortRace(NO_BASH, false, 'edit'));
+
+const crossSpellingRace = (tools: readonly string[] | undefined) => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'B'));
+  writeFileSync(join(dir, 'B', 'f.txt'), 'orig\n');
+  const viaA = JSON.stringify(join(dir, 'A', 'f.txt'));
+  const viaB = JSON.stringify(join(dir, 'B', 'f.txt'));
+  const ready = join(dir, 'y-read');
+  const go = join(dir, 'go');
+  const late = 'await read(' + viaA + ')\nawait sh("touch ' + ready + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 20000 })\ntry { await write(' + viaA + ', "Y\\n"); return "Y wrote" } catch (e) { return "Y refused: " + String(e.message) }';
+  const first = 'await read(' + viaB + ')\nawait write(' + viaB + ', "X\\n")\nreturn "X wrote"';
+  const out = run({ ...(tools ? { tools: [...tools] } : {}), engineForgets: true, steps: [{ link: { from: join(dir, 'A'), to: join(dir, 'B') } }, { script: late, keepTurn: true }, { untilFile: ready }, { script: first, keepTurn: true }, { untilRunDone: 'r2' }, { collect: true }, { touch: go }, { untilRunsDone: true }, { collect: true }] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('X wrote');
+  expect(said).toContain('Y refused: ');
+  expect(said).toContain('changed since this session read it');
+  expect(readFileSync(join(dir, 'B', 'f.txt'), 'utf8')).toBe('X\n');
+};
+
+test('A run that read a file under one spelling cannot overwrite what another run wrote under another spelling', () => crossSpellingRace(undefined));
+test('A run that read a file under one spelling cannot patch over what another run wrote under another spelling', () => crossSpellingRace(NO_BASH));
+
+test('An edit of a file read through a symlink that was then pointed elsewhere compares the file it names', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'xxxx\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'yyyyyy\n');
+  const link = join(dir, 'L');
+  const out = run({ tools: NO_BASH, steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script: 'await read(' + JSON.stringify(join(link, 'f.txt')) + ')\nawait sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\ntry { await edit(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', "xxxx", "zzzz"); return "edited" } catch (e) { return String(e.message) }' },
+  ] });
+  expect(out.results[0]!.text).toBe('edited');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('zzzz\n');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('yyyyyy\n');
+});

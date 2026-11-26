@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { changeEveryRead?: boolean; readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { changeEveryRead?: boolean; readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; patchDelayMs?: number; statDelayMs?: number; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; clockMarks?: number[]; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
@@ -3715,4 +3715,84 @@ test('A direct patch through a symlink that moves while it is checked lands on t
   expect(out.results.map((r) => r.text).join('\n')).toContain('moved');
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
   expect(['xxxx\n', 'BBBB\n']).toContain(readFileSync(join(dir, 'X', 'f.txt'), 'utf8'));
+});
+
+const patchWhileLinkMovesForLock = (what: 'create' | 'replace') => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt']);
+  const link = join(dir, 'L');
+  const name = what === 'create' ? 'new.txt' : 'f.txt';
+  const [aReady, bReady, bAsked, go, goB] = ['a-ready', 'b-ready', 'b-asked', 'go', 'go-b'].map((n) => join(dir, n));
+  const gate = (ready: string, start: string) => 'await sh("touch ' + ready + '")\nawait waitFor(() => sh("test -f ' + start + '"), { every: 20, timeout: 20000 })\n';
+  const a = 'await read(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ')\n' + gate(aReady, go) + 'await edit(' + JSON.stringify(join(dir, 'X', 'f.txt')) + ', "xxxx", "AAAA")\nreturn "A edited"';
+  const bCall = what === 'create' ? 'await write(' + JSON.stringify(join(link, name)) + ', "B\\n").then(() => "B wrote", (e) => "B refused: " + e.message)' : 'await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + JSON.stringify(join(link, name)) + ', old_text: "xxxx", new_text: "BBBB" }).then((r) => (r.ok ? "B patched" : "B refused: " + r.error))';
+  const b = (what === 'create' ? '' : 'await read(' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ')\n') + gate(bReady, goB) + 'await sh("touch ' + bAsked + '")\nreturn ' + bCall;
+  const out = run({ tools: NO_BASH, patchDelayMs: 1500, steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script: a, keepTurn: true },
+    { script: b, keepTurn: true },
+    { untilFile: aReady },
+    { untilFile: bReady },
+    { touch: go },
+    { untilTool: 'mcp__lean-ctx__ctx_patch' },
+    { touch: goB },
+    { untilFile: bAsked },
+    { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nreturn "moved"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('A edited');
+  expect(said).toContain('B refused: ');
+  expect(existsSync(join(dir, 'Y', name)) ? readFileSync(join(dir, 'Y', name), 'utf8') : 'absent').toBe(what === 'create' ? 'absent' : 'xxxx\n');
+};
+
+test('A patch write creating a file through a symlink that moves while it waits for another write lock is refused and creates nothing', () => patchWhileLinkMovesForLock('create'));
+test('A direct patch through a symlink that moves while it waits for another write lock is refused and leaves the new target alone', () => patchWhileLinkMovesForLock('replace'));
+
+const linkMovesInsideTheCall = (tool: 'Write' | 'patch') => {
+  const dir = scratch();
+  twinFiles(dir, ['X/f.txt', 'Y/f.txt']);
+  const link = join(dir, 'L');
+  const viaL = JSON.stringify(join(link, 'f.txt'));
+  const act = tool === 'Write' ? 'const r = await call("Write", { file_path: ' + viaL + ', content: "MINE\\n" })' : 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + viaL + ', old_text: "xxxx", new_text: "MINE" })';
+  const out = run({ ...(tool === 'Write' ? { writeDelayMs: 1500 } : { tools: [...NO_BASH], patchDelayMs: 1500 }), steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script: 'await read(' + viaL + ')\n' + act + '\nreturn r.ok ? "landed" : r.error', keepTurn: true },
+    { untilTool: tool === 'Write' ? 'Write' : 'mcp__lean-ctx__ctx_patch' },
+    { script: 'await sh("ln -sfn ' + join(dir, 'Y') + ' ' + link + '")\nreturn "moved"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  expect(out.results.map((r) => r.text).join('\n')).toContain('landed');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('MINE\n');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
+};
+
+test('A Write through a symlink that moves once the Write has started lands on the file it checked', () => linkMovesInsideTheCall('Write'));
+test('A patch through a symlink that moves once the patch has started lands on the file it checked', () => linkMovesInsideTheCall('patch'));
+
+test('A page chain kept fresh outlives two thousand other chains and an older run handing back a shorter one', () => {
+  const dir = scratch();
+  const p = join(dir, 'p.txt');
+  writeFileSync(p, 'a\nb\nc\nd\n');
+  const gateFile = join(dir, 'gate');
+  const page = (f: string, offset: number, limit: number) => 'await call("Read", { file_path: ' + JSON.stringify(f) + ', offset: ' + offset + ', limit: ' + limit + ' })\n';
+  const others = Array.from({ length: 2010 }, (_, i) => join(dir, 'q' + i + '.txt'));
+  for (const f of others) writeFileSync(f, 'one\ntwo\n');
+  const out = run({ steps: [
+    { script: page(p, 1, 1) + 'await waitFor(() => sh("test -f ' + gateFile + '"), { every: 200, timeout: 240000 })\nreturn "old"', keepTurn: true },
+    { script: page(p, 1, 2) + 'return "fresh"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { script: '// @options: {"timeout_ms": 120000}\nfor (const f of ' + JSON.stringify(others) + ') await call("Read", { file_path: f, limit: 1 })\n' + page(p, 1, 2) + 'return "others"', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { collect: true },
+    { touch: gateFile },
+    { untilRunDone: 'r1' },
+    { collect: true },
+    { script: 'await call("Read", { file_path: ' + JSON.stringify(p) + ', offset: 3 })\nconst r = await call("Write", { file_path: ' + JSON.stringify(p) + ', content: "mine\\n" })\nreturn r.ok ? "wrote" : r.error' },
+  ] });
+  expect(out.results[out.results.length - 1]!.text).toBe('wrote');
+  expect(readFileSync(p, 'utf8')).toBe('mine\n');
 });

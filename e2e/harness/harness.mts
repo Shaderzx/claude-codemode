@@ -8,6 +8,7 @@ type Case = {
   clockFrozen?: boolean
   killDelayMs?: number
   writeDelayMs?: number
+  patchDelayMs?: number
   statDelayMs?: number
   hangListMs?: number
   hangListCount?: number
@@ -318,6 +319,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       return leanReply(tool, r)
     }
     case 'mcp__lean-ctx__ctx_patch': {
+      if (c.patchDelayMs) await new Promise((r) => setTimeout(r, c.patchDelayMs))
       if (Array.isArray(a.ops)) {
         const said: string[] = []
         for (const o of a.ops as Record<string, unknown>[]) {

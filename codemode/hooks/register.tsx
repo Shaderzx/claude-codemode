@@ -1810,9 +1810,11 @@ const promoteReads = (j: Job) => {
     readVersions.delete(k)
   })
   dropOldest(readVersions.keys(), 2000, readStamp, (k) => readVersions.delete(k), readVersions.size)
-  dropOldest(versionAt.keys(), 2000, readStamp, (k) => versionAt.delete(k), versionAt.size)
+  const forgottenReads = [...versionAt.keys()].filter((k) => !readPaths.has(k) && !readVersions.has(k))
+  dropOldest(forgottenReads, 2000, readStamp, (k) => versionAt.delete(k), forgottenReads.length)
   dropOldest(readProgress.keys(), 200, pageStamp, (k) => readProgress.delete(k), readProgress.size)
-  dropOldest(progressAt.keys(), 2000, pageStamp, (k) => progressAt.delete(k), progressAt.size)
+  const forgottenPages = [...progressAt.keys()].filter((k) => !readProgress.has(k))
+  dropOldest(forgottenPages, 2000, pageStamp, (k) => progressAt.delete(k), forgottenPages.length)
 }
 const dropOldest = (keys: Iterable<string>, cap: number, stampOf: (k: string) => number, drop: (k: string) => void, size = (keys as Set<string>).size) => {
   if (size <= cap) return
@@ -1960,7 +1962,7 @@ const withHeld = (r: unknown, held: string) => {
   return { ...base, block: typeof base.block === 'string' && base.block ? `${base.block}\n\n${held}` : held }
 }
 const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: Record<string, string>, timeout: number, maxChars: number): Promise<{ result: RunResult }> => {
-  const pagesStarted = new Map<string, { version?: string; real?: string }>()
+  const pagesStarted = new Map<string, { version?: string; real?: string; next?: number }>()
   const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
   const all = listing.map((t) => ({ name: t.name, description: t.description }))
   const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
@@ -2323,13 +2325,16 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
         }
       }
+      const ownPages = tool === 'Read' && p.handled === true && typeof p.readId === 'number' ? pagesStarted.get(`#${p.readId}`) : undefined
+      const ownChain = ownPages?.next !== undefined ? { next: ownPages.next, version: ownPages.version } : undefined
       const receipt =
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter ? readBefore : undefined, [job.progress.get(realAfter ?? args.file_path), readProgress.get(realAfter ?? args.file_path)])
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter ? readBefore : undefined, [ownChain, job.progress.get(realAfter ?? args.file_path), readProgress.get(realAfter ?? args.file_path)])
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
             : undefined
       if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
+      if (ownPages && receipt && !receipt.whole && receipt.next !== undefined) ownPages.next = receipt.next
       if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : await realOf(receipt.file)
       if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
       else if (isStub(text, tool) && p.handled !== true) {

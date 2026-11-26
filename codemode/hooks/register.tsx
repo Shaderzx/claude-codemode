@@ -1,5 +1,8 @@
 import type { Hook, Register } from 'claude-code'
 
+const patchToolName = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/
+const isPatchTool = (name: string) => patchToolName.test(name)
+
 // The one tool the model calls. Every other tool is deferred and refused when
 // the model calls it directly; scripts reach them through `tools.<name>()`.
 // ToolSearch stays callable only to load schemas, which a mod cannot read.
@@ -407,11 +410,12 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const usable = (n) => names.has(n) && !denied.has(n)
   const named = (re) => all.map((t) => t.name).filter((n) => re.test(n) && !denied.has(n))
   const LEAN_SHELL = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/
+  const LEAN_PATCH = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/
   const shells = () => {
     const order = [...new Set([...(shellPref && usable(shellPref) ? [shellPref] : []), ...(usable('Bash') ? ['Bash'] : []), ...named(LEAN_SHELL)])]
     return order.length || !names.has('Bash') ? order : ['Bash']
   }
-  const patcher = () => named(/^mcp__lean[-_]ctx__(?:ctx_)?patch$/)[0]
+  const patcher = () => named(LEAN_PATCH)[0]
   const shResult = (text, code, tool) => Object.assign(new String(text), { exitCode: code, ok: code === 0, tool }, text && text.withheld === true ? { withheld: true, truncated: true } : {})
   const withheldOutput = (t) => Object.assign(new String(t), { withheld: true })
   const LIMIT = 7000
@@ -1714,6 +1718,7 @@ const handedSpills = new Map<string, number>()
 const ownSpills = new Set<string>()
 const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
+const forgottenAt = new Map<string, number>()
 let readClock = 0
 let jobSeq = 0
 let mainTurn = false
@@ -1744,7 +1749,7 @@ const writeTargets = (m: Request, cwd: string | undefined, home: string, default
     ? [args.file_path]
     : tool === 'NotebookEdit'
       ? [args.notebook_path]
-      : /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+      : isPatchTool(tool)
         ? [args.path, ...ops.map((o) => o?.path ?? args.path)]
         : []
   const paths = raws.filter((r): r is string => typeof r === 'string' && !!r.trim()).map((r) => normal(absolute(r.trim(), cwd, home)))
@@ -2017,7 +2022,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (late()) return refusal('request')
     if (m.kind === 'store') {
       const key = `script:${String(p.key)}`
-      const loadReply = p.value === undefined ? 0 : Buffer.byteLength(JSON.stringify({ ok: true, value: p.value }) ?? '')
+      const loadReply = p.value === undefined ? 0 : utf8(JSON.stringify({ ok: true, value: p.value }) ?? '')
       if (loadReply > 4 * 1024 * 1024) return { ok: false, error: `the value is ${loadReply} bytes as JSON, too large to load back (the most is 4 MiB); store it in a file instead` }
       if (p.value === undefined) await $.store.delete(key)
       else await $.store.set(key, p.value as never)
@@ -2117,7 +2122,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         args.file_path = key
       }
     }
-    if (typeof p.expectedVersion === 'string' && /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool) && typeof args.path === 'string') {
+    if (typeof p.expectedVersion === 'string' && isPatchTool(tool) && typeof args.path === 'string') {
       const path = normal(absolute(args.path.trim(), cwd, home))
       const real = typeof p.expectedReal === 'string' ? p.expectedReal : await realOf(path)
       if (!job.reads.has(real) && !readPaths.has(real)) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
@@ -2139,10 +2144,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (tool === 'Skill' && !release)
       return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
     const since = skillSeq
+    const askedAt = readClock
+    const forgottenSinceAsked = (real?: string) => real !== undefined && (forgottenAt.get(real) ?? 0) > askedAt
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
     const patchPath = (v: unknown) => (typeof v === 'string' && !!v.trim() && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
-    const isPatch = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+    const isPatch = isPatchTool(tool)
     const patchPaths = isPatch ? [args.path, ...(Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).map((o) => o?.path) : [])] : []
     if (patchPaths.some((v) => typeof v === 'string' && v.trim().startsWith('~')))
       return { ok: false, error: 'The patch tool reads a path starting with ~ as a folder named ~ inside its working folder, not as your home folder; give the full path' }
@@ -2221,7 +2228,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const plain = said.replace(/^\s*<tool_use_error>/, '').replace(/<\/tool_use_error>\s*$/, '')
       const whole = WHOLE_RE.exec(plain)
       const wants = whole && whole[1] === tool ? all.map((x) => x.name).filter((n) => n !== tool && (n === whole[2] || short(n) === whole[2])) : []
-      const fits = (n: string) => (tool === 'Bash' ? /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(n) : /^(?:Write|Edit)$/.test(tool) && /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(n))
+      const fits = (n: string) => (tool === 'Bash' ? /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(n) : /^(?:Write|Edit)$/.test(tool) && isPatchTool(n))
       const alt = wants.length === 1 && fits(wants[0] as string) ? wants[0] : undefined
       if (!alt) return { ok: false, error: plain, refused: true }
       if (!deniedTools.has(tool) && job.gen === sessionGen) {
@@ -2300,6 +2307,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         versionAt.set(k, ++readClock)
         progressAt.delete(k)
         progressAt.set(k, readClock)
+        forgottenAt.delete(k)
+        forgottenAt.set(k, readClock)
+        dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
       }
       for (const o of patchOps) {
         const key = patchKeys.get(o.path) as string
@@ -2320,7 +2330,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const from = typeof args.offset === 'number' ? args.offset : 1
         const pages = typeof p.readId === 'number' ? `#${p.readId}` : args.file_path
         const first = job.pages.get(pages)
-        const heldStill = readBefore !== undefined && readBefore === readAfter && realBefore === realAfter
+        const heldStill = readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter)
         if (from === 1) job.pages.set(pages, heldStill ? { version: readBefore, real: realBefore } : {})
         else if (first !== undefined && (!heldStill || readBefore !== first.version || realBefore !== first.real)) {
           tally.ok--
@@ -2332,7 +2342,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const ownChain = ownPages?.next !== undefined ? { next: ownPages.next, version: ownPages.version } : undefined
       const receipt =
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter ? readBefore : undefined, [ownChain, job.progress.get(realAfter ?? args.file_path), readProgress.get(realAfter ?? args.file_path)])
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter) ? readBefore : undefined, [ownChain, job.progress.get(realAfter ?? args.file_path), readProgress.get(realAfter ?? args.file_path)])
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
             : undefined
@@ -2408,7 +2418,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const file = String(args.file_path)
     const version = await versionOf(file)
     const real = await realOf(file)
-    const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real
+    const pagingFrom = readClock
+    const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real || (forgottenAt.get(real) ?? 0) > pagingFrom
     for (let guard = 0; guard < 10_000; guard++) {
       if (over) return undefined
       const r = late() ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
@@ -2477,14 +2488,15 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const readlink = (p: string) => $.process.run(['readlink', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : undefined), () => undefined)
   const realOf = async (p: string) => {
     let path = p
-    for (let hops = 0; hops < 40; hops++) {
+    for (let links = 0, steps = 0; links < 40 && steps < 2048; steps++) {
       const next = await resolveOnce(path)
       if (next.done) return next.path
+      if (next.link) links++
       path = next.path
     }
     return path
   }
-  const resolveOnce = async (p: string): Promise<{ done: boolean; path: string }> => {
+  const resolveOnce = async (p: string): Promise<{ done: boolean; path: string; link?: boolean }> => {
     let missing = ''
     for (let head = p; ; ) {
       const found = await realpath(head)
@@ -2498,7 +2510,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (target) {
         const parent = head.slice(0, head.lastIndexOf('/')) || '/'
         const base = target.startsWith('/') ? '' : ((await realpath(parent)) ?? parent).replace(/\/$/, '') + '/'
-        return { done: false, path: (base + target + missing).replace(/\/(?:\.?\/)+/g, '/') }
+        return { done: false, link: true, path: (base + target + missing).replace(/\/(?:\.?\/)+/g, '/') }
       }
       const slash = head.lastIndexOf('/')
       if (slash < 0 || head === '/') return { done: true, path: p }
@@ -2545,7 +2557,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const tool = String(m.payload.tool)
     const lean = /^mcp__lean[-_]ctx__/.test(tool)
     if (!lean && !/^(?:Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead|Grep|Glob|LS)$/.test(tool)) return undefined
-    const relative = /^(?:Read|NotebookRead|Grep|Glob|LS)$/.test(tool) || /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
+    const relative = /^(?:Read|NotebookRead|Grep|Glob|LS)$/.test(tool) || isPatchTool(tool)
     const given = (m.payload.args && typeof m.payload.args === 'object' ? m.payload.args : {}) as Record<string, unknown>
     const preset = defaults[tool] ?? {}
     const args = { ...given }
@@ -2636,7 +2648,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (!sameText && (await $.fs.write(file, JSON.stringify({ ...base, droppedResult: true })).then(() => true, () => false))) return true
       }
       const failed = m.kind !== 'call' ? { ok: false, error: `The answer to ${m.kind} is too large to pass to the script whole.` } : { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
-      const t = calls.get(tool)
+      const t = m.kind === 'call' ? calls.get(tool) : undefined
       if (t && out.ok) {
         t.ok--
         t.failed++
@@ -2911,6 +2923,7 @@ export const register: Register = (on) => {
     jobsById.clear()
     deliveredIds.clear()
     versionAt.clear()
+    forgottenAt.clear()
     for (const j of jobs) j.expiry?.cancel()
     mainTurn = false
     mainTurnId = undefined
@@ -2931,6 +2944,7 @@ export const register: Register = (on) => {
       progressAt.clear()
       readVersions.clear()
       versionAt.clear()
+      forgottenAt.clear()
     }
     return r
   }).catch(($, e, next) => next(e))

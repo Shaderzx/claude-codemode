@@ -3712,9 +3712,11 @@ test('A direct patch through a symlink that moves while it is checked lands on t
     { untilRunsDone: true },
     { collect: true },
   ] });
-  expect(out.results.map((r) => r.text).join('\n')).toContain('moved');
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('moved');
+  expect(said).toContain('patched');
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('xxxx\n');
-  expect(['xxxx\n', 'BBBB\n']).toContain(readFileSync(join(dir, 'X', 'f.txt'), 'utf8'));
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('BBBB\n');
 });
 
 const patchWhileLinkMovesForLock = (what: 'create' | 'replace') => {
@@ -3796,4 +3798,16 @@ test('A page chain kept fresh outlives two thousand other chains and an older ru
   ] });
   expect(out.results[out.results.length - 1]!.text).toBe('wrote');
   expect(readFileSync(p, 'utf8')).toBe('mine\n');
+});
+
+test('A patch path starting with ~ is refused, since the patch tool reads ~ as a folder and not as home', () => {
+  const dir = scratch();
+  const home = scratch();
+  writeFileSync(join(home, 'f.txt'), 'alpha\n');
+  const out = run({ cwd: dir, home, tools: NO_BASH, steps: [{ script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "create", path: "~/f.txt", new_text: "made\\n" })\nconst b = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "create", path: "~/g.txt", new_text: "made\\n" }] })\nreturn (r.ok ? "made" : r.error) + " | " + (b.ok ? "made" : b.error)' }] });
+  const said = out.results[0]!.text;
+  expect(said.split(' | ')).toHaveLength(2);
+  for (const part of said.split(' | ')) expect(part).toContain('full path');
+  expect(existsSync(join(dir, '~'))).toBe(false);
+  expect(readFileSync(join(home, 'f.txt'), 'utf8')).toBe('alpha\n');
 });

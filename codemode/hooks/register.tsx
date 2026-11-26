@@ -1795,7 +1795,6 @@ const promoteReads = (j: Job) => {
     readVersions.delete(p)
     if (v !== undefined) readVersions.set(p, v)
   }
-  while (versionAt.size > 2000) versionAt.delete(versionAt.keys().next().value as string)
   for (const [p, chain] of j.progress) {
     const at = j.progressAt.get(p) ?? 0
     if (at < (progressAt.get(p) ?? 0)) continue
@@ -1804,14 +1803,20 @@ const promoteReads = (j: Job) => {
     readProgress.delete(p)
     readProgress.set(p, chain)
   }
-  while (progressAt.size > 2000) progressAt.delete(progressAt.keys().next().value as string)
-  for (const oldest of readPaths) {
-    if (readPaths.size <= 2000) break
-    readPaths.delete(oldest)
-    readVersions.delete(oldest)
-  }
-  while (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
-  while (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
+  const readStamp = (k: string) => versionAt.get(k) ?? 0
+  const pageStamp = (k: string) => progressAt.get(k) ?? 0
+  dropOldest(readPaths, 2000, readStamp, (k) => {
+    readPaths.delete(k)
+    readVersions.delete(k)
+  })
+  dropOldest(readVersions.keys(), 2000, readStamp, (k) => readVersions.delete(k), readVersions.size)
+  dropOldest(versionAt.keys(), 2000, readStamp, (k) => versionAt.delete(k), versionAt.size)
+  dropOldest(readProgress.keys(), 200, pageStamp, (k) => readProgress.delete(k), readProgress.size)
+  dropOldest(progressAt.keys(), 2000, pageStamp, (k) => progressAt.delete(k), progressAt.size)
+}
+const dropOldest = (keys: Iterable<string>, cap: number, stampOf: (k: string) => number, drop: (k: string) => void, size = (keys as Set<string>).size) => {
+  if (size <= cap) return
+  for (const k of [...keys].sort((a, b) => stampOf(a) - stampOf(b)).slice(0, size - cap)) drop(k)
 }
 const deliver = (agent: string, room: number): { text: string; blocks: { type: string }[] } => {
   const texts: string[] = []
@@ -1988,12 +1993,17 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const dir = `${root}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${++runs}`
 
   const lockedReals = new WeakMap<Request, Set<string>>()
-  const climbedFrom = new WeakMap<Request, Map<string, [string, boolean]>>()
+  const climbedFrom = new WeakMap<Request, Map<string, [string, boolean][]>>()
   const movedSinceLocked = async (m: Request, path: string, real: string) => {
-    const climbed = climbedFrom.get(m)?.get(path)
-    const now = climbed ? await onDisk(climbed[0], climbed[1]) : path
-    return now === undefined || (await realOf(now)) !== real || !(lockedReals.get(m)?.has(real) ?? true)
+    if (!(lockedReals.get(m)?.has(real) ?? true)) return true
+    const spellings = climbedFrom.get(m)?.get(path) ?? []
+    for (const [given, relative] of spellings) {
+      const now = await onDisk(given, relative)
+      if (now === undefined || (await realOf(now)) !== real) return true
+    }
+    return (await realOf(path)) !== real
   }
+
   const versionOf = (path: string): Promise<string | undefined> =>
     $.fs.stat(path, { resolve: true }).then(
       (s) => (typeof s?.mtimeMs === 'number' ? `${s.mtimeMs}:${s.size}` : undefined),
@@ -2303,7 +2313,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
         const from = typeof args.offset === 'number' ? args.offset : 1
-        const pages = typeof p.readId === 'number' ? `${args.file_path}#${p.readId}` : args.file_path
+        const pages = typeof p.readId === 'number' ? `#${p.readId}` : args.file_path
         const first = pagesStarted.get(pages)
         const heldStill = readBefore !== undefined && readBefore === readAfter && realBefore === realAfter
         if (from === 1) pagesStarted.set(pages, heldStill ? { version: readBefore, real: realBefore } : {})
@@ -2527,12 +2537,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const preset = defaults[tool] ?? {}
     const args = { ...given }
     const lost: string[] = []
-    const climbed = new Map<string, [string, boolean]>()
+    const climbed = new Map<string, [string, boolean][]>()
     climbedFrom.set(m, climbed)
     const place = async (v: unknown) => {
       const found = await onDisk(String(v), relative)
       if (found === undefined) lost.push(String(v).trim())
-      else climbed.set(found, [String(v), relative])
+      else climbed.set(found, [...(climbed.get(found) ?? []), [String(v), relative]])
       return found ?? String(v)
     }
     const patchTool = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)

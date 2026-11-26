@@ -2537,7 +2537,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const tool = String(m.payload.tool)
     const lean = /^mcp__lean[-_]ctx__/.test(tool)
     if (!lean && !/^(?:Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead|Grep|Glob|LS)$/.test(tool)) return undefined
-    const relative = lean || /^(?:Read|NotebookRead|Grep|Glob|LS)$/.test(tool)
+    const relative = /^(?:Read|NotebookRead|Grep|Glob|LS)$/.test(tool)
     const given = (m.payload.args && typeof m.payload.args === 'object' ? m.payload.args : {}) as Record<string, unknown>
     const preset = defaults[tool] ?? {}
     const args = { ...given }

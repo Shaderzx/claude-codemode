@@ -647,6 +647,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
           if (limit) continue
           throw toolError('read: ' + file + ' has a line over Read\'s token cap at line ' + offset + ', so it cannot be read in pages; read part of it with sh() and head -c', r)
         }
+        if (/EISDIR/.test(String(r.error))) throw toolError('read: ' + file + ' is a folder, not a file', r)
         throw toolError('read: ' + r.error, r)
       }
       if (r.whole === true) whole = true
@@ -2411,7 +2412,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
   }
   const climbs = (v: unknown) => typeof v === 'string' && /(^|\/)\.\.(\/|$)/.test(v.trim())
-  const climb = async (p: string, hops = 0): Promise<string> => {
+  const climb = async (p: string, hops = 0): Promise<string | undefined> => {
     const segs = p.split('/').filter((seg) => seg !== '' && seg !== '.')
     const kept: string[] = []
     for (let i = 0; i < segs.length; i++) {
@@ -2421,6 +2422,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       const link = kept.length && hops < 40 ? await readlink('/' + kept.join('/')) : undefined
       if (link === undefined) {
+        if (hops && kept.length && !(await $.fs.exists('/' + kept.join('/')).catch(() => false))) return undefined
         kept.pop()
         continue
       }
@@ -2435,18 +2437,25 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (e.startsWith('/')) return climb(e)
     return cwd ? climb(`${cwd.replace(/\/$/, '')}/${e}`) : v
   }
-  const resolveClimbs = async (m: Request) => {
-    if (m.kind === 'fresh' && climbs(m.payload.path)) m.payload.path = await onDisk(String(m.payload.path))
-    if (m.kind !== 'call') return
+  const resolveClimbs = async (m: Request): Promise<string | undefined> => {
+    if (m.kind === 'fresh' && climbs(m.payload.path)) m.payload.path = (await onDisk(String(m.payload.path))) ?? m.payload.path
+    if (m.kind !== 'call') return undefined
     const given = (m.payload.args && typeof m.payload.args === 'object' ? m.payload.args : {}) as Record<string, unknown>
     const preset = defaults[String(m.payload.tool)] ?? {}
     const args = { ...given }
+    const lost: string[] = []
+    const place = async (v: unknown) => {
+      const found = await onDisk(String(v))
+      if (found === undefined) lost.push(String(v).trim())
+      return found ?? String(v)
+    }
     for (const k of ['file_path', 'notebook_path', 'path']) {
       const v = k in given ? given[k] : preset[k]
-      if (climbs(v)) args[k] = await onDisk(String(v))
+      if (climbs(v)) args[k] = await place(v)
     }
-    if (Array.isArray(args.ops)) args.ops = await Promise.all((args.ops as Record<string, unknown>[]).map(async (o) => (o && climbs(o.path) ? { ...o, path: await onDisk(String(o.path)) } : o)))
+    if (Array.isArray(args.ops)) args.ops = await Promise.all((args.ops as Record<string, unknown>[]).map(async (o) => (o && climbs(o.path) ? { ...o, path: await place(o.path) } : o)))
     m.payload.args = args
+    return lost.length ? `${lost[0]} climbs out of a symlinked folder and then through a folder that does not exist there, so it names no file on disk` : undefined
   }
   const sameFileKey = async (path: string, keys: Iterable<string>) => {
     const name = path.slice(path.lastIndexOf('/'))
@@ -2458,13 +2467,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   }
   const readKeyOf = async (path: string) => (job.reads.has(path) || readPaths.has(path) ? path : ((await sameFileKey(path, [...job.reads.keys(), ...readPaths])) ?? path))
   const respond = async (m: Request) => {
-    await resolveClimbs(m)
+    const lost = await resolveClimbs(m)
     let out: Record<string, unknown>
     const unlocks: (() => void)[] = []
     const real = await Promise.all(writeTargets(m, cwd, home, defaults).map(realOf))
     for (const path of [...new Set(real)].sort()) unlocks.push(await lockFile(path))
     try {
-      out = await handle(m)
+      out = lost ? { ok: false, error: lost } : await handle(m)
     } catch (err) {
       out = { ok: false, error: (err as Error)?.message ?? String(err) }
     } finally {

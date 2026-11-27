@@ -3273,6 +3273,7 @@ export const register: Register = (on) => {
     } finally {
       if (agent !== MAIN) {
         forgetSessionReads(agent)
+        sessionReads.delete(agent)
         const jobs = agentJobs(agent)
         await stopJobs($, jobs, 'the end of its agent\'s turn', 'cancelled')
         for (const j of jobs) {

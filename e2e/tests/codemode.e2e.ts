@@ -4657,6 +4657,7 @@ test('A failure note never counts a call alongside it that the run ended before 
 const threeVersions = (dir: string, file: string, count: number, width = 0, newerIsOneLine = false) => {
   const lines = (tag: string) => Array.from({ length: count }, (_, i) => tag + ' ' + String(i).padStart(5, '0') + (width ? ' ' + 'x'.repeat(width) : '')).join('\n') + '\n';
   writeFileSync(file, lines('AAAA'));
+  writeFileSync(join(dir, 'a.txt'), lines('AAAA'));
   writeFileSync(join(dir, 'b.txt'), newerIsOneLine ? 'BBBBBB\n' : lines('BBBBBB'));
   writeFileSync(join(dir, 'c.txt'), lines('CCCC'));
   writeFileSync(join(dir, 'ref'), '');
@@ -5002,6 +5003,36 @@ test('A handed-back page chain never completes after the session forgot its newe
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('r3 refused: ');
   expect(readFileSync(f, 'utf8')).toBe(v.c);
+});
+
+test('Sixteen older versions handed back never push out the newest sighting a paged tools.Read in flight needs', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const v = threeVersions(dir, big, 15000, 60, true);
+  const versions = Array.from({ length: 16 }, (_, i) => join(dir, 'v' + i + '.txt'));
+  versions.forEach((p, i) => writeFileSync(p, 'V'.repeat(i + 7) + '\n'));
+  const marks = versions.map((_, i) => [join(dir, 'read-' + i), join(dir, 'go-' + i)] as const);
+  const [asked, gate, bRead, bGo] = ['later-asked', 'gate', 'b-read', 'b-go'].map((n) => join(dir, n));
+  const holders = versions.map((p, i) => ({ script: 'await sh("cp ' + p + ' ' + big + '")\nawait read(' + v.q + ')\nawait sh("touch ' + marks[i]![0] + '")\nawait waitFor(() => sh("test -f ' + marks[i]![1] + '"), { every: 20, timeout: 120000 })\nreturn "held ' + i + '"', keepTurn: true }));
+  const out = run({ tools: NO_BASH, holdLaterPages: { asked, gate }, steps: [
+    ...holders.flatMap((h, i) => [h, { untilFile: marks[i]![0] }]),
+    { script: 'await sh("cp ' + join(dir, 'a.txt') + ' ' + big + ' && touch -r ' + join(dir, 'ref') + ' ' + big + '")\ntry { String(await tools.Read({ file_path: ' + v.q + ' })); await write(' + v.q + ', "CLOBBERED\\n"); return "paged reader wrote" } catch (e) { return "paged reader: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { script: v.toB + 'await read(' + v.q + ')\nawait sh("touch ' + bRead + '")\nawait waitFor(() => sh("test -f ' + bGo + '"), { every: 20, timeout: 120000 })\nreturn "read B"', keepTurn: true },
+    { untilFile: bRead },
+    { script: v.toC + 'return "changed to C"', keepTurn: true },
+    { untilRunDone: 'r19' },
+    ...marks.flatMap(([, go], i) => [{ touch: go }, { untilRunDone: 'r' + (i + 1) }, { collect: true }]),
+    { touch: gate },
+    { untilRunDone: 'r17' },
+    { touch: bGo },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('changed while it was read in pages');
+  expect(said).not.toContain('paged reader wrote');
+  expect(readFileSync(big, 'utf8')).toBe(v.c);
 });
 
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {

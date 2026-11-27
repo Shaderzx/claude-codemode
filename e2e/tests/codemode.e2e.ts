@@ -4756,20 +4756,20 @@ test('A newer read handed back ends another open run\'s older page chain', () =>
   expect(readFileSync(f, 'utf8')).toBe(v.c);
 });
 
-test('A stale patch already on its way when a read() starts fails that read once it lands', () => {
+test('A stale patch already on its way when a paged tools.Read starts fails that read once it lands', () => {
   const dir = scratch();
   const big = join(dir, 'big.txt');
   const ref = join(dir, 'ref');
-  writeFileSync(big, Array.from({ length: 2400 }, (_, i) => 'A ' + String(i).padStart(4, '0')).join('\n') + '\n');
+  writeFileSync(big, Array.from({ length: 15000 }, (_, i) => 'A ' + String(i).padStart(5, '0') + ' ' + 'x'.repeat(60)).join('\n') + '\n');
   writeFileSync(ref, '');
   utimesSync(big, 1_700_000_000, 1_700_000_000);
   utimesSync(ref, 1_700_000_000, 1_700_000_000);
   const b = JSON.stringify(big);
   const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
   const out = run({ tools: NO_BASH, patchDelayMs: 1500, holdLaterPages: { asked, gate }, steps: [
-    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + b + ', old_text: "A 0000", new_text: "C 0000" })\nawait sh("touch -r ' + ref + ' ' + big + '")\nreturn r.ok ? "patched" : r.error', keepTurn: true },
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + b + ', old_text: "A 00000", new_text: "C 00000" })\nawait sh("touch -r ' + ref + ' ' + big + '")\nreturn r.ok ? "patched" : r.error', keepTurn: true },
     { untilTool: 'mcp__lean-ctx__ctx_patch' },
-    { script: 'try { const t = await read(' + b + '); return "read " + (t.includes("A 0000") ? "A" : "C") } catch (e) { return "reader: " + e.message }', keepTurn: true },
+    { script: 'try { const t = String(await tools.Read({ file_path: ' + b + ' })); return "read " + (t.includes("A 00000") ? "A" : "C") } catch (e) { return "reader: " + e.message }', keepTurn: true },
     { untilFile: asked },
     { untilRunDone: 'r1' },
     { touch: gate },
@@ -4780,7 +4780,7 @@ test('A stale patch already on its way when a read() starts fails that read once
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('changed while it was read in pages');
   expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
-  expect(readFileSync(big, 'utf8').startsWith('C 0000')).toBe(true);
+  expect(readFileSync(big, 'utf8').startsWith('C 00000')).toBe(true);
 });
 
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {

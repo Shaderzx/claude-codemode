@@ -1722,15 +1722,34 @@ const handedSpills = new Map<string, number>()
 const ownSpills = new Set<string>()
 const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
-const forgottenAt = new Map<string, { before: number; pending: { settledAt: number; sentVersion?: string }[] }>()
+type Forgotten = { before: number; pending: { settledAt: number; sentVersion?: string }[]; seen: { at: number; version: string }[] }
+const forgottenAt = new Map<string, Forgotten>()
 const forgottenFor = (real: string | undefined, askedAt: number, readBefore: string | undefined) => {
   const f = real === undefined ? undefined : forgottenAt.get(real)
-  return !!f && (askedAt < f.before || f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || readBefore === e.sentVersion)))
+  return (
+    !!f &&
+    (askedAt < f.before ||
+      f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || readBefore === e.sentVersion)) ||
+      f.seen.some((e) => askedAt < e.at && readBefore !== e.version))
+  )
 }
 const forgottenStamp = (real: string) => {
   const f = forgottenAt.get(real)
-  return f?.pending.at(-1)?.settledAt ?? f?.before ?? 0
+  return Math.max(f?.pending.at(-1)?.settledAt ?? 0, f?.seen.at(-1)?.at ?? 0, f?.before ?? 0)
 }
+const forgottenEntry = (real: string): Forgotten => forgottenAt.get(real) ?? { before: 0, pending: [], seen: [] }
+const keepForgotten = (real: string, f: Forgotten) => {
+  forgottenAt.delete(real)
+  forgottenAt.set(real, f)
+  dropOldest(forgottenAt.keys(), 2000, forgottenStamp, (k) => forgottenAt.delete(k), forgottenAt.size)
+}
+const noteSeen = (real: string, at: number, version: string | undefined) => {
+  if (version === undefined) return
+  const f = forgottenEntry(real)
+  keepForgotten(real, { ...f, seen: [...f.seen, { at, version }].slice(-16) })
+}
+const chainIsCurrent = (chain: { version?: string } | undefined, chainAt: number, newer: [number | undefined, string | undefined][]) =>
+  chain !== undefined && newer.every(([at, version]) => (at ?? 0) <= chainAt || version === chain.version)
 let readClock = 0
 let jobSeq = 0
 let mainTurn = false
@@ -1811,14 +1830,9 @@ const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionRead
 const outdateOlderViews = (j: Job, p: string, v: string | undefined, at: number) => {
   const olderAndDiffering = (stamp: number | undefined, version: string | undefined) => (stamp ?? 0) < at && version !== v
   if (readPaths.has(p) && olderAndDiffering(versionAt.get(p), readVersions.get(p))) readVersions.delete(p)
-  if (readProgress.has(p) && olderAndDiffering(progressAt.get(p), readProgress.get(p)?.version)) readProgress.delete(p)
   for (const other of jobsById.values()) {
     if (other === j || other.gen !== sessionGen) continue
     if (other.reads.has(p) && olderAndDiffering(other.readAt.get(p), other.reads.get(p))) other.reads.set(p, undefined)
-    if (other.progress.has(p) && olderAndDiffering(other.progressAt.get(p), other.progress.get(p)?.version)) {
-      other.progress.delete(p)
-      other.progressAt.delete(p)
-    }
     for (const [id, started] of other.pages) if (started.real === p && olderAndDiffering(started.at, started.version)) other.pages.set(id, {})
   }
 }
@@ -1828,6 +1842,7 @@ const promoteReads = (j: Job) => {
     const at = j.readAt.get(p) ?? 0
     if (at < (versionAt.get(p) ?? 0)) continue
     outdateOlderViews(j, p, v, at)
+    noteSeen(p, at, v)
     readPaths.delete(p)
     readPaths.add(p)
     versionAt.delete(p)
@@ -1839,6 +1854,7 @@ const promoteReads = (j: Job) => {
     const at = j.progressAt.get(p) ?? 0
     if (at < (progressAt.get(p) ?? 0)) continue
     outdateOlderViews(j, p, chain.version, at)
+    noteSeen(p, at, chain.version)
     progressAt.delete(p)
     progressAt.set(p, at)
     readProgress.delete(p)
@@ -2187,6 +2203,16 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const askedAt = readClock
     const forgottenSinceAsked = (real?: string) => forgottenFor(real, askedAt, readBefore)
+    const liveChains = (k: string) => {
+      const own = job.progress.get(k)
+      const session = readProgress.get(k)
+      const ownAt = job.progressAt.get(k) ?? 0
+      const sessionAt = progressAt.get(k) ?? 0
+      return [
+        chainIsCurrent(own, ownAt, [[readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)], [sessionAt, session?.version]]) ? own : undefined,
+        chainIsCurrent(session, sessionAt, [[job.reads.has(k) ? job.readAt.get(k) : undefined, job.reads.get(k)], [ownAt, own?.version], [readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)]]) ? session : undefined,
+      ]
+    }
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
     const patchPath = (v: unknown) => (typeof v === 'string' && !!v.trim() && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
     const isPatch = isPatchTool(tool)
@@ -2223,10 +2249,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) => at === undefined || at < sentAt || version === undefined || version === sentVersions.get(k)
     const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
     const stampForgotten = (k: string) => {
-      const prev = forgottenAt.get(k)
-      forgottenAt.delete(k)
-      forgottenAt.set(k, { before: Math.max(prev?.before ?? 0, sentAt), pending: [...(prev?.pending ?? []), { settledAt, sentVersion: sentVersions.get(k) }].slice(-16) })
-      dropOldest(forgottenAt.keys(), 2000, forgottenStamp, (f) => forgottenAt.delete(f), forgottenAt.size)
+      const prev = forgottenEntry(k)
+      keepForgotten(k, { ...prev, before: Math.max(prev.before, sentAt), pending: [...prev.pending, { settledAt, sentVersion: sentVersions.get(k) }].slice(-16) })
     }
     const resetOpenPages = (j: Job, k: string) => {
       for (const [id, started] of j.pages) if (started.real === k && sawBeforeSent(k, started.version, started.at)) j.pages.set(id, {})
@@ -2455,7 +2479,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const ownChain = ownPages?.next !== undefined ? { next: ownPages.next, version: ownPages.version } : undefined
       const receipt =
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter) ? readBefore : undefined, [ownChain, job.progress.get(realAfter ?? args.file_path), readProgress.get(realAfter ?? args.file_path)])
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter) ? readBefore : undefined, [ownChain, ...liveChains(realAfter ?? args.file_path)])
           : wrote && typeof target === 'string' && target.startsWith('/')
             ? ({ file: normal(target), whole: true } as Receipt)
             : undefined
@@ -2720,6 +2744,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (receipt) {
       const f = receipt.file
       const stamp = ++readClock
+      noteSeen(f, stamp, receipt.version)
+      for (const [id, started] of job.pages) if (started.real === f && (started.at ?? 0) < stamp && started.version !== receipt.version) job.pages.set(id, {})
       const read = { had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f) }
       const page = { value: job.progress.get(f), at: job.progressAt.get(f) }
       const restorePage = () => {

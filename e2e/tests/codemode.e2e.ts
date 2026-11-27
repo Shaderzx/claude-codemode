@@ -5844,11 +5844,9 @@ test('A page chain from before a patch never completes while the patch is being 
   const v = threeVersions(dir, f, 4);
   const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
   for (const o of others) writeFileSync(o, 'o\n');
-  const slow = join(dir, 'slow-0.txt');
-  const out = run({ tools: NO_BASH, engineForgets: true, statDelayMs: 8000, statDelayFor: 'slow-', steps: [
+  const out = run({ tools: NO_BASH, engineForgets: true, padPatchReply: 55_000, statDelayMs: 6000, statDelayFor: 'tool-results', steps: [
     { script: 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\nreturn "r0 chain"' },
-    { script: 'await read(' + v.q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "create", path: ' + JSON.stringify(slow) + ', new_text: "g\\n" }, { op: "replace_unique", path: ' + v.q + ', old_text: "AAAA 00000", new_text: "PPPP 00000" }] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
-    { untilFile: slow },
+    { script: 'await read(' + v.q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + v.q + ', old_text: "AAAA 00000", new_text: "PPPP 00000" }] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
     { untilStatPending: true },
     { script: '// @options: {"timeout_ms": 300000}\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\n' + v.toC + 'await tools.Read({ file_path: ' + v.q + ', offset: 3 })\nreturn "r2 read the rest"', keepTurn: true },
     { untilRunDone: 'r2' },
@@ -5937,3 +5935,75 @@ const oldTextAcrossKeptStamp = (when: 'booked before the patch settled' | 'still
 
 test('A read of the old text booked before a patch that keeps the mtime and size settled never counts once an open run reads thousands of other files', () => oldTextAcrossKeptStamp('booked before the patch settled'));
 test('A read of the old text still being checked when a patch that keeps the mtime and size settled never counts once an open run reads thousands of other files', () => oldTextAcrossKeptStamp('still being checked when the patch settled'));
+
+test('A Read checked after another run patched the file and read thousands of others never counts the version it read before the patch', () => {
+  const dir = scratch();
+  const [f, link, ref, asked, gate] = ['f.txt', 'late_link.txt', 'ref', 'asked', 'gate'].map((n) => join(dir, n));
+  writeFileSync(f, 'aaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  symlinkSync(f, link);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const q = JSON.stringify(f);
+  const out = run({ tools: NO_BASH, holdRealpath: { match: 'late_link', afterTool: 'Read', asked, gate }, steps: [
+    { script: 'const saw = String(await tools.Read({ file_path: ' + JSON.stringify(link) + ' }))\nreturn "r1 saw old=" + saw.includes("aaaa")', keepTurn: true },
+    { untilFile: asked },
+    { script: '// @options: {"timeout_ms": 300000}\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "pppp" })\nawait sh("touch -r ' + ref + ' ' + f + '")\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\nreturn r.ok ? "r2 patched and read 2000" : r.error', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 saw old=true');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('pppp\n');
+});
+
+test('An edit of a file read after another run\'s patch landed goes through while that patch is still being booked', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'alpha 0\n');
+  const q = JSON.stringify(f);
+  const [applied, answer, readDone, go] = ['applied', 'answer', 'read-done', 'go'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, patchAnswerGate: { applied, gate: answer }, statDelayMs: 2000, statDelayFor: 'slow-', steps: [
+    { script: 'await read(' + q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "create", path: ' + JSON.stringify(join(dir, 'slow-0.txt')) + ', new_text: "g\\n" }, { op: "replace_unique", path: ' + q + ', old_text: "alpha 0", new_text: "patched 0" }] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: applied },
+    { script: 'const t = await read(' + q + ')\nawait sh("touch ' + readDone + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 30000 })\ntry { await edit(' + q + ', "patched 0", "EDITED 0"); return "r2 saw=" + t.includes("patched 0") + " edited" } catch (e) { return "r2 saw=" + t.includes("patched 0") + " refused: " + e.message }', keepTurn: true },
+    { untilFile: readDone },
+    { touch: answer },
+    { untilStatPending: true },
+    { touch: go },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 patched');
+  expect(said).toContain('r2 saw=true edited');
+  expect(readFileSync(f, 'utf8')).toBe('EDITED 0\n');
+});
+
+test('A big Read paged across another run\'s patch that is still being booked comes back whole when every page shows the patched file', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  writeFileSync(big, Array.from({ length: 6000 }, (_, i) => 'alpha ' + String(i).padStart(5, '0') + ' ' + 'x'.repeat(45)).join('\n') + '\n');
+  const b = JSON.stringify(big);
+  const [applied, answer, pageAsked, pageGate] = ['applied', 'answer', 'page-asked', 'page-gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, patchAnswerGate: { applied, gate: answer }, holdLaterPages: { asked: pageAsked, gate: pageGate }, statDelayMs: 2000, statDelayFor: 'slow-', steps: [
+    { script: 'await read(' + JSON.stringify(join(dir, 'none.txt')) + ').catch(() => "")\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "create", path: ' + JSON.stringify(join(dir, 'slow-0.txt')) + ', new_text: "g\\n" }, { op: "replace_unique", path: ' + b + ', old_text: "alpha 00000", new_text: "patch 00000" }] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: applied },
+    { script: 'const r = await call("Read", { file_path: ' + b + ' })\nreturn r.ok ? "r2 whole=" + String(r.text).includes("patch 00000") : "r2 failed: " + r.error', keepTurn: true },
+    { untilFile: pageAsked },
+    { touch: answer },
+    { untilStatPending: true },
+    { touch: pageGate },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 patched');
+  expect(said).toContain('r2 whole=true');
+});

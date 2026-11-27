@@ -1724,15 +1724,31 @@ const handedSpills = new Map<string, number>()
 const ownSpills = new Set<string>()
 const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
-type PendingChange = { settledAt: number; sentVersion?: string; after?: { version?: string } }
+type PendingChange = { settledAt: number; afterVersion?: string }
 type Forgotten = { before: number; pending: PendingChange[]; seen: { at: number; version: string }[] }
 const forgottenAt = new Map<string, Forgotten>()
+const changingFiles = new Map<string, number>()
+const samplingFiles = new Map<string, Promise<unknown>>()
+const holdChanging = (files: Iterable<string>) => {
+  const held = [...new Set(files)]
+  for (const f of held) changingFiles.set(f, (changingFiles.get(f) ?? 0) + 1)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    for (const f of held) {
+      const left = (changingFiles.get(f) ?? 1) - 1
+      if (left > 0) changingFiles.set(f, left)
+      else changingFiles.delete(f)
+    }
+  }
+}
 const forgottenFor = (real: string | undefined, askedAt: number, readBefore: string | undefined) => {
   const f = real === undefined ? undefined : forgottenAt.get(real)
   return (
     !!f &&
     (askedAt < f.before ||
-      f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || (e.after ? readBefore !== e.after.version : readBefore === e.sentVersion))) ||
+      f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || readBefore !== e.afterVersion)) ||
       f.seen.some((e) => askedAt < e.at && readBefore !== e.version))
   )
 }
@@ -1746,7 +1762,8 @@ const forgottenEntry = (real: string): Forgotten => forgottenAt.get(real) ?? { b
 const keepForgotten = (real: string, f: Forgotten) => {
   forgottenAt.delete(real)
   forgottenAt.set(real, f)
-  dropOldest(forgottenAt.keys(), 2000, forgottenStamp, (k) => forgottenAt.delete(k), forgottenAt.size)
+  const evictable = changingFiles.size ? [...forgottenAt.keys()].filter((k) => !changingFiles.has(k)) : [...forgottenAt.keys()]
+  dropOldest(evictable, Math.max(0, 2000 - (forgottenAt.size - evictable.length)), forgottenStamp, (k) => forgottenAt.delete(k), evictable.length)
 }
 const noteSeen = (real: string, at: number, version: string | undefined) => {
   if (version === undefined) return
@@ -2262,11 +2279,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     let settledAt = sentAt
     const afterVersions = new Map<string, string | undefined>()
     const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) =>
-      at === undefined || at < sentAt || version === undefined || (at < settledAt && (afterVersions.has(k) ? version !== afterVersions.get(k) : version === sentVersions.get(k)))
+      at === undefined || at < sentAt || version === undefined || (at < settledAt && version !== afterVersions.get(k))
     const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
     const stampForgotten = (k: string) => {
       const prev = forgottenEntry(k)
-      const entry: PendingChange = { settledAt, sentVersion: sentVersions.get(k), ...(afterVersions.has(k) ? { after: { version: afterVersions.get(k) } } : {}) }
+      const entry: PendingChange = { settledAt, afterVersion: afterVersions.get(k) }
       keepForgotten(k, { ...prev, before: Math.max(prev.before, sentAt), pending: [...prev.pending.filter((e) => e.settledAt !== settledAt), entry].sort((x, y) => x.settledAt - y.settledAt).slice(-16) })
     }
     const resetOpenPages = (j: Job, k: string) => {
@@ -2326,10 +2343,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.progressAt.delete(k)
       }
     }
-    const patchUnsure = (appliedBefore = Infinity) => {
+    const patchKeysBefore = (appliedBefore = Infinity) => {
       const opPaths = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).slice(0, appliedBefore).map((o) => patchPath(o?.path ?? args.path)) : appliedBefore > 0 ? [patchPath(args.path)] : []
-      const changed = new Set(opPaths.map((v) => patchKeys.get(v ?? '') ?? (v ? [...patchKeys.values()].find((k) => k === v) : undefined)).filter((k): k is string => !!k))
-      for (const key of changed) {
+      return new Set(opPaths.map((v) => patchKeys.get(v ?? '') ?? (v ? [...patchKeys.values()].find((k) => k === v) : undefined)).filter((k): k is string => !!k))
+    }
+    const patchUnsure = (appliedBefore = Infinity) => {
+      for (const key of patchKeysBefore(appliedBefore)) {
         if (patchFresh.get(key) !== true) {
           forgetEverywhere(key)
           continue
@@ -2357,27 +2376,32 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     tally.open++
     if (counted) open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
     startedCalls.add(m.id as number)
-    const changedKeys = [...new Set([...patchOps.map((o) => patchKeys.get(o.path) as string), ...(writeKey !== undefined ? [writeKey] : [])])]
+    const changedKeys = [...new Set([...patchKeysBefore(), ...(writeKey !== undefined ? [writeKey] : [])])]
     const stillNamed = async (key: string) => {
       const version = await versionOf(key)
       return (await realOf(key)) === key ? version : undefined
     }
-    const settle = async (mayHaveChanged: boolean) => {
+    const settle = async (keys: Iterable<string>) => {
       settledAt = ++readClock
-      if (!mayHaveChanged) return
-      for (const key of changedKeys) {
+      const touched = [...keys]
+      for (const key of touched) {
         afterVersions.set(key, undefined)
         stampForgotten(key)
       }
-      for (const [key, version] of await Promise.all(changedKeys.map(async (key) => [key, await stillNamed(key)] as const))) afterVersions.set(key, version)
-      for (const key of changedKeys) stampForgotten(key)
+      const sampling = Promise.all(touched.map(async (key) => [key, await stillNamed(key)] as const))
+      for (const key of touched) samplingFiles.set(key, sampling)
+      for (const [key, version] of await sampling) afterVersions.set(key, version)
+      for (const key of touched) {
+        if (samplingFiles.get(key) === sampling) samplingFiles.delete(key)
+        stampForgotten(key)
+      }
     }
     let r = await $.tool.call({ ...args, tool: target } as never).catch(async (err: unknown) => {
       tally.open--
       tally.failed++
       tally.arg ??= firstArg(args)
       release?.()
-      await settle(true)
+      await settle(changedKeys)
       changeUnsure()
       const msg = (err as Error)?.message ?? String(err)
       // A tool a setting or another mod removed: name what may replace it.
@@ -2387,7 +2411,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const failedSaid = isPatch && r.isError ? String(r.text ?? show(r.result)).replace(/^\s*(?:<tool_use_error>)?\s*/, '') : ''
     const failedAt = /^ops\[(\d+)\]/.exec(failedSaid)
     const partlyApplied = !!failedAt && /Earlier ops in this batch were already applied/.test(failedSaid)
-    await settle(!r.isError || partlyApplied)
+    await settle(r.deny !== undefined ? [] : !r.isError ? changedKeys : partlyApplied ? patchKeysBefore(Number(failedAt?.[1])) : [])
     const body = release ? skillTexts.get(key) : undefined
     release?.()
     if (partlyApplied) patchUnsure(Number(failedAt?.[1]))
@@ -2503,6 +2527,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const patchReads: PatchRead[] = [...freshKeys].map((key) => ({ key, version: afterVersions.get(key), window: windowOf(key) }))
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
+      if (realAfter !== undefined) await samplingFiles.get(realAfter)?.then(() => undefined, () => undefined)
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
         const from = typeof args.offset === 'number' ? args.offset : 1
         const pages = typeof p.readId === 'number' ? `#${p.readId}` : args.file_path
@@ -2804,6 +2829,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const real = await Promise.all(writeTargets(m, cwd, home, defaults).map(realOf))
     lockedReals.set(m, new Set(real))
     for (const path of [...new Set(real)].sort()) unlocks.push(await lockFile(path))
+    const releaseChanging = holdChanging(real)
     try {
       out = lost ? { ok: false, error: lost } : await handle(m)
     } catch (err) {
@@ -2814,6 +2840,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     open.delete(m.id)
     // The child is gone after a timeout; writing would recreate its run dir.
     if (over) {
+      releaseChanging()
       ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
       return
     }
@@ -2870,6 +2897,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         for (const restore of [...restores].reverse()) restore()
       }
     }
+    releaseChanging()
     // Tracked whole, fallbacks included, so the run dir is removed only after it.
     const delivered = (async () => {
       if (await $.fs.write(file, JSON.stringify(out)).then(() => true, () => false)) return true

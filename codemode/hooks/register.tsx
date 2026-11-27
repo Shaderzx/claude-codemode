@@ -2813,6 +2813,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const file = `${dir}/${m.id}.json`
     const receipt = out[READ as never] as Receipt | undefined
     let undo: (() => void) | undefined
+    const outdateOwnUndo = (f: string, version: string | undefined, stamp: number) => {
+      if (version !== undefined) invalidateQueued(job, f, (seen, at) => (at ?? 0) < stamp && seen !== version, true)
+    }
     if (receipt) {
       const f = receipt.file
       const stamp = ++readClock
@@ -2821,6 +2824,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       for (const [id, started] of job.pages) if (started.real === f && (started.at ?? 0) < stamp && started.version !== receipt.version) job.pages.set(id, {})
       if (receipt.whole) {
         undo = booked(f, { reads: true, chain: true })
+        outdateOwnUndo(f, receipt.version, stamp)
         job.progress.delete(f)
         job.progressAt.delete(f)
         job.reads.delete(f)
@@ -2830,6 +2834,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       } else if (receipt.next !== undefined) {
         const ownReadIsOlder = job.reads.has(f) && (job.readAt.get(f) ?? 0) < stamp && job.reads.get(f) !== receipt.version
         undo = booked(f, { reads: ownReadIsOlder, chain: true })
+        outdateOwnUndo(f, receipt.version, stamp)
         if (ownReadIsOlder) job.reads.set(f, undefined)
         job.progress.delete(f)
         job.progress.set(f, { next: receipt.next, version: receipt.version })
@@ -2842,6 +2847,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const restores = patched.map(({ key: f, version }) => {
         const restore = booked(f, { reads: true, chain: true })
         const stamp = ++readClock
+        outdateOwnUndo(f, version, stamp)
         job.progress.delete(f)
         job.progressAt.delete(f)
         job.reads.delete(f)

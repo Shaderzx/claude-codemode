@@ -6096,3 +6096,86 @@ test('A subagent whose context is compacted must read its files again before it 
   expect(said).toContain('sub refused: ');
   expect(readFileSync(f, 'utf8')).toBe('before compact\n');
 });
+
+const patchInOtherAgent = (patcher: 'subagent' | 'main agent', how: 'patch after reading' | 'patch unread' | 'outside change then read' = 'patch after reading') => {
+  const dir = scratch();
+  const [f, ref] = ['f.txt', 'ref'].map((n) => join(dir, n));
+  const [b, c] = ['b.txt', 'c.txt'].map((n) => join(dir, n));
+  writeFileSync(f, 'alpha one\n');
+  writeFileSync(b, 'bravo two\n');
+  writeFileSync(c, 'ALPHA one\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const change = how === 'outside change then read'
+    ? 'await sh("cp ' + b + ' ' + f + '")\nawait read(' + q + ')\nawait sh("cp ' + c + ' ' + f + ' && touch -r ' + ref + ' ' + f + '")\nconst p = { ok: true }\n'
+    : (how === 'patch after reading' ? 'await read(' + q + ')\n' : '') + 'const p = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + q + ', old_text: "alpha", new_text: "ALPHA" }] })\nawait sh("touch -r ' + ref + ' ' + f + '")\n';
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const reader = patcher === 'subagent' ? {} : { agentId: 'a1' };
+  const changer = patcher === 'subagent' ? { agentId: 'a1' } : {};
+  const out = run({ tools: NO_BASH, steps: [
+    { script: 'await read(' + q + ')\nreturn "reader read"', ...reader },
+    { script: '// @options: {"timeout_ms": 300000}\n' + change + 'const all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\nreturn p.ok ? "changer patched" : "changer " + p.error', ...changer },
+    ...(patcher === 'subagent' ? [{ agentEnd: 'a1' }] : []),
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "reader wrote" } catch (e) { return "reader refused: " + e.message }', ...reader },
+    ...(patcher === 'main agent' ? [{ agentEnd: 'a1' }] : []),
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('changer patched');
+  expect(said).toContain('reader refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('ALPHA one\n');
+};
+
+test('A patch a subagent lands with a matching mtime and size never lets the main agent write over it after thousands of other reads', () => patchInOtherAgent('subagent'));
+test('A patch the main agent lands with a matching mtime and size never lets a subagent write over it after thousands of other reads', () => patchInOtherAgent('main agent'));
+test('A patch a subagent makes without reading, keeping the mtime and size, never lets the main agent write over it after thousands of other reads', () => patchInOtherAgent('subagent', 'patch unread'));
+test('A patch the main agent makes without reading, keeping the mtime and size, never lets a subagent write over it after thousands of other reads', () => patchInOtherAgent('main agent', 'patch unread'));
+test('A newer version a subagent read never lets the main agent write over a later one that matches its old read after thousands of other reads', () => patchInOtherAgent('subagent', 'outside change then read'));
+test('A newer version the main agent read never lets a subagent write over a later one that matches its old read after thousands of other reads', () => patchInOtherAgent('main agent', 'outside change then read'));
+
+test('The main agent keeps its reads when a subagent finishes', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'alpha\n');
+  const q = JSON.stringify(f);
+  const out = run({ steps: [
+    { script: 'await read(' + q + ')\nreturn "main read"' },
+    { script: 'return "sub ran"', agentId: 'a1' },
+    { agentEnd: 'a1' },
+    { script: 'try { await edit(' + q + ', "alpha", "BETA"); return "main edited" } catch (e) { return "main refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('main edited');
+  expect(readFileSync(f, 'utf8')).toBe('BETA\n');
+});
+
+test('A patch whose own record is dropped still outdates a subagent\'s read from before the patch', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  const xfPath = join(dir, 'X', 'f.txt');
+  writeFileSync(xfPath, 'aaaa\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'PREC\n');
+  writeFileSync(join(dir, 'ref'), '');
+  for (const p of [xfPath, join(dir, 'Y', 'f.txt'), join(dir, 'ref')]) utimesSync(p, 1_700_000_000, 1_700_000_000);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const xf = JSON.stringify(xfPath);
+  const creates = Array.from({ length: 4 }, (_, i) => '{ op: "create", path: ' + JSON.stringify(join(dir, 'slow-' + i + '.txt')) + ', new_text: "g\\n" }').join(', ');
+  const out = run({ tools: NO_BASH, engineForgets: true, statDelayMs: 600, statDelayFor: 'X/f.txt', steps: [
+    { script: 'await read(' + xf + ')\nreturn "sub read"', agentId: 'a1' },
+    { script: 'await read(' + xf + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [' + creates + ', { op: "replace_unique", path: ' + xf + ', old_text: "aaaa", new_text: "pppppp" }] })\nreturn r.ok ? "main patched" : r.error', keepTurn: true },
+    { untilFile: join(dir, 'slow-3.txt') },
+    { untilStatPending: true },
+    { script: 'await sh("rm -rf ' + join(dir, 'X') + ' && ln -s ' + join(dir, 'Y') + ' ' + join(dir, 'X') + '")\nreturn "main symlinked"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: '// @options: {"timeout_ms": 300000}\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\nawait sh("rm ' + join(dir, 'X') + ' && mv ' + join(dir, 'Y') + ' ' + join(dir, 'X') + ' && touch -r ' + join(dir, 'ref') + ' ' + xfPath + '")\ntry { await write(' + xf + ', "CLOBBERED\\n"); return "sub clobbered" } catch (e) { return "sub refused: " + e.message }', agentId: 'a1' },
+    { agentEnd: 'a1' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('sub refused: ');
+  expect(readFileSync(xfPath, 'utf8')).toBe('PREC\n');
+});

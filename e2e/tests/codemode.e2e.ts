@@ -5333,3 +5333,60 @@ test('A symlink whose target climbs out of forty missing folders never overwrite
   expect(out.results[0]!.text).toContain('refused: ');
   expect(readFileSync(join(dir, 'secret.txt'), 'utf8')).toBe('PRECIOUS\n');
 });
+test('A patch that stats slow files before the patched one never marks a version another run left unread as read', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'aaaa\n');
+  const q = JSON.stringify(f);
+  const creates = Array.from({ length: 6 }, (_, i) => '{ op: "create", path: ' + JSON.stringify(join(dir, 'slow-' + i + '.txt')) + ', new_text: "g\\n" }').join(', ');
+  const out = run({ tools: NO_BASH, statDelayMs: 1000, statDelayFor: 'slow-', steps: [
+    { script: 'await read(' + q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [' + creates + ', { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "pppp" }] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: join(dir, 'slow-5.txt') },
+    { untilStatPending: true },
+    { script: 'await sh("printf BBBBBB > ' + f + '")\nawait read(' + q + ')\nawait sh("printf SECRET_UNREAD > ' + f + '")\nreturn "r2 left an unread version"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('SECRET_UNREAD');
+});
+
+test('A Write whose folder becomes a symlink while it is booked never lets a later Write clobber the file moved into its place', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'aaaa\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'PRECIOUS\n');
+  const xf = JSON.stringify(join(dir, 'X', 'f.txt'));
+  const out = run({ engineForgets: true, statDelayMs: 400, steps: [
+    { script: 'await read(' + xf + ')\nreturn "r0 read"' },
+    { script: 'await write(' + xf + ', "pppp\\n")\nreturn "r1 wrote"', keepTurn: true },
+    { untilTool: 'Write' },
+    { script: 'await sh("rm -rf ' + join(dir, 'X') + ' && ln -s ' + join(dir, 'Y') + ' ' + join(dir, 'X') + '")\nreturn "r2 moved"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'await sh("rm ' + join(dir, 'X') + ' && mv ' + join(dir, 'Y') + ' ' + join(dir, 'X') + '")\nconst w = await call("Write", { file_path: ' + xf + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r3 clobbered" : "r3 refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('PRECIOUS\n');
+});
+
+test('A big file read in pages after a patch landed during its first try can be edited by the run that read it', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  writeFileSync(big, Array.from({ length: 6000 }, (_, i) => 'alpha ' + String(i).padStart(5, '0') + ' ' + 'x'.repeat(45)).join('\n') + '\n');
+  const b = JSON.stringify(big);
+  const out = run({ tools: NO_BASH, readDelayMs: 300, steps: [
+    { script: 'const t = String(await tools.Read({ file_path: ' + b + ' }))\ntry { await edit(' + b + ', "patched 00000", "EDITED 00000"); return "saw=" + t.includes("patched 00000") + " edited" } catch (e) { return "saw=" + t.includes("patched 00000") + " refused: " + e.message }', keepTurn: true },
+    { untilCalls: { tool: 'Read', count: 1 } },
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + b + ', old_text: "alpha 00000", new_text: "patched 00000" })\nreturn r.ok ? "patched" : r.error', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('saw=true edited');
+  expect(readFileSync(big, 'utf8').startsWith('EDITED 00000')).toBe(true);
+});

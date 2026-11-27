@@ -2384,6 +2384,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       !r.isError &&
       args.limit === undefined &&
       (infoOf(r.result)?.truncatedByTokenCap === true || ((args.offset === undefined || args.offset === 1) && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
+    let pagedView: { version?: string; real?: string; at: number } | undefined
     if (tool === 'Read' && args.limit === undefined && (capped || (r.isError && /exceeds maximum allowed (?:tokens|size)/i.test(String(r.text ?? show(r.result)))))) {
       const paged = await pageRead(args)
       if (paged === undefined && late()) {
@@ -2392,7 +2393,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         tally.arg ??= firstArg(args)
         return refusal('call')
       }
-      if (paged?.text !== undefined) r = { text: paged.text, result: paged.result } as typeof r
+      if (paged?.text !== undefined) {
+        r = { text: paged.text, result: paged.result } as typeof r
+        pagedView = { version: paged.version, real: paged.real, at: paged.sampledAt ?? settledAt }
+      }
       else if (paged?.error !== undefined) r = { isError: true, text: paged.error } as typeof r
       else if (capped)
         r = { isError: true, text: `${String(args.file_path)} is over Read's token cap and could not be read in pages (a single line may be over the cap); read part of it with sh() and head -c, or with offset and limit` } as typeof r
@@ -2474,20 +2478,22 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
       }
       const readNow: string[] = []
-      const patchReads: PatchRead[] = []
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
+      const freshKeys = new Set<string>()
       for (const o of patchOps) {
         const key = patchKeys.get(o.path) as string
         if (created.has(key) || patchFresh.get(key) === true) {
           outdateEverywhere(key)
-          if (!patchReads.some((r) => r.key === key)) {
-            const sampledAt = readClock
-            patchReads.push({ key, version: await versionOf(key), sampledAt })
-          }
+          freshKeys.add(key)
           readNow.push(o.path)
         } else forgetEverywhere(key)
       }
       if (wrote && writeKey !== undefined) outdateEverywhere(writeKey)
+      const stillNamed = async (key: string) => {
+        const version = await versionOf(key)
+        return (await realOf(key)) === key ? version : undefined
+      }
+      const patchReads: PatchRead[] = await Promise.all([...freshKeys].map(async (key) => ({ key, version: await stillNamed(key), sampledAt: settledAt })))
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
@@ -2502,17 +2508,20 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
         }
       }
+      const heldVersion = pagedView
+        ? pagedView.version !== undefined && pagedView.version === readAfter && pagedView.real === realAfter && !forgottenFor(realAfter, pagedView.at, pagedView.version) ? pagedView.version : undefined
+        : readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter) ? readBefore : undefined
       const ownPages = tool === 'Read' && p.handled === true && typeof p.readId === 'number' ? job.pages.get(`#${p.readId}`) : undefined
       const ownChain = ownPages?.next !== undefined ? { next: ownPages.next, version: ownPages.version } : undefined
       const receipt =
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
-          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter) ? readBefore : undefined, [ownChain, ...liveChains(realAfter ?? args.file_path)])
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, heldVersion, [ownChain, ...liveChains(realAfter ?? args.file_path)])
           : wrote && writeKey !== undefined
             ? ({ file: writeKey, whole: true } as Receipt)
             : wrote && typeof target === 'string' && target.startsWith('/')
               ? ({ file: normal(target), whole: true } as Receipt)
               : undefined
-      if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
+      if (receipt?.whole && receipt.version === undefined) receipt.version = wrote && writeKey !== undefined ? await stillNamed(writeKey) : await versionOf(receipt.file)
       if (ownPages && receipt && !receipt.whole && receipt.next !== undefined) ownPages.next = receipt.next
       if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : wrote && writeKey !== undefined ? writeKey : await realOf(receipt.file)
       if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
@@ -2571,7 +2580,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     return bytes.length === size ? fromUtf8(bytes) : undefined
   }
-  const pageRead = async (args: Record<string, unknown>): Promise<{ text?: string; error?: string; result?: unknown } | undefined> => {
+  const pageRead = async (args: Record<string, unknown>): Promise<{ text?: string; error?: string; result?: unknown; version?: string; real?: string; sampledAt?: number } | undefined> => {
     const pages: string[] = []
     let size = 0
     let offset = typeof args.offset === 'number' && args.offset > 1 ? args.offset : 1
@@ -2629,7 +2638,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const text = pages.join('\n')
     const lines = text ? text.split('\n') : []
     const content = lines.map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
-    return { text, result: { type: 'text', file: { filePath: file, content, numLines: lines.length, startLine: start, totalLines: total ?? start + lines.length - 1 } } }
+    return { text, version, real, sampledAt: pagingFrom, result: { type: 'text', file: { filePath: file, content, numLines: lines.length, startLine: start, totalLines: total ?? start + lines.length - 1 } } }
   }
 
   let over = false

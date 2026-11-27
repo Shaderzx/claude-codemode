@@ -4655,6 +4655,134 @@ test('A failure note never counts a call alongside it that the run ended before 
   expect(readFileSync(f, 'utf8')).toBe('AAAA\n');
 });
 
+const threeVersions = (dir: string, file: string, count: number, width = 0, newerIsOneLine = false) => {
+  const lines = (tag: string) => Array.from({ length: count }, (_, i) => tag + ' ' + String(i).padStart(5, '0') + (width ? ' ' + 'x'.repeat(width) : '')).join('\n') + '\n';
+  writeFileSync(file, lines('AAAA'));
+  writeFileSync(join(dir, 'b.txt'), newerIsOneLine ? 'BBBBBB\n' : lines('BBBBBB'));
+  writeFileSync(join(dir, 'c.txt'), lines('CCCC'));
+  writeFileSync(join(dir, 'ref'), '');
+  utimesSync(file, 1_700_000_000, 1_700_000_000);
+  utimesSync(join(dir, 'ref'), 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(file);
+  return {
+    q,
+    c: lines('CCCC'),
+    toB: 'await sh("cp ' + join(dir, 'b.txt') + ' ' + file + '")\n',
+    toC: 'await sh("cp ' + join(dir, 'c.txt') + ' ' + file + ' && touch -r ' + join(dir, 'ref') + ' ' + file + '")\n',
+  };
+};
+
+test('A paged tools.Read never stitches pages across a newer read another run handed back', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const v = threeVersions(dir, big, 15000, 60, true);
+  const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, holdLaterPages: { asked, gate }, steps: [
+    { script: 'try { String(await tools.Read({ file_path: ' + v.q + ' })); await write(' + v.q + ', "CLOBBERED\\n"); return "r1 wrote" } catch (e) { return "r1: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { script: v.toB + 'await read(' + v.q + ')\nreturn "r2 read"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { script: v.toC + 'return "changed outside"', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('changed while it was read in pages');
+  expect(said).not.toContain('r1 wrote');
+  expect(readFileSync(big, 'utf8')).toBe(v.c);
+});
+
+test('An open read() never stitches pages across a newer read the same run made', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const v = threeVersions(dir, big, 2400, 0, true);
+  const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
+  const script = 'const open = read(' + v.q + ')\nawait waitFor(() => sh("test -f ' + asked + '"), { every: 20, timeout: 20000 })\n' + v.toB + 'await read(' + v.q + ')\n' + v.toC + 'await sh("touch ' + gate + '")\ntry { await open; await write(' + v.q + ', "CLOBBERED\\n"); return "wrote" } catch (e) { return "refused: " + e.message }';
+  const out = run({ tools: NO_BASH, holdLaterPages: { asked, gate }, steps: [{ script }] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('refused: ');
+  expect(readFileSync(big, 'utf8')).toBe(v.c);
+});
+
+test('A page chain handed back before a newer read in the same run never completes into a read', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const out = run({ engineForgets: true, steps: [
+    { script: 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\nreturn "r1 started"' },
+    { script: v.toB + 'await read(' + v.q + ')\n' + v.toC + 'await tools.Read({ file_path: ' + v.q + ', offset: 3 })\nconst w = await call("Write", { file_path: ' + v.q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r2 wrote" : "r2 refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});
+
+test('A handed-back page chain of a newer version outdates the session\'s older read of the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const out = run({ engineForgets: true, steps: [
+    { script: 'await read(' + v.q + ')\nreturn "r1 read"' },
+    { script: v.toB + 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\nreturn "r2 started a chain"' },
+    { script: v.toC + 'try { await write(' + v.q + ', "CLOBBERED\\n"); return "r3 wrote" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});
+
+test('A newer read handed back ends another open run\'s older page chain', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const [started, go] = ['started', 'go'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, steps: [
+    { script: 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\nawait sh("touch ' + started + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 30000 })\nawait tools.Read({ file_path: ' + v.q + ', offset: 3 })\nconst w = await call("Write", { file_path: ' + v.q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r1 wrote" : "r1 refused: " + w.error', keepTurn: true },
+    { untilFile: started },
+    { script: v.toB + 'await read(' + v.q + ')\nreturn "r2 read"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { script: v.toC + 'return "changed outside"', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { touch: go },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});
+
+test('A stale patch already on its way when a read() starts fails that read once it lands', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(big, Array.from({ length: 2400 }, (_, i) => 'A ' + String(i).padStart(4, '0')).join('\n') + '\n');
+  writeFileSync(ref, '');
+  utimesSync(big, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const b = JSON.stringify(big);
+  const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, patchDelayMs: 1500, holdLaterPages: { asked, gate }, steps: [
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + b + ', old_text: "A 0000", new_text: "C 0000" })\nawait sh("touch -r ' + ref + ' ' + big + '")\nreturn r.ok ? "patched" : r.error', keepTurn: true },
+    { untilTool: 'mcp__lean-ctx__ctx_patch' },
+    { script: 'try { const t = await read(' + b + '); return "read " + (t.includes("A 0000") ? "A" : "C") } catch (e) { return "reader: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { untilRunDone: 'r1' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + b + ', "CLOBBERED\\n"); return "wrote" } catch (e) { return String(e.message) }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('changed while it was read in pages');
+  expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
+  expect(readFileSync(big, 'utf8').startsWith('C 0000')).toBe(true);
+});
+
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {
   const dir = scratch();
   const f = join(dir, 'f.txt');

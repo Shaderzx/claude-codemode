@@ -12,6 +12,7 @@ type Case = {
   patchDelayMs?: number
   patchLostAfterApply?: boolean
   patchErrorWrapped?: boolean
+  padPatchReply?: number
   patchAnswerGate?: { applied: string; gate: string }
   existsGapMs?: number
   lastPartMayBeMissing?: boolean
@@ -349,7 +350,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
           }
           said.push(text)
         }
-        return ok(said.join('\n'))
+        return ok(said.join('\n') + (c.padPatchReply ? '\n' + 'x'.repeat(c.padPatchReply) : ''))
       }
       const p = String(a.path).startsWith('/') ? String(a.path) : join(cwd, String(a.path))
       if (a.op === 'create' && c.deniedCreateMessage !== undefined) return err(c.deniedCreateMessage)

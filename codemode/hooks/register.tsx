@@ -1489,6 +1489,8 @@ const failedScripts = new Map<string, { first: string; at: number }>()
 
 const READ = Symbol('read')
 const UNDELIVERED = Symbol('undelivered')
+const PATCH_READS = Symbol('patch reads')
+type PatchRead = { key: string; version?: string }
 const readProgress = new Map<string, { next: number; version?: string }>()
 const readVersions = new Map<string, string>()
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
@@ -1822,12 +1824,14 @@ const running = (asker: Job) =>
     .map((j) => ({ id: j.id, state: j.exited ? 'finishing' : 'running', seconds: Math.round((Date.now() - j.started) / 1000) }))
 const LATER_ROOM = 300
 const sessionReadIsNewer = (j: Job, k: string) => readPaths.has(k) && (versionAt.get(k) ?? 0) > (j.readAt.get(k) ?? 0)
+const unforgotten = (k: string, version: string | undefined, at: number | undefined) => (version !== undefined && !forgottenFor(k, at ?? 0, version) ? version : undefined)
+const sessionVersion = (k: string) => (readPaths.has(k) ? unforgotten(k, readVersions.get(k), versionAt.get(k)) : undefined)
 const readVersionFor = (j: Job, k: string) => {
-  if (!j.reads.has(k)) return readPaths.has(k) ? readVersions.get(k) : undefined
-  const own = j.reads.get(k)
-  return sessionReadIsNewer(j, k) && readVersions.get(k) !== own ? undefined : own
+  if (!j.reads.has(k)) return sessionVersion(k)
+  const own = unforgotten(k, j.reads.get(k), j.readAt.get(k))
+  return sessionReadIsNewer(j, k) && readVersions.get(k) !== j.reads.get(k) ? undefined : own
 }
-const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionReadIsNewer(j, k) ? j.reads.get(k) : readPaths.has(k) ? readVersions.get(k) : undefined)
+const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionReadIsNewer(j, k) ? unforgotten(k, j.reads.get(k), j.readAt.get(k)) : sessionVersion(k))
 const outdateOlderViews = (j: Job, p: string, v: string | undefined, at: number) => {
   const olderAndDiffering = (stamp: number | undefined, version: string | undefined) => (stamp ?? 0) < at && version !== v
   if (readPaths.has(p) && olderAndDiffering(versionAt.get(p), readVersions.get(p))) readVersions.delete(p)
@@ -2215,8 +2219,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const ownAt = own ? job.progressAt.get(k) : undefined
       const sessionAt = session ? progressAt.get(k) : undefined
       return [
-        chainIsCurrent(own, ownAt ?? 0, [[readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)], [sessionAt, session?.version]]) ? own : undefined,
-        chainIsCurrent(session, sessionAt ?? 0, [[job.reads.has(k) ? job.readAt.get(k) : undefined, job.reads.get(k)], [ownAt, own?.version], [readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)]]) ? session : undefined,
+        chainIsCurrent(own, ownAt ?? 0, [[readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)], [sessionAt, session?.version]]) && !forgottenFor(k, ownAt ?? 0, own?.version) ? own : undefined,
+        chainIsCurrent(session, sessionAt ?? 0, [[job.reads.has(k) ? job.readAt.get(k) : undefined, job.reads.get(k)], [ownAt, own?.version], [readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)]]) && !forgottenFor(k, sessionAt ?? 0, session?.version) ? session : undefined,
       ]
     }
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
@@ -2263,11 +2267,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     const forgetEverywhere = (k: string) => {
       const forgetIn = (j: Job) => {
-        if (j === job || sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) {
+        if (sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) {
           j.reads.delete(k)
           j.readAt.delete(k)
         }
-        if (j === job || sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
+        if (sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
           j.progress.delete(k)
           j.progressAt.delete(k)
         }
@@ -2306,9 +2310,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       stampForgotten(k)
     }
     const forgetOwnView = (k: string) => {
-      if (job.reads.has(k)) job.reads.set(k, undefined)
-      job.progress.delete(k)
-      job.progressAt.delete(k)
+      if (job.reads.has(k) && sawBeforeSent(k, job.reads.get(k), job.readAt.get(k))) job.reads.set(k, undefined)
+      if (job.progress.has(k) && sawBeforeSent(k, job.progress.get(k)?.version, job.progressAt.get(k))) {
+        job.progress.delete(k)
+        job.progressAt.delete(k)
+      }
     }
     const patchUnsure = (appliedBefore = Infinity) => {
       const opPaths = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).slice(0, appliedBefore).map((o) => patchPath(o?.path ?? args.path)) : appliedBefore > 0 ? [patchPath(args.path)] : []
@@ -2456,18 +2462,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
       }
       const readNow: string[] = []
+      const patchReads: PatchRead[] = []
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
       for (const o of patchOps) {
         const key = patchKeys.get(o.path) as string
         if (created.has(key) || patchFresh.get(key) === true) {
           outdateEverywhere(key)
-          const version = await versionOf(key)
-          job.progress.delete(key)
-          job.progressAt.delete(key)
-          job.reads.delete(key)
-          job.reads.set(key, version)
-          job.readAt.delete(key)
-          job.readAt.set(key, ++readClock)
+          patchReads.push({ key, version: await versionOf(key) })
           readNow.push(o.path)
         } else forgetEverywhere(key)
       }
@@ -2480,7 +2481,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const first = job.pages.get(pages)
         const heldStill = readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter)
         if (from === 1) job.pages.set(pages, heldStill ? { version: readBefore, real: realBefore, at: askedAt } : {})
-        else if (first !== undefined && (!heldStill || readBefore !== first.version || realBefore !== first.real)) {
+        else if (first !== undefined && (!heldStill || readBefore !== first.version || realBefore !== first.real || forgottenFor(first.real, first.at ?? 0, first.version))) {
           tally.ok--
           tally.failed++
           return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
@@ -2503,7 +2504,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (/read-dedup/.test(text)) deduped = true
       }
       const leanJob = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
-      return { ok: true, text, result, ...exit, ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}), ...(isPatch || writeKey !== undefined ? { [UNDELIVERED]: changeUnsure } : {}) }
+      return { ok: true, text, result, ...exit, ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}), ...(patchReads.length ? { [PATCH_READS]: patchReads } : {}), ...(isPatch || writeKey !== undefined ? { [UNDELIVERED]: changeUnsure } : {}) }
     }
     const bad = tidy(tool, text)
     if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
@@ -2745,10 +2746,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     open.delete(m.id)
     // The child is gone after a timeout; writing would recreate its run dir.
-    if (over) {
-      ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
-      return
-    }
+    if (over) return
     const file = `${dir}/${m.id}.json`
     const receipt = out[READ as never] as Receipt | undefined
     let undo: (() => void) | undefined
@@ -2788,6 +2786,34 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         undo = () => {
           if (job.progressAt.get(f) === stamp) restorePage()
         }
+      }
+    }
+    const patched = (out[PATCH_READS as never] ?? []) as PatchRead[]
+    if (patched.length) {
+      const restores = patched.map(({ key: f, version }) => {
+        const before = { had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f), chain: job.progress.get(f), chainAt: job.progressAt.get(f) }
+        const stamp = ++readClock
+        job.progress.delete(f)
+        job.progressAt.delete(f)
+        job.reads.delete(f)
+        job.reads.set(f, version)
+        job.readAt.delete(f)
+        job.readAt.set(f, stamp)
+        noteSeen(f, stamp, version)
+        return () => {
+          if (job.readAt.get(f) !== stamp) return
+          if (before.had) job.reads.set(f, before.value)
+          else job.reads.delete(f)
+          if (before.at === undefined) job.readAt.delete(f)
+          else job.readAt.set(f, before.at)
+          if (before.chain !== undefined) job.progress.set(f, before.chain)
+          if (before.chainAt !== undefined) job.progressAt.set(f, before.chainAt)
+        }
+      })
+      const undoReceipt = undo
+      undo = () => {
+        undoReceipt?.()
+        for (const restore of restores) restore()
       }
     }
     // Tracked whole, fallbacks included, so the run dir is removed only after it.

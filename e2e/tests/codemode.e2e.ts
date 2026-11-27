@@ -4442,14 +4442,18 @@ const changeLandingAfterItsRunEnded = (how: 'patch beside a failing call' | 'cre
   utimesSync(ref, 1_700_000_000, 1_700_000_000);
   if (how !== 'create in a run that timed out') utimesSync(f, 1_700_000_000, 1_700_000_000);
   const q = JSON.stringify(f);
+  const [applied, answer] = ['applied', 'answer'].map((n) => join(dir, n));
+  const failOnceApplied = '{ command: "until [ -f ' + applied + ' ]; do sleep 0.05; done; exit 1" }';
   const first = how === 'patch beside a failing call'
-    ? 'await read(' + q + ')\nawait Promise.all([tools.mcp__lean_ctx__ctx_patch({ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "AAAA" }), tools.mcp__lean_ctx__ctx_shell({ command: "exit 1" })])'
+    ? 'await read(' + q + ')\nawait Promise.all([tools.mcp__lean_ctx__ctx_patch({ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "AAAA" }), tools.mcp__lean_ctx__ctx_shell(' + failOnceApplied + ')])'
     : how === 'write beside a failing call'
-      ? 'await read(' + q + ')\nawait Promise.all([tools.Write({ file_path: ' + q + ', content: "AAAA\\nbeta\\n" }), tools.Bash({ command: "exit 1" })])'
+      ? 'await read(' + q + ')\nawait Promise.all([tools.Write({ file_path: ' + q + ', content: "AAAA\\nbeta\\n" }), tools.Bash(' + failOnceApplied + ')])'
       : '// @options: {"timeout_ms": 1000}\nwhile (deadline() > 250) {}\nawait call("mcp__lean-ctx__ctx_patch", { op: "create", path: ' + q + ', new_text: "PRECIOUS\\n" })';
-  const out = run({ ...(how === 'write beside a failing call' ? { engineForgets: true, writeDelayMs: 300 } : { tools: NO_BASH, patchDelayMs: how === 'create in a run that timed out' ? 600 : 300 }), steps: [
+  const beside = how !== 'create in a run that timed out';
+  const out = run({ ...(how === 'write beside a failing call' ? { engineForgets: true } : { tools: NO_BASH }), ...(beside ? { patchAnswerGate: { applied, gate: answer } } : { patchDelayMs: 600 }), steps: [
     { script: first, keepTurn: true },
     { untilRunsDone: true },
+    ...(beside ? [{ touch: answer }] : []),
     { untilQuiet: true },
     { collect: true },
     { script: (how === 'write beside a failing call' ? 'await sh("touch -r ' + ref + ' ' + f + '")\n' : '') + 'try { await write(' + q + ', "ZZZZ\\nbeta\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },

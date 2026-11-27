@@ -540,7 +540,7 @@ const $ = {
       })
       if (c.patchLostAfterApply && ['mcp__lean-ctx__ctx_patch', 'Write', 'Edit'].includes(String(tool)) && r.isError !== true) throw new Error('MCP error -32000: Connection closed')
       const answering = c.patchAnswerGate
-      if (answering && tool === 'mcp__lean-ctx__ctx_patch') {
+      if (answering && ['mcp__lean-ctx__ctx_patch', 'Write', 'Edit'].includes(String(tool))) {
         writeFileSync(answering.applied, '')
         await until(() => existsSync(answering.gate), 60_000, answering.gate + ' appearing')
       }

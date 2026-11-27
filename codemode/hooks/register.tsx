@@ -2468,7 +2468,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const key = patchKeys.get(o.path) as string
         if (created.has(key) || patchFresh.get(key) === true) {
           outdateEverywhere(key)
-          patchReads.push({ key, version: await versionOf(key) })
+          if (!patchReads.some((r) => r.key === key)) patchReads.push({ key, version: await versionOf(key) })
           readNow.push(o.path)
         } else forgetEverywhere(key)
       }

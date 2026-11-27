@@ -6019,3 +6019,79 @@ test('A listed tool whose call fails with no tool of that name may still have ru
   expect(out.results[0]!.text).toContain('write ok=false | refused: ');
   expect(readFileSync(f, 'utf8')).toBe('alpha\n');
 });
+
+test('A big Read whose link moves before it pages never stitches pages across a patch of the file it paged, even after thousands of other files', () => {
+  const dir = scratch();
+  const [big1, big2, ref, link, asked, gate] = ['big1.txt', 'big2.txt', 'ref', 'link.txt', 'asked', 'gate'].map((n) => join(dir, n));
+  const lines = Array.from({ length: 6000 }, (_, i) => 'alpha ' + String(i).padStart(5, '0') + ' ' + 'x'.repeat(45)).join('\n') + '\n';
+  writeFileSync(big1, lines);
+  writeFileSync(big2, lines);
+  writeFileSync(ref, '');
+  utimesSync(big2, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  symlinkSync(big1, link);
+  const b2 = JSON.stringify(big2);
+  const creates = (from: number) => Array.from({ length: 500 }, (_, i) => '{ op: "create", path: ' + JSON.stringify(join(dir, 'n' + (from + i) + '.txt')) + ', new_text: "n\\n" }').join(', ');
+  const out = run({ tools: NO_BASH, readDelayMs: 400, holdLaterPages: { asked, gate }, steps: [
+    { script: 'const r = await call("Read", { file_path: ' + JSON.stringify(link) + ' })\nreturn r.ok ? "r1 ok torn=" + (String(r.text).includes("alpha 00000") && String(r.text).includes("PATCH 05999")) : "r1 refused: " + r.error', keepTurn: true },
+    { untilTool: 'Read' },
+    { relink: { from: link, to: big2 } },
+    { untilFile: asked },
+    { script: '// @options: {"timeout_ms": 300000}\nconst p = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + b2 + ', old_text: "alpha 00000", new_text: "PATCH 00000" }, { op: "replace_unique", path: ' + b2 + ', old_text: "alpha 05999", new_text: "PATCH 05999" }] })\nawait sh("touch -r ' + ref + ' ' + big2 + '")\n' + [0, 500, 1000, 1500, 2000].map((f) => 'await call("mcp__lean-ctx__ctx_patch", { ops: [' + creates(f) + '] })\n').join('') + 'return p.ok ? "r2 patched and created" : p.error', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + b2 + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).not.toContain('r1 ok torn=true');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(big2, 'utf8').startsWith('PATCH 00000')).toBe(true);
+});
+
+test('A file a subagent read never counts as read for the main agent', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'sub only\n');
+  const q = JSON.stringify(f);
+  const out = run({ steps: [
+    { script: 'await read(' + q + ')\nreturn "sub read"', agentId: 'a1' },
+    { agentEnd: 'a1' },
+    { script: 'const w = await call("Write", { file_path: ' + q + ', content: "MAIN_CLOBBERED\\n" })\nreturn w.ok ? "main wrote" : "main refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('main refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('sub only\n');
+});
+
+test('A file the main agent read never counts as read for a subagent', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'main only\n');
+  const q = JSON.stringify(f);
+  const out = run({ steps: [
+    { script: 'await read(' + q + ')\nreturn "main read"' },
+    { script: 'const w = await call("Write", { file_path: ' + q + ', content: "SUB_CLOBBERED\\n" })\nreturn w.ok ? "sub wrote" : "sub refused: " + w.error', agentId: 'a2' },
+    { agentEnd: 'a2' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('sub refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('main only\n');
+});
+
+test('A subagent whose context is compacted must read its files again before it writes them', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'before compact\n');
+  const q = JSON.stringify(f);
+  const out = run({ steps: [
+    { script: 'await read(' + q + ')\nreturn "sub read"', agentId: 'a1' },
+    { compact: true, compactAgent: 'a1' },
+    { script: 'const w = await call("Write", { file_path: ' + q + ', content: "AFTER_COMPACT\\n" })\nreturn w.ok ? "sub wrote" : "sub refused: " + w.error', agentId: 'a1' },
+    { agentEnd: 'a1' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('sub refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('before compact\n');
+});

@@ -4881,6 +4881,43 @@ test('Many reads of a later version never hide an earlier different version from
   expect(readFileSync(big, 'utf8')).toBe(v.c);
 });
 
+test('A promotion of an older read never rolls back a newer sighting of the same version', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const v = threeVersions(dir, big, 15000, 60, true);
+  const a = join(dir, 'a.txt');
+  const refB = join(dir, 'ref-b');
+  writeFileSync(a, readFileSync(big, 'utf8'));
+  writeFileSync(refB, '');
+  utimesSync(refB, 1_700_000_500, 1_700_000_500);
+  const toB = 'await sh("cp ' + join(dir, 'b.txt') + ' ' + big + ' && touch -r ' + refB + ' ' + big + '")\n';
+  const toA = 'await sh("cp ' + a + ' ' + big + ' && touch -r ' + join(dir, 'ref') + ' ' + big + '")\n';
+  const [r1Read, g1, asked, gate, r3Read, g2] = ['r1-read', 'g1', 'later-asked', 'gate', 'r3-read', 'g2'].map((n) => join(dir, n));
+  const readB = (marker: string, go: string) => toB + 'await read(' + v.q + ')\nawait sh("touch ' + marker + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 60000 })\nreturn "read B"';
+  const out = run({ tools: NO_BASH, holdLaterPages: { asked, gate }, steps: [
+    { script: readB(r1Read, g1), keepTurn: true },
+    { untilFile: r1Read },
+    { script: toA + 'try { String(await tools.Read({ file_path: ' + v.q + ' })); await write(' + v.q + ', "CLOBBERED\\n"); return "paged reader wrote" } catch (e) { return "paged reader: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { script: readB(r3Read, g2), keepTurn: true },
+    { untilFile: r3Read },
+    { script: v.toC + 'return "changed to C"', keepTurn: true },
+    { untilRunDone: 'r4' },
+    { touch: g1 },
+    { untilRunDone: 'r1' },
+    { collect: true },
+    { touch: gate },
+    { untilRunDone: 'r2' },
+    { touch: g2 },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('changed while it was read in pages');
+  expect(said).not.toContain('paged reader wrote');
+  expect(readFileSync(big, 'utf8')).toBe(v.c);
+});
+
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {
   const dir = scratch();
   const f = join(dir, 'f.txt');

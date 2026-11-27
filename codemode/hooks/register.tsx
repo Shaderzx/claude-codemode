@@ -1490,7 +1490,8 @@ const failedScripts = new Map<string, { first: string; at: number }>()
 const READ = Symbol('read')
 const UNDELIVERED = Symbol('undelivered')
 const PATCH_READS = Symbol('patch reads')
-type PatchRead = { key: string; version?: string; sampledAt: number }
+type ChangeWindow = { sentAt: number; sentVersion?: string }
+type PatchRead = { key: string; version?: string; window: ChangeWindow }
 const readProgress = new Map<string, { next: number; version?: string }>()
 const readVersions = new Map<string, string>()
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
@@ -1499,7 +1500,7 @@ const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number)
   for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
   return 0
 }
-type Receipt = { file: string; whole: boolean; next?: number; version?: string }
+type Receipt = { file: string; whole: boolean; next?: number; version?: string; window?: ChangeWindow }
 type FileInfo = { startLine?: unknown; numLines?: unknown; totalLines?: unknown; truncatedByTokenCap?: unknown }
 const infoOf = (result: unknown): FileInfo | undefined => {
   const f = result && typeof result === 'object' ? (result as { file?: unknown }).file : undefined
@@ -1743,6 +1744,8 @@ const forgottenFor = (real: string | undefined, askedAt: number, readBefore: str
       f.seen.some((e) => askedAt < e.at && readBefore !== e.version))
   )
 }
+const changeHeld = (f: string, version: string | undefined, w: ChangeWindow) =>
+  version !== undefined && !(forgottenAt.get(f)?.seen.some((e) => w.sentAt < e.at && e.version !== version && e.version !== w.sentVersion) ?? false)
 const forgottenStamp = (real: string) => {
   const f = forgottenAt.get(real)
   return Math.max(f?.pending.at(-1)?.settledAt ?? 0, f?.seen.at(-1)?.at ?? 0, f?.before ?? 0)
@@ -2265,7 +2268,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (writeKey !== undefined) sentVersions.set(writeKey, writeVersion)
     const sentAt = ++readClock
     let settledAt = sentAt
-    const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) => at === undefined || at < sentAt || version === undefined || version === sentVersions.get(k)
+    const afterVersions = new Map<string, string | undefined>()
+    const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) =>
+      at === undefined || at < sentAt || version === undefined || (at < settledAt && (afterVersions.has(k) ? version !== afterVersions.get(k) : version === sentVersions.get(k)))
     const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
     const stampForgotten = (k: string) => {
       const prev = forgottenEntry(k)
@@ -2306,9 +2311,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     const outdateEverywhere = (k: string) => {
       const outdateIn = (j: Job) => {
-        if (j !== job) invalidateQueued(j, k, (version, at) => sawBeforeSent(k, version, at), true)
-        if (j !== job && j.reads.has(k) && sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) j.reads.set(k, undefined)
-        if (j !== job && sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
+        invalidateQueued(j, k, (version, at) => sawBeforeSent(k, version, at), true)
+        if (j.reads.has(k) && sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) j.reads.set(k, undefined)
+        if (sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
           j.progress.delete(k)
           j.progressAt.delete(k)
         }
@@ -2477,6 +2482,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         tally.arg ??= firstArg(args)
         return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
       }
+      const stillNamed = async (key: string) => {
+        const version = await versionOf(key)
+        return (await realOf(key)) === key ? version : undefined
+      }
+      const changedKeys = [...new Set([...patchOps.map((o) => patchKeys.get(o.path) as string), ...(wrote && writeKey !== undefined ? [writeKey] : [])])]
+      for (const [key, version] of await Promise.all(changedKeys.map(async (key) => [key, await stillNamed(key)] as const))) afterVersions.set(key, version)
+      const windowOf = (key: string): ChangeWindow => ({ sentAt, sentVersion: sentVersions.get(key) })
       const readNow: string[] = []
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
       const freshKeys = new Set<string>()
@@ -2489,11 +2501,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         } else forgetEverywhere(key)
       }
       if (wrote && writeKey !== undefined) outdateEverywhere(writeKey)
-      const stillNamed = async (key: string) => {
-        const version = await versionOf(key)
-        return (await realOf(key)) === key ? version : undefined
-      }
-      const patchReads: PatchRead[] = await Promise.all([...freshKeys].map(async (key) => ({ key, version: await stillNamed(key), sampledAt: settledAt })))
+      const patchReads: PatchRead[] = [...freshKeys].map((key) => ({ key, version: afterVersions.get(key), window: windowOf(key) }))
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
@@ -2517,11 +2525,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
           ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, heldVersion, [ownChain, ...liveChains(realAfter ?? args.file_path)])
           : wrote && writeKey !== undefined
-            ? ({ file: writeKey, whole: true } as Receipt)
+            ? ({ file: writeKey, whole: true, version: afterVersions.get(writeKey), window: windowOf(writeKey) } as Receipt)
             : wrote && typeof target === 'string' && target.startsWith('/')
               ? ({ file: normal(target), whole: true } as Receipt)
               : undefined
-      if (receipt?.whole && receipt.version === undefined) receipt.version = wrote && writeKey !== undefined ? await stillNamed(writeKey) : await versionOf(receipt.file)
+      if (receipt?.whole && receipt.version === undefined && !receipt.window) receipt.version = await versionOf(receipt.file)
       if (ownPages && receipt && !receipt.whole && receipt.next !== undefined) ownPages.next = receipt.next
       if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : wrote && writeKey !== undefined ? writeKey : await realOf(receipt.file)
       if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
@@ -2811,7 +2819,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       return
     }
     const file = `${dir}/${m.id}.json`
-    const receipt = out[READ as never] as Receipt | undefined
+    const claimed = out[READ as never] as Receipt | undefined
+    const receipt = claimed?.window && !changeHeld(claimed.file, claimed.version, claimed.window) ? undefined : claimed
     let undo: (() => void) | undefined
     const outdateOwnUndo = (f: string, version: string | undefined, stamp: number) => {
       if (version !== undefined) invalidateQueued(job, f, (seen, at) => (at ?? 0) < stamp && seen !== version, true)
@@ -2842,7 +2851,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.progressAt.set(f, stamp)
       }
     }
-    const patched = ((out[PATCH_READS as never] ?? []) as PatchRead[]).filter((r) => r.version !== undefined && !forgottenFor(r.key, r.sampledAt, r.version))
+    const patched = ((out[PATCH_READS as never] ?? []) as PatchRead[]).filter((r) => changeHeld(r.key, r.version, r.window))
     if (patched.length) {
       const restores = patched.map(({ key: f, version }) => {
         const restore = booked(f, { reads: true, chain: true })

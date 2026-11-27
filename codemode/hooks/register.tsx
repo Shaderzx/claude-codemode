@@ -1728,6 +1728,7 @@ type PendingChange = { settledAt: number; sentVersion?: string; afterVersion?: s
 type Forgotten = { before: number; pending: PendingChange[]; seen: { at: number; version: string }[] }
 const forgottenAt = new Map<string, Forgotten>()
 const changingFiles = new Map<string, number>()
+const readPins = new Map<Request, () => void>()
 const samplingFiles = new Map<string, Promise<unknown>>()
 const holdChanging = (files: Iterable<string>) => {
   const held = [...new Set(files)]
@@ -2245,6 +2246,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       ]
     }
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
+    if (realBefore !== undefined) readPins.set(m, holdChanging([realBefore]))
     const patchPath = (v: unknown) => (typeof v === 'string' && !!v.trim() && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
     const isPatch = isPatchTool(tool)
     const patchPaths = isPatch ? [args.path, ...(Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).map((o) => o?.path) : [])] : []
@@ -2279,7 +2281,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     let settledAt = sentAt
     const afterVersions = new Map<string, string | undefined>()
     const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) =>
-      at === undefined || at < sentAt || version === undefined || (at < settledAt && version !== afterVersions.get(k))
+      at === undefined || at < sentAt || version === undefined || (at < settledAt && (version !== afterVersions.get(k) || afterVersions.get(k) === sentVersions.get(k)))
     const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
     const stampForgotten = (k: string) => {
       const prev = forgottenEntry(k)
@@ -2402,7 +2404,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       tally.arg ??= firstArg(args)
       release?.()
       const msg = (err as Error)?.message ?? String(err)
-      const neverRan = msg.includes('no tool named')
+      const neverRan = msg.includes(`no tool named "${target}"`) && !all.some((x) => x.name === target)
       await settle(neverRan ? [] : changedKeys)
       if (!neverRan) changeUnsure()
       // A tool a setting or another mod removed: name what may replace it.
@@ -2830,7 +2832,12 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const real = await Promise.all(writeTargets(m, cwd, home, defaults).map(realOf))
     lockedReals.set(m, new Set(real))
     for (const path of [...new Set(real)].sort()) unlocks.push(await lockFile(path))
-    const releaseChanging = holdChanging(real)
+    const heldForChange = holdChanging(real)
+    const releaseChanging = () => {
+      heldForChange()
+      readPins.get(m)?.()
+      readPins.delete(m)
+    }
     try {
       out = lost ? { ok: false, error: lost } : await handle(m)
     } catch (err) {

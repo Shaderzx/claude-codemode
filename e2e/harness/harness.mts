@@ -85,7 +85,7 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; untilReadlink?: string; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; untilReadlink?: string; untilRealpath?: string; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
@@ -140,7 +140,9 @@ const archive = (id: string) => join(home, '.local', 'share', 'lean-ctx', 'archi
 let archived = 0
 let replyHeld = false
 let realpathHolds = 0
+const realpathsAsked: string[] = []
 const realpathHeld = async (argv: string[]) => {
+  if (argv[0] === 'realpath') realpathsAsked.push(String(argv[1]))
   const hold = c.holdRealpath
   if (!hold || realpathHolds || argv[0] !== 'realpath' || !String(argv[1]).includes(hold.match) || !calls.some((x) => x.tool === hold.afterTool)) return
   realpathHolds++
@@ -868,6 +870,10 @@ for (const s of c.steps) {
   }
   if (s.untilFile) {
     await until(() => existsSync(s.untilFile as string), 240_000, s.untilFile + ' appearing')
+    continue
+  }
+  if (s.untilRealpath) {
+    await until(() => realpathsAsked.includes(s.untilRealpath as string), 30_000, 'a path check of ' + s.untilRealpath)
     continue
   }
   if (s.untilStatPending) {

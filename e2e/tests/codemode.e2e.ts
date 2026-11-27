@@ -4579,13 +4579,13 @@ const changeNeverReadBack = (how: 'patch create left unawaited' | 'Write left un
   const dir = scratch();
   const f = join(dir, 'f.txt');
   const q = JSON.stringify(f);
-  const busy = 'const until = Date.now() + 400\nwhile (Date.now() < until) {}\n';
+  const untilTaken = 'let taken = false\n'
   const first = how === 'patch create left unawaited'
-    ? 'void call("mcp__lean-ctx__ctx_patch", { op: "create", path: ' + q + ', new_text: "PRECIOUS\\n" })\n' + busy + 'return "returned early"'
+    ? untilTaken + 'void call("mcp__lean-ctx__ctx_patch", { op: "create", path: ' + q + ', new_text: "PRECIOUS\\n" }).then(() => { taken = true })\nawait waitFor(() => taken, { every: 10, timeout: 20000 })\nreturn "returned early"'
     : how === 'Write left unawaited'
-      ? 'void tools.Write({ file_path: ' + q + ', content: "PRECIOUS\\n" })\n' + busy + 'return "returned early"'
-      : '// @options: {"timeout_ms": 1000}\nwhile (deadline() > 300) {}\nvoid tools.Write({ file_path: ' + q + ', content: "PRECIOUS\\n" })\nwhile (true) {}';
-  const out = run({ ...(how === 'patch create left unawaited' ? { tools: NO_BASH } : { engineForgets: true }), ...(how === 'Write in a run killed after its timeout' ? { writeDelayMs: 280 } : {}), steps: [
+      ? untilTaken + 'void tools.Write({ file_path: ' + q + ', content: "PRECIOUS\\n" }).then(() => { taken = true })\nawait waitFor(() => taken, { every: 10, timeout: 20000 })\nreturn "returned early"'
+      : '// @options: {"timeout_ms": 1000}\nvoid tools.Write({ file_path: ' + q + ', content: "PRECIOUS\\n" })\nwhile (true) {}';
+  const out = run({ ...(how === 'patch create left unawaited' ? { tools: NO_BASH } : { engineForgets: true }), steps: [
     { script: first },
     { untilQuiet: true },
     { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },
@@ -4781,6 +4781,104 @@ test('A stale patch already on its way when a paged tools.Read starts fails that
   expect(said).toContain('changed while it was read in pages');
   expect(out.results[out.results.length - 1]!.text).toContain('has not read it');
   expect(readFileSync(big, 'utf8').startsWith('C 00000')).toBe(true);
+});
+
+const supersededChainAcrossCompaction = (resumes: 'the open run' | 'a later run') => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const [started, go] = ['started', 'go'].map((n) => join(dir, n));
+  const finish = 'await tools.Read({ file_path: ' + v.q + ', offset: 3 })\nconst w = await call("Write", { file_path: ' + v.q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "wrote" : "refused: " + w.error';
+  const first = 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\nawait sh("touch ' + started + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 20, timeout: 30000 })\n' + (resumes === 'the open run' ? finish : 'return "chain left open"');
+  const out = run({ engineForgets: true, steps: [
+    { script: first, keepTurn: true },
+    { untilFile: started },
+    { script: v.toB + 'await read(' + v.q + ')\nreturn "newer read"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { compact: true },
+    { script: v.toC + 'return "changed outside"', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { touch: go },
+    { untilRunsDone: true },
+    { collect: true },
+    ...(resumes === 'a later run' ? [{ script: finish }] : []),
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('refused: ');
+  expect(said).not.toMatch(/(^|\n)wrote/);
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+};
+
+test('A compaction never revives an open run\'s page chain that a newer read superseded', () => supersededChainAcrossCompaction('the open run'));
+test('A compaction never lets a superseded page chain handed back later complete into a read', () => supersededChainAcrossCompaction('a later run'));
+
+test('A run\'s page chain of an unchanged file still completes after the session forgot older chains', () => {
+  const dir = scratch();
+  const p = join(dir, 'p.txt');
+  writeFileSync(p, 'a\nb\nc\n');
+  const others = Array.from({ length: 200 }, (_, i) => join(dir, 'q' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'q\n');
+  const q = JSON.stringify(p);
+  const [started, go] = ['started', 'go'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, steps: [
+    { script: '// @options: {"timeout_ms": 240000}\nawait tools.Read({ file_path: ' + q + ', offset: 1, limit: 2 })\nawait sh("touch ' + started + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 50, timeout: 200000 })\nawait tools.Read({ file_path: ' + q + ', offset: 3 })\nconst w = await call("Write", { file_path: ' + q + ', content: "mine\\n" })\nreturn w.ok ? "r1 wrote" : "r1 refused: " + w.error', keepTurn: true },
+    { untilFile: started },
+    { script: '// @options: {"timeout_ms": 240000}\nawait tools.Read({ file_path: ' + q + ', offset: 1, limit: 1 })\nfor (const o of ' + JSON.stringify(others) + ') await tools.Read({ file_path: o, offset: 1, limit: 1 })\nreturn "r2 paged others"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { touch: go },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 wrote');
+  expect(readFileSync(p, 'utf8')).toBe('mine\n');
+});
+
+const ownChainAfterUnsureChange = (how: 'batch failing after it changed the file' | 'Write whose answer was lost') => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(f, 'aaaa\nbbbb\ncccc\ndddd\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const change = how === 'batch failing after it changed the file'
+    ? 'await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "PPPP" }, { op: "replace_unique", path: ' + q + ', old_text: "NOPE", new_text: "x" }] })'
+    : 'await call("Write", { file_path: ' + q + ', content: "PPPP\\nbbbb\\ncccc\\ndddd\\n" })';
+  const script = 'await read(' + q + ')\nawait tools.Read({ file_path: ' + q + ', offset: 1, limit: 2 })\n' + change + '\nawait sh("touch -r ' + ref + ' ' + f + '")\nawait tools.Read({ file_path: ' + q + ', offset: 3 })\ntry { await write(' + q + ', "CLOBBERED\\n"); return "wrote over PPPP" } catch (e) { return "refused: " + e.message }';
+  const out = run(how === 'batch failing after it changed the file' ? { tools: NO_BASH, steps: [{ script }] } : { engineForgets: true, failReplyAfter: { fail: 3, after: 3 }, steps: [{ script }] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('PPPP\nbbbb\ncccc\ndddd\n');
+};
+
+test('A batch patch that fails after changing the file ends the patcher\'s own page chain of it', () => ownChainAfterUnsureChange('batch failing after it changed the file'));
+test('A Write whose answer was lost ends the writer\'s own page chain of the file', () => ownChainAfterUnsureChange('Write whose answer was lost'));
+
+test('Many reads of a later version never hide an earlier different version from a paged tools.Read in flight', () => {
+  const dir = scratch();
+  const big = join(dir, 'big.txt');
+  const v = threeVersions(dir, big, 15000, 60, true);
+  const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, holdLaterPages: { asked, gate }, steps: [
+    { script: 'try { String(await tools.Read({ file_path: ' + v.q + ' })); await write(' + v.q + ', "CLOBBERED\\n"); return "r1 wrote" } catch (e) { return "r1: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { script: v.toB + 'await read(' + v.q + ')\nreturn "r2 read"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { script: v.toC + 'for (let i = 0; i < 16; i++) await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 1 })\nreturn "r3 read sixteen times"', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('changed while it was read in pages');
+  expect(said).not.toContain('r1 wrote');
+  expect(readFileSync(big, 'utf8')).toBe(v.c);
 });
 
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {

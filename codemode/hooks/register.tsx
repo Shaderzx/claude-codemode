@@ -1474,7 +1474,6 @@ const num = (v: unknown, fallback: number, min: number, max: number) =>
 
 let runs = 0
 let sessionCwd: string | undefined
-const readPaths = new Set<string>()
 const deniedTools = new Map<string, { alt?: string; at: number }>()
 const failedScripts = new Map<string, { first: string; at: number }>()
 
@@ -1483,8 +1482,6 @@ const UNDELIVERED = Symbol('undelivered')
 const PATCH_READS = Symbol('patch reads')
 type ChangeWindow = { sentAt: number; settledAt: number; sentVersion?: string }
 type PatchRead = { key: string; version?: string; window: ChangeWindow }
-const readProgress = new Map<string, { next: number; version?: string }>()
-const readVersions = new Map<string, string>()
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
 const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number) => {
   for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
@@ -1722,13 +1719,34 @@ const jobsById = new Map<string, Job>()
 const deliveredIds = new Map<string, string>()
 const handedSpills = new Map<string, number>()
 const ownSpills = new Set<string>()
-const progressAt = new Map<string, number>()
-const versionAt = new Map<string, number>()
+type SessionReads = { readPaths: Set<string>; readVersions: Map<string, string>; versionAt: Map<string, number>; readProgress: Map<string, { next: number; version?: string }>; progressAt: Map<string, number> }
+const sessionReads = new Map<string, SessionReads>()
+const forgetSessionReads = (agent: string) => {
+  const known = sessionReads.get(agent)
+  if (!known) return
+  for (const records of Object.values(known)) records.clear()
+}
+const readsOf = (agent: string): SessionReads => {
+  const known = sessionReads.get(agent)
+  if (known) return known
+  const fresh: SessionReads = { readPaths: new Set(), readVersions: new Map(), versionAt: new Map(), readProgress: new Map(), progressAt: new Map() }
+  sessionReads.set(agent, fresh)
+  return fresh
+}
 type PendingChange = { settledAt: number; sentVersion?: string; afterVersion?: string }
 type Forgotten = { before: number; pending: PendingChange[]; seen: { at: number; version: string }[] }
 const forgottenAt = new Map<string, Forgotten>()
 const changingFiles = new Map<string, number>()
 const readPins = new Map<Request, () => void>()
+const pinRead = (m: Request, real: string | undefined) => {
+  if (real === undefined) return
+  const earlier = readPins.get(m)
+  const release = holdChanging([real])
+  readPins.set(m, () => {
+    earlier?.()
+    release()
+  })
+}
 const samplingFiles = new Map<string, Promise<unknown>>()
 const sampledNow = (real: string | undefined) => (real === undefined ? undefined : samplingFiles.get(real)?.then(() => undefined, () => undefined))
 const holdChanging = (files: Iterable<string>) => {
@@ -1845,19 +1863,27 @@ const running = (asker: Job) =>
     .filter((j) => j !== asker)
     .map((j) => ({ id: j.id, state: j.exited ? 'finishing' : 'running', seconds: Math.round((Date.now() - j.started) / 1000) }))
 const LATER_ROOM = 300
-const sessionReadIsNewer = (j: Job, k: string) => readPaths.has(k) && (versionAt.get(k) ?? 0) > (j.readAt.get(k) ?? 0)
-const unforgotten = (k: string, version: string | undefined, at: number | undefined) => (version !== undefined && !forgottenFor(k, at ?? 0, version) ? version : undefined)
-const sessionVersion = (k: string) => (readPaths.has(k) ? unforgotten(k, readVersions.get(k), versionAt.get(k)) : undefined)
-const readVersionFor = (j: Job, k: string) => {
-  if (!j.reads.has(k)) return sessionVersion(k)
-  const own = unforgotten(k, j.reads.get(k), j.readAt.get(k))
-  return sessionReadIsNewer(j, k) && readVersions.get(k) !== j.reads.get(k) ? undefined : own
+const sessionReadIsNewer = (j: Job, k: string) => {
+  const { readPaths, versionAt } = readsOf(j.agent)
+  return readPaths.has(k) && (versionAt.get(k) ?? 0) > (j.readAt.get(k) ?? 0)
 }
-const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionReadIsNewer(j, k) ? unforgotten(k, j.reads.get(k), j.readAt.get(k)) : sessionVersion(k))
+const unforgotten = (k: string, version: string | undefined, at: number | undefined) => (version !== undefined && !forgottenFor(k, at ?? 0, version) ? version : undefined)
+const sessionVersion = (agent: string, k: string) => {
+  const { readPaths, readVersions, versionAt } = readsOf(agent)
+  return readPaths.has(k) ? unforgotten(k, readVersions.get(k), versionAt.get(k)) : undefined
+}
+const readVersionFor = (j: Job, k: string) => {
+  if (!j.reads.has(k)) return sessionVersion(j.agent, k)
+  const own = unforgotten(k, j.reads.get(k), j.readAt.get(k))
+  return sessionReadIsNewer(j, k) && readsOf(j.agent).readVersions.get(k) !== j.reads.get(k) ? undefined : own
+}
+const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionReadIsNewer(j, k) ? unforgotten(k, j.reads.get(k), j.readAt.get(k)) : sessionVersion(j.agent, k))
 const outdateOlderViews = (j: Job, p: string, v: string | undefined, at: number) => {
   const olderAndDiffering = (stamp: number | undefined, version: string | undefined) => (stamp ?? 0) < at && version !== v
-  if (readPaths.has(p) && olderAndDiffering(versionAt.get(p), readVersions.get(p))) readVersions.delete(p)
-  if (readProgress.has(p) && olderAndDiffering(progressAt.get(p), readProgress.get(p)?.version)) readProgress.delete(p)
+  for (const { readPaths, readVersions, versionAt, readProgress, progressAt } of sessionReads.values()) {
+    if (readPaths.has(p) && olderAndDiffering(versionAt.get(p), readVersions.get(p))) readVersions.delete(p)
+    if (readProgress.has(p) && olderAndDiffering(progressAt.get(p), readProgress.get(p)?.version)) readProgress.delete(p)
+  }
   for (const other of jobsById.values()) {
     if (other === j || other.gen !== sessionGen) continue
     if (other.reads.has(p) && olderAndDiffering(other.readAt.get(p), other.reads.get(p))) other.reads.set(p, undefined)
@@ -1870,6 +1896,7 @@ const outdateOlderViews = (j: Job, p: string, v: string | undefined, at: number)
   }
 }
 const promoteReads = (j: Job) => {
+  const { readPaths, readVersions, versionAt, readProgress, progressAt } = readsOf(j.agent)
   if (j.stopped || j.gen !== sessionGen) return
   for (const [p, v] of j.reads) {
     const at = j.readAt.get(p) ?? 0
@@ -2052,6 +2079,7 @@ const withHeld = (r: unknown, held: string) => {
   return { ...base, block: typeof base.block === 'string' && base.block ? `${base.block}\n\n${held}` : held }
 }
 const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: Record<string, string>, timeout: number, maxChars: number): Promise<{ result: RunResult }> => {
+  const { readPaths, readVersions, versionAt, readProgress, progressAt } = readsOf(job.agent)
   const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
   const all = listing.map((t) => ({ name: t.name, description: t.description }))
   const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
@@ -2234,6 +2262,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (tool === 'Skill' && !release)
       return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
     const since = skillSeq
+    const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
+    pinRead(m, realBefore)
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const askedAt = readClock
     const forgottenSinceAsked = (real?: string) => forgottenFor(real, askedAt, readBefore)
@@ -2247,8 +2277,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         chainIsCurrent(session, sessionAt ?? 0, [[job.reads.has(k) ? job.readAt.get(k) : undefined, job.reads.get(k)], [ownAt, own?.version], [readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)]]) && !forgottenFor(k, sessionAt ?? 0, session?.version) ? session : undefined,
       ]
     }
-    const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
-    if (realBefore !== undefined) readPins.set(m, holdChanging([realBefore]))
     const patchPath = (v: unknown) => (typeof v === 'string' && !!v.trim() && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
     const isPatch = isPatchTool(tool)
     const patchPaths = isPatch ? [args.path, ...(Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).map((o) => o?.path) : [])] : []
@@ -2308,18 +2336,20 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       forgetIn(job)
       for (const j of jobsById.values()) if (j.gen === sessionGen) forgetIn(j)
-      if (sawBeforeSent(k, readVersions.get(k), versionAt.get(k))) {
-        const at = beforeSent(versionAt.get(k))
-        readPaths.delete(k)
-        readVersions.delete(k)
-        versionAt.delete(k)
-        versionAt.set(k, at)
-      }
-      if (sawBeforeSent(k, readProgress.get(k)?.version, progressAt.get(k))) {
-        const at = beforeSent(progressAt.get(k))
-        readProgress.delete(k)
-        progressAt.delete(k)
-        progressAt.set(k, at)
+      for (const session of sessionReads.values()) {
+        if (sawBeforeSent(k, session.readVersions.get(k), session.versionAt.get(k))) {
+          const at = beforeSent(session.versionAt.get(k))
+          session.readPaths.delete(k)
+          session.readVersions.delete(k)
+          session.versionAt.delete(k)
+          session.versionAt.set(k, at)
+        }
+        if (sawBeforeSent(k, session.readProgress.get(k)?.version, session.progressAt.get(k))) {
+          const at = beforeSent(session.progressAt.get(k))
+          session.readProgress.delete(k)
+          session.progressAt.delete(k)
+          session.progressAt.set(k, at)
+        }
       }
       stampForgotten(k)
     }
@@ -2335,8 +2365,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       }
       outdateIn(job)
       for (const j of jobsById.values()) if (j.gen === sessionGen) outdateIn(j)
-      if (sawBeforeSent(k, readVersions.get(k), versionAt.get(k))) readVersions.delete(k)
-      if (sawBeforeSent(k, readProgress.get(k)?.version, progressAt.get(k))) readProgress.delete(k)
+      for (const session of sessionReads.values()) {
+        if (sawBeforeSent(k, session.readVersions.get(k), session.versionAt.get(k))) session.readVersions.delete(k)
+        if (sawBeforeSent(k, session.readProgress.get(k)?.version, session.progressAt.get(k))) session.readProgress.delete(k)
+      }
       stampForgotten(k)
     }
     const forgetOwnView = (k: string) => {
@@ -2427,7 +2459,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       (infoOf(r.result)?.truncatedByTokenCap === true || ((args.offset === undefined || args.offset === 1) && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
     let pagedView: { version?: string; real?: string; at: number } | undefined
     if (tool === 'Read' && args.limit === undefined && (capped || (r.isError && /exceeds maximum allowed (?:tokens|size)/i.test(String(r.text ?? show(r.result)))))) {
-      const paged = await pageRead(args)
+      const paged = await pageRead(args, m)
       if (paged === undefined && late()) {
         tally.open--
         tally.cutOff = (tally.cutOff ?? 0) + 1
@@ -2617,7 +2649,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     return bytes.length === size ? fromUtf8(bytes) : undefined
   }
-  const pageRead = async (args: Record<string, unknown>): Promise<{ text?: string; error?: string; result?: unknown; version?: string; real?: string; sampledAt?: number } | undefined> => {
+  const pageRead = async (args: Record<string, unknown>, pinFor?: Request): Promise<{ text?: string; error?: string; result?: unknown; version?: string; real?: string; sampledAt?: number } | undefined> => {
     const pages: string[] = []
     let size = 0
     let offset = typeof args.offset === 'number' && args.offset > 1 ? args.offset : 1
@@ -2628,8 +2660,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     let total: number | undefined
     const start = offset
     const file = String(args.file_path)
-    const version = await versionOf(file)
     const real = await realOf(file)
+    if (pinFor) pinRead(pinFor, real)
+    const version = await versionOf(file)
     const pagingFrom = readClock
     const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real || (await sampledNow(real), forgottenFor(real, pagingFrom, version))
     for (let guard = 0; guard < 10_000; guard++) {
@@ -3205,15 +3238,11 @@ export const register: Register = (on) => {
     void stopJobs($, jobs, 'the end of its session', 'aborted')
     jobsById.clear()
     deliveredIds.clear()
-    versionAt.clear()
+    for (const agent of sessionReads.keys()) forgetSessionReads(agent)
     forgottenAt.clear()
     for (const j of jobs) j.expiry?.cancel()
     mainTurn = false
     mainTurnId = undefined
-    readPaths.clear()
-    readProgress.clear()
-    progressAt.clear()
-    readVersions.clear()
     failedScripts.clear()
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -3221,13 +3250,7 @@ export const register: Register = (on) => {
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
     const skipped = !!r && typeof r === 'object' && 'skip' in r && (r as { skip?: unknown }).skip !== undefined
-    if (!e.agentId && e.trigger !== 'precompute' && !skipped) {
-      readPaths.clear()
-      readProgress.clear()
-      progressAt.clear()
-      readVersions.clear()
-      versionAt.clear()
-    }
+    if (e.trigger !== 'precompute' && !skipped) forgetSessionReads(agentOf(e.agentId))
     return r
   }).catch(($, e, next) => next(e))
 
@@ -3249,6 +3272,7 @@ export const register: Register = (on) => {
       return await next(e)
     } finally {
       if (agent !== MAIN) {
+        forgetSessionReads(agent)
         const jobs = agentJobs(agent)
         await stopJobs($, jobs, 'the end of its agent\'s turn', 'cancelled')
         for (const j of jobs) {

@@ -1686,6 +1686,12 @@ export const skillTurn = async (key: string, limit: Promise<unknown>): Promise<(
 
 type Dollar = Parameters<Hook<'tool.call'>>[0]
 type RunResult = string | { type: string; text?: string }[]
+type ReadsView = { had: boolean; value?: string; at?: number }
+type ChainView = { chain?: { next: number; version?: string }; chainAt?: number }
+const invalidateQueued = (j: Job, k: string, stale: (version: string | undefined, at: number | undefined) => boolean, outdate: boolean) => {
+  for (const e of j.readUndo.get(k) ?? []) if (e.before.had && stale(e.before.value, e.before.at)) e.before = outdate ? { ...e.before, value: undefined } : { had: false }
+  for (const e of j.chainUndo.get(k) ?? []) if (e.before.chain && stale(e.before.chain.version, e.before.chainAt)) e.before = {}
+}
 type Job = {
   id: string
   agent: string
@@ -1706,6 +1712,8 @@ type Job = {
   noticed: boolean
   quiet: boolean
   reads: Map<string, string | undefined>
+  readUndo: Map<string, { before: ReadsView }[]>
+  chainUndo: Map<string, { before: ChainView }[]>
   readAt: Map<string, number>
   pages: Map<string, { version?: string; real?: string; next?: number; at?: number }>
   progress: Map<string, { next: number; version?: string }>
@@ -1800,7 +1808,7 @@ const expire = (j: Job) => {
 export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
 const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
 const startJob = (agent: string, timeout: number): Job => {
-  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readAt: new Map(), pages: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readUndo: new Map(), chainUndo: new Map(), readAt: new Map(), pages: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
   job.pidKnown = new Promise<void>((r) => (job.onPid = r))
   jobsById.set(job.id, job)
   return job
@@ -1839,6 +1847,7 @@ const outdateOlderViews = (j: Job, p: string, v: string | undefined, at: number)
   for (const other of jobsById.values()) {
     if (other === j || other.gen !== sessionGen) continue
     if (other.reads.has(p) && olderAndDiffering(other.readAt.get(p), other.reads.get(p))) other.reads.set(p, undefined)
+    invalidateQueued(other, p, (version, stamp) => olderAndDiffering(stamp, version), true)
     if (other.progress.has(p) && olderAndDiffering(other.progressAt.get(p), other.progress.get(p)?.version)) {
       other.progress.delete(p)
       other.progressAt.delete(p)
@@ -2267,6 +2276,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     const forgetEverywhere = (k: string) => {
       const forgetIn = (j: Job) => {
+        invalidateQueued(j, k, (version, at) => sawBeforeSent(k, version, at), false)
         if (sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) {
           j.reads.delete(k)
           j.readAt.delete(k)
@@ -2296,6 +2306,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     const outdateEverywhere = (k: string) => {
       const outdateIn = (j: Job) => {
+        if (j !== job) invalidateQueued(j, k, (version, at) => sawBeforeSent(k, version, at), true)
         if (j !== job && j.reads.has(k) && sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) j.reads.set(k, undefined)
         if (j !== job && sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
           j.progress.delete(k)
@@ -2310,6 +2321,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       stampForgotten(k)
     }
     const forgetOwnView = (k: string) => {
+      invalidateQueued(job, k, (version, at) => sawBeforeSent(k, version, at), true)
       if (job.reads.has(k) && sawBeforeSent(k, job.reads.get(k), job.readAt.get(k))) job.reads.set(k, undefined)
       if (job.progress.has(k) && sawBeforeSent(k, job.progress.get(k)?.version, job.progressAt.get(k))) {
         job.progress.delete(k)
@@ -2733,31 +2745,39 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     m.payload.args = args
     return lost.length ? namesNoFile(lost[0] as string) : undefined
   }
-  const untakenAnswers = new Map<number, { order: number; cleanUp: () => void }>()
-  type ReadView = { had: boolean; value?: string; at?: number; chain?: { next: number; version?: string }; chainAt?: number }
-  const undoStacks = new Map<string, { before: ReadView }[]>()
-  const viewOf = (f: string): ReadView => ({ had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f), chain: job.progress.get(f), chainAt: job.progressAt.get(f) })
-  const putBack = (f: string, v: ReadView) => {
+  const untakenAnswers = new Map<number, () => void>()
+  const stackUndo = <V,>(stacks: Map<string, { before: V }[]>, f: string, before: V, putBack: (v: V) => void) => {
+    const stack = stacks.get(f) ?? []
+    stacks.set(f, stack)
+    const entry = { before }
+    stack.push(entry)
+    return () => {
+      const at = stack.indexOf(entry)
+      if (at < 0) return
+      if (at === stack.length - 1) putBack(entry.before)
+      else stack[at + 1]!.before = entry.before
+      stack.splice(at, 1)
+    }
+  }
+  const putBackReads = (f: string) => (v: ReadsView) => {
     if (v.had) job.reads.set(f, v.value)
     else job.reads.delete(f)
     if (v.at === undefined) job.readAt.delete(f)
     else job.readAt.set(f, v.at)
+  }
+  const putBackChain = (f: string) => (v: ChainView) => {
     if (v.chain === undefined) job.progress.delete(f)
     else job.progress.set(f, v.chain)
     if (v.chainAt === undefined) job.progressAt.delete(f)
     else job.progressAt.set(f, v.chainAt)
   }
-  const booked = (f: string) => {
-    const stack = undoStacks.get(f) ?? []
-    undoStacks.set(f, stack)
-    const entry = { before: viewOf(f) }
-    stack.push(entry)
+  const booked = (f: string, parts: { reads: boolean; chain: boolean }) => {
+    const undos = [
+      ...(parts.reads ? [stackUndo<ReadsView>(job.readUndo, f, { had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f) }, putBackReads(f))] : []),
+      ...(parts.chain ? [stackUndo<ChainView>(job.chainUndo, f, { chain: job.progress.get(f), chainAt: job.progressAt.get(f) }, putBackChain(f))] : []),
+    ]
     return () => {
-      const at = stack.indexOf(entry)
-      if (at < 0) return
-      if (at === stack.length - 1) putBack(f, entry.before)
-      else stack[at + 1]!.before = entry.before
-      stack.splice(at, 1)
+      for (const undo of undos) undo()
     }
   }
   const startedCalls = new Set<number>()
@@ -2791,7 +2811,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (receipt.version !== undefined) outdateOlderViews(job, f, receipt.version, stamp)
       for (const [id, started] of job.pages) if (started.real === f && (started.at ?? 0) < stamp && started.version !== receipt.version) job.pages.set(id, {})
       if (receipt.whole) {
-        undo = booked(f)
+        undo = booked(f, { reads: true, chain: true })
         job.progress.delete(f)
         job.progressAt.delete(f)
         job.reads.delete(f)
@@ -2799,7 +2819,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.readAt.delete(f)
         job.readAt.set(f, stamp)
       } else if (receipt.next !== undefined) {
-        undo = booked(f)
+        const ownReadIsOlder = job.reads.has(f) && (job.readAt.get(f) ?? 0) < stamp && job.reads.get(f) !== receipt.version
+        undo = booked(f, { reads: ownReadIsOlder, chain: true })
+        if (ownReadIsOlder) job.reads.set(f, undefined)
         job.progress.delete(f)
         job.progress.set(f, { next: receipt.next, version: receipt.version })
         job.progressAt.delete(f)
@@ -2809,7 +2831,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const patched = ((out[PATCH_READS as never] ?? []) as PatchRead[]).filter((r) => r.version !== undefined && !forgottenFor(r.key, r.sampledAt, r.version))
     if (patched.length) {
       const restores = patched.map(({ key: f, version }) => {
-        const restore = booked(f)
+        const restore = booked(f, { reads: true, chain: true })
         const stamp = ++readClock
         job.progress.delete(f)
         job.progressAt.delete(f)
@@ -2849,14 +2871,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       await $.fs.write(file, JSON.stringify(failed)).catch(() => {})
       return false
     })()
-    const answerOrder = ++readClock
     const cleanUp = () => {
       undo?.()
       ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
     }
     const reply = delivered.then((ok) => {
       if (!ok) return cleanUp()
-      if (undo || out[UNDELIVERED as never]) untakenAnswers.set(m.id as number, { order: answerOrder, cleanUp })
+      if (undo || out[UNDELIVERED as never]) untakenAnswers.set(m.id as number, cleanUp)
     })
     writes.add(reply)
     void reply.finally(() => writes.delete(reply))
@@ -2990,7 +3011,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   // A reply already being written could recreate the dir after it is removed.
   await Promise.allSettled([...writes])
   const answered = new Set(done?.answered ?? [])
-  for (const [, { cleanUp }] of [...untakenAnswers].filter(([id]) => !answered.has(id)).sort((a, b) => b[1].order - a[1].order)) cleanUp()
+  for (const [id, cleanUp] of untakenAnswers) if (!answered.has(id)) cleanUp()
   untakenAnswers.clear()
   await $.process.run(['rm', '-rf', dir]).catch(() => {})
   let ended: Ended = job.cancelledBy

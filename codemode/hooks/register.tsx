@@ -1724,7 +1724,7 @@ const handedSpills = new Map<string, number>()
 const ownSpills = new Set<string>()
 const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
-type PendingChange = { settledAt: number; afterVersion?: string }
+type PendingChange = { settledAt: number; sentVersion?: string; afterVersion?: string }
 type Forgotten = { before: number; pending: PendingChange[]; seen: { at: number; version: string }[] }
 const forgottenAt = new Map<string, Forgotten>()
 const changingFiles = new Map<string, number>()
@@ -1748,7 +1748,7 @@ const forgottenFor = (real: string | undefined, askedAt: number, readBefore: str
   return (
     !!f &&
     (askedAt < f.before ||
-      f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || readBefore !== e.afterVersion)) ||
+      f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || readBefore !== e.afterVersion || e.afterVersion === e.sentVersion)) ||
       f.seen.some((e) => askedAt < e.at && readBefore !== e.version))
   )
 }
@@ -2283,7 +2283,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
     const stampForgotten = (k: string) => {
       const prev = forgottenEntry(k)
-      const entry: PendingChange = { settledAt, afterVersion: afterVersions.get(k) }
+      const entry: PendingChange = { settledAt, sentVersion: sentVersions.get(k), afterVersion: afterVersions.get(k) }
       keepForgotten(k, { ...prev, before: Math.max(prev.before, sentAt), pending: [...prev.pending.filter((e) => e.settledAt !== settledAt), entry].sort((x, y) => x.settledAt - y.settledAt).slice(-16) })
     }
     const resetOpenPages = (j: Job, k: string) => {
@@ -2401,9 +2401,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       tally.failed++
       tally.arg ??= firstArg(args)
       release?.()
-      await settle(changedKeys)
-      changeUnsure()
       const msg = (err as Error)?.message ?? String(err)
+      const neverRan = msg.includes('no tool named')
+      await settle(neverRan ? [] : changedKeys)
+      if (!neverRan) changeUnsure()
       // A tool a setting or another mod removed: name what may replace it.
       const near = msg.includes('no tool named') ? similar(tool, all.map((x) => x.name)) : []
       throw new Error(near.length ? `${msg}; similar: ${near.join(', ')}` : msg)

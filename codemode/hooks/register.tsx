@@ -1490,7 +1490,7 @@ const failedScripts = new Map<string, { first: string; at: number }>()
 const READ = Symbol('read')
 const UNDELIVERED = Symbol('undelivered')
 const PATCH_READS = Symbol('patch reads')
-type PatchRead = { key: string; version?: string }
+type PatchRead = { key: string; version?: string; sampledAt: number }
 const readProgress = new Map<string, { next: number; version?: string }>()
 const readVersions = new Map<string, string>()
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
@@ -2468,7 +2468,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const key = patchKeys.get(o.path) as string
         if (created.has(key) || patchFresh.get(key) === true) {
           outdateEverywhere(key)
-          if (!patchReads.some((r) => r.key === key)) patchReads.push({ key, version: await versionOf(key) })
+          if (!patchReads.some((r) => r.key === key)) {
+            const sampledAt = readClock
+            patchReads.push({ key, version: await versionOf(key), sampledAt })
+          }
           readNow.push(o.path)
         } else forgetEverywhere(key)
       }
@@ -2728,7 +2731,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     m.payload.args = args
     return lost.length ? namesNoFile(lost[0] as string) : undefined
   }
-  const untakenAnswers = new Map<number, () => void>()
+  const untakenAnswers = new Map<number, { order: number; cleanUp: () => void }>()
   const startedCalls = new Set<number>()
   const respond = async (m: Request) => {
     const lost = await resolveClimbs(m)
@@ -2788,7 +2791,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         }
       }
     }
-    const patched = (out[PATCH_READS as never] ?? []) as PatchRead[]
+    const patched = ((out[PATCH_READS as never] ?? []) as PatchRead[]).filter((r) => r.version !== undefined && !forgottenFor(r.key, r.sampledAt, r.version))
     if (patched.length) {
       const restores = patched.map(({ key: f, version }) => {
         const before = { had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f), chain: job.progress.get(f), chainAt: job.progressAt.get(f) }
@@ -2806,6 +2809,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           else job.reads.delete(f)
           if (before.at === undefined) job.readAt.delete(f)
           else job.readAt.set(f, before.at)
+          if (job.progress.has(f)) return
           if (before.chain !== undefined) job.progress.set(f, before.chain)
           if (before.chainAt !== undefined) job.progressAt.set(f, before.chainAt)
         }
@@ -2813,7 +2817,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const undoReceipt = undo
       undo = () => {
         undoReceipt?.()
-        for (const restore of restores) restore()
+        for (const restore of [...restores].reverse()) restore()
       }
     }
     // Tracked whole, fallbacks included, so the run dir is removed only after it.
@@ -2839,13 +2843,14 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       await $.fs.write(file, JSON.stringify(failed)).catch(() => {})
       return false
     })()
+    const answerOrder = ++readClock
     const cleanUp = () => {
       undo?.()
       ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
     }
     const reply = delivered.then((ok) => {
       if (!ok) return cleanUp()
-      if (undo || out[UNDELIVERED as never]) untakenAnswers.set(m.id as number, cleanUp)
+      if (undo || out[UNDELIVERED as never]) untakenAnswers.set(m.id as number, { order: answerOrder, cleanUp })
     })
     writes.add(reply)
     void reply.finally(() => writes.delete(reply))
@@ -2979,7 +2984,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   // A reply already being written could recreate the dir after it is removed.
   await Promise.allSettled([...writes])
   const answered = new Set(done?.answered ?? [])
-  for (const [id, cleanUp] of untakenAnswers) if (!answered.has(id)) cleanUp()
+  for (const [, { cleanUp }] of [...untakenAnswers].filter(([id]) => !answered.has(id)).sort((a, b) => b[1].order - a[1].order)) cleanUp()
   untakenAnswers.clear()
   await $.process.run(['rm', '-rf', dir]).catch(() => {})
   let ended: Ended = job.cancelledBy

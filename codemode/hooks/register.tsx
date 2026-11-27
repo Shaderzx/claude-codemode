@@ -252,7 +252,7 @@ const isDedup = (t) => {
   const rows = String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
   return rows.length <= 2 && /^\s*1\t\S[^\n]* \[unchanged \d+L · lean-ctx read-dedup\]\s*$/.test(rows[0] || '')
 }
-async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied: deniedList, shell: shellPref, seen: seenList }) {
+async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied: deniedList, shell: shellPref }) {
   fs.mkdirSync(dir, { recursive: true })
   const started = booted
   let room = 1000000
@@ -341,7 +341,6 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const byIdent = new Map(all.map((t) => [ident(t.name), t.name]))
   const names = new Set(all.map((t) => t.name))
   const denied = new Set(deniedList || [])
-  const seen = new Set(seenList || [])
   const resolve = (name) => {
     const n = String(name)
     if (names.has(n)) return n
@@ -375,11 +374,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     return cwd ? norm(cwd.replace(/\/$/, '') + '/' + s.replace(/^\.\//, '')) : s
   }
   const noteRead = (tool, args, r) => {
-    const target = args && (typeof args.file_path === 'string' ? args.file_path : args.path)
-    if (r.ok && r.whole === true && typeof target === 'string') seen.add(abs(target))
-    if (r.ok && Array.isArray(r.readNow)) for (const f of r.readNow) seen.add(f)
     delete r.whole
-    delete r.readNow
     if (r.denied && r.alt) denied.add(tool)
     else if (r.ok) denied.delete(tool)
   }
@@ -642,7 +637,6 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let stubbed = 0
     let tried = new Set()
     let cap = 2000
-    let whole = false
     for (;;) {
       const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true, readId, ...(internal ? { internal: true } : {}) })
       const cutAtCap = r.ok && r.result && r.result.file && r.result.file.truncatedByTokenCap === true
@@ -657,7 +651,6 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
         if (/EISDIR/.test(String(r.error))) throw toolError('read: ' + file + ' is a folder, not a file', r)
         throw toolError('read: ' + r.error, r)
       }
-      if (r.whole === true) whole = true
       const t = String(r.text)
       if (isDedup(t)) {
         tried.add(limit)
@@ -678,13 +671,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       limit = Math.min(2000, limit * 2)
       stubbed = 0
     }
-    if (whole && !internal) seen.add(file)
     return rows.join('\n')
   }
   const UNREAD = /read it first|has not been read|modified since read|changed since (?:it was )?last read/i
   const MOVED = /modified since read|changed since (?:it was )?last read/i
   const wrote = (file, verb = 'wrote') => {
-    seen.add(file)
     return verb + ' ' + file
   }
   const timeToRetry = (tryStarted) => started + timeout - Date.now() > Math.max(500, Date.now() - tryStarted + 100)
@@ -2489,7 +2480,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const changedKeys = [...new Set([...patchOps.map((o) => patchKeys.get(o.path) as string), ...(wrote && writeKey !== undefined ? [writeKey] : [])])]
       for (const [key, version] of await Promise.all(changedKeys.map(async (key) => [key, await stillNamed(key)] as const))) afterVersions.set(key, version)
       const windowOf = (key: string): ChangeWindow => ({ sentAt, sentVersion: sentVersions.get(key) })
-      const readNow: string[] = []
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
       const freshKeys = new Set<string>()
       for (const o of patchOps) {
@@ -2497,7 +2487,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (created.has(key) || patchFresh.get(key) === true) {
           outdateEverywhere(key)
           freshKeys.add(key)
-          readNow.push(o.path)
         } else forgetEverywhere(key)
       }
       if (wrote && writeKey !== undefined) outdateEverywhere(writeKey)
@@ -2538,7 +2527,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (/read-dedup/.test(text)) deduped = true
       }
       const leanJob = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
-      return { ok: true, text, result, ...exit, ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}), ...(patchReads.length ? { [PATCH_READS]: patchReads } : {}), ...(isPatch || writeKey !== undefined ? { [UNDELIVERED]: changeUnsure } : {}) }
+      return { ok: true, text, result, ...exit, ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(receipt ? { [READ]: receipt } : {}), ...(patchReads.length ? { [PATCH_READS]: patchReads } : {}), ...(isPatch || writeKey !== undefined ? { [UNDELIVERED]: changeUnsure } : {}) }
     }
     const bad = tidy(tool, text)
     if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
@@ -2947,7 +2936,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (job.cancelledBy) throw new Error('codemode: stopped before its runner started')
     const child = $.process.spawn({
       argv: [node, '--permission', `--allow-fs-read=${dir}`, `--allow-fs-write=${dir}`, '-e', RUNNER],
-      input: JSON.stringify({ script, tools: all, dir, timeout, texts, cwd, home, denied: [...deniedTools.keys()], shell: shellPref, seen: [...readPaths] }),
+      input: JSON.stringify({ script, tools: all, dir, timeout, texts, cwd, home, denied: [...deniedTools.keys()], shell: shellPref }),
     })
     for await (const piece of child) {
       if (piece.stream === 'stderr') {

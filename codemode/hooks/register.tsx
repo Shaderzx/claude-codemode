@@ -2732,6 +2732,32 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     return lost.length ? namesNoFile(lost[0] as string) : undefined
   }
   const untakenAnswers = new Map<number, { order: number; cleanUp: () => void }>()
+  type ReadView = { had: boolean; value?: string; at?: number; chain?: { next: number; version?: string }; chainAt?: number }
+  const undoStacks = new Map<string, { before: ReadView }[]>()
+  const viewOf = (f: string): ReadView => ({ had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f), chain: job.progress.get(f), chainAt: job.progressAt.get(f) })
+  const putBack = (f: string, v: ReadView) => {
+    if (v.had) job.reads.set(f, v.value)
+    else job.reads.delete(f)
+    if (v.at === undefined) job.readAt.delete(f)
+    else job.readAt.set(f, v.at)
+    if (v.chain === undefined) job.progress.delete(f)
+    else job.progress.set(f, v.chain)
+    if (v.chainAt === undefined) job.progressAt.delete(f)
+    else job.progressAt.set(f, v.chainAt)
+  }
+  const booked = (f: string) => {
+    const stack = undoStacks.get(f) ?? []
+    undoStacks.set(f, stack)
+    const entry = { before: viewOf(f) }
+    stack.push(entry)
+    return () => {
+      const at = stack.indexOf(entry)
+      if (at < 0) return
+      if (at === stack.length - 1) putBack(f, entry.before)
+      else stack[at + 1]!.before = entry.before
+      stack.splice(at, 1)
+    }
+  }
   const startedCalls = new Set<number>()
   const respond = async (m: Request) => {
     const lost = await resolveClimbs(m)
@@ -2758,43 +2784,26 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const stamp = ++readClock
       noteSeen(f, stamp, receipt.version)
       for (const [id, started] of job.pages) if (started.real === f && (started.at ?? 0) < stamp && started.version !== receipt.version) job.pages.set(id, {})
-      const read = { had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f) }
-      const page = { value: job.progress.get(f), at: job.progressAt.get(f) }
-      const restorePage = () => {
-        if (page.value === undefined) job.progress.delete(f)
-        else job.progress.set(f, page.value)
-        if (page.at === undefined) job.progressAt.delete(f)
-        else job.progressAt.set(f, page.at)
-      }
       if (receipt.whole) {
+        undo = booked(f)
         job.progress.delete(f)
         job.progressAt.delete(f)
         job.reads.delete(f)
         job.reads.set(f, receipt.version)
         job.readAt.delete(f)
         job.readAt.set(f, stamp)
-        undo = () => {
-          if (job.readAt.get(f) !== stamp) return
-          if (read.had) job.reads.set(f, read.value)
-          else job.reads.delete(f)
-          if (read.at === undefined) job.readAt.delete(f)
-          else job.readAt.set(f, read.at)
-          if (!job.progress.has(f)) restorePage()
-        }
       } else if (receipt.next !== undefined) {
+        undo = booked(f)
         job.progress.delete(f)
         job.progress.set(f, { next: receipt.next, version: receipt.version })
         job.progressAt.delete(f)
         job.progressAt.set(f, stamp)
-        undo = () => {
-          if (job.progressAt.get(f) === stamp) restorePage()
-        }
       }
     }
     const patched = ((out[PATCH_READS as never] ?? []) as PatchRead[]).filter((r) => r.version !== undefined && !forgottenFor(r.key, r.sampledAt, r.version))
     if (patched.length) {
       const restores = patched.map(({ key: f, version }) => {
-        const before = { had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f), chain: job.progress.get(f), chainAt: job.progressAt.get(f) }
+        const restore = booked(f)
         const stamp = ++readClock
         job.progress.delete(f)
         job.progressAt.delete(f)
@@ -2803,16 +2812,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.readAt.delete(f)
         job.readAt.set(f, stamp)
         noteSeen(f, stamp, version)
-        return () => {
-          if (job.readAt.get(f) !== stamp) return
-          if (before.had) job.reads.set(f, before.value)
-          else job.reads.delete(f)
-          if (before.at === undefined) job.readAt.delete(f)
-          else job.readAt.set(f, before.at)
-          if (job.progress.has(f)) return
-          if (before.chain !== undefined) job.progress.set(f, before.chain)
-          if (before.chainAt !== undefined) job.progressAt.set(f, before.chainAt)
-        }
+        return restore
       })
       const undoReceipt = undo
       undo = () => {

@@ -5071,6 +5071,101 @@ test('A handed-back page chain never completes across a newer read another open 
   expect(readFileSync(f, 'utf8')).toBe(v.c);
 });
 
+test('Two untaken reads of one file in a killed run leave it unread', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'PRECIOUS\n');
+  const q = JSON.stringify(f);
+  const out = run({ engineForgets: true, steps: [
+    { script: '// @options: {"timeout_ms": 1000}\nvoid tools.Read({ file_path: ' + q + ' })\nvoid tools.Read({ file_path: ' + q + ' })\nwhile (true) {}' },
+    { untilQuiet: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('later refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('PRECIOUS\n');
+});
+
+test('A two-step patch of one file whose answer cannot be handed back makes the patcher read again', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'aaaa\nbbbb\n');
+  const q = JSON.stringify(f);
+  const script = 'await read(' + q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "AAAA_LONGER" }, { op: "replace_unique", path: ' + q + ', old_text: "bbbb", new_text: "BBBB_LONGER" }] })\ntry { await write(' + q + ', "CLOBBERED\\n"); return (r.ok ? "ok" : "failed") + " | writer wrote" } catch (e) { return (r.ok ? "ok" : "failed") + " | writer refused: " + e.message }';
+  const out = run({ tools: NO_BASH, failReplyAfter: { fail: 2, after: 2 }, steps: [{ script }] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('failed | writer refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('AAAA_LONGER\nBBBB_LONGER\n');
+});
+
+test('A patch whose bookkeeping is still running never takes over a newer read another run made meanwhile', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'aaaa\n');
+  const q = JSON.stringify(f);
+  const creates = Array.from({ length: 6 }, (_, i) => '{ op: "create", path: ' + JSON.stringify(join(dir, 'g' + i + '.txt')) + ', new_text: "g\\n" }').join(', ');
+  const out = run({ tools: NO_BASH, statDelayMs: 300, steps: [
+    { script: 'await read(' + q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "pppp" }, ' + creates + '] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: join(dir, 'g5.txt') },
+    { untilStatPending: true },
+    { script: 'await sh("printf qqqqqq > ' + f + '")\nawait read(' + q + ')\nreturn "r2 read newer"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await edit(' + q + ', "qqqqqq", "RRRRRR"); return "r3 edited" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 edited');
+  expect(readFileSync(f, 'utf8')).toBe('RRRRRR');
+});
+
+test('A Write left unawaited by a run that returned keeps its old read out of the session even once the in-flight records are full', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(f, 'aaaa\nbbbb\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const others = Array.from({ length: 1999 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const unread = [join(dir, 'u0.txt'), join(dir, 'u1.txt')];
+  for (const u of unread) writeFileSync(u, 'u\n');
+  const [applied, gate] = ['applied', 'gate'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, patchAnswerGate: { applied, gate }, steps: [
+    { script: 'await read(' + q + ')\nvoid call("Write", { file_path: ' + q + ', content: "XXXX\\nbbbb\\n" })\nawait waitFor(() => sh("test -f ' + applied + '"), { every: 20, timeout: 20000 })\nreturn "r1 returned early"' },
+    { touch: gate },
+    { untilQuiet: true },
+    { collect: true },
+    { script: '// @options: {"timeout_ms": 300000}\nfor (const o of ' + JSON.stringify(others) + ') await read(o)\nfor (const u of ' + JSON.stringify(unread) + ') await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: u, old_text: "u", new_text: "U" })\nawait sh("touch -r ' + ref + ' ' + f + '")\nconst w = await call("Write", { file_path: ' + q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r2 wrote" : "r2 refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('XXXX\nbbbb\n');
+});
+
+test('An unawaited patch answered after its run hung never blocks another run\'s read of the patched file', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'aaaa\n');
+  const q = JSON.stringify(f);
+  const [applied, gate] = ['applied', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, patchAnswerGate: { applied, gate }, steps: [
+    { script: 'await waitFor(() => sh("test -f ' + applied + '"), { every: 20, timeout: 20000 })\nawait read(' + q + ')\nreturn "r1 read patched"', keepTurn: true },
+    { script: '// @options: {"timeout_ms": 1500}\nawait read(' + q + ')\nvoid call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "bbbb" })\nwhile (true) {}', keepTurn: true },
+    { untilFile: applied },
+    { untilRunDone: 'r1' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { untilQuiet: true },
+    { collect: true },
+    { script: 'try { await edit(' + q + ', "bbbb", "cccc"); return "r3 edited" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 edited');
+  expect(readFileSync(f, 'utf8')).toBe('cccc\n');
+});
+
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {
   const dir = scratch();
   const f = join(dir, 'f.txt');

@@ -2758,7 +2758,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         if (await $.fs.write(file, JSON.stringify(slim)).then(() => true, () => false)) return true
         if (!sameText && (await $.fs.write(file, JSON.stringify({ ...base, droppedResult: true })).then(() => true, () => false))) return true
       }
-      const failed = m.kind !== 'call' ? { ok: false, error: `The answer to ${m.kind} is too large to pass to the script whole.` } : { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
+      const changedFile = m.kind === 'call' && out.ok === true && (tool === 'Write' || tool === 'Edit' || isPatchTool(tool))
+      const failed = m.kind !== 'call' ? { ok: false, error: `The answer to ${m.kind} is too large to pass to the script whole.` } : changedFile ? { ok: false, error: `The answer of ${tool} could not be handed to the script, but it may have changed the file; read the file again before changing it.` } : { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
       const t = m.kind === 'call' ? calls.get(tool) : undefined
       if (t && out.ok) {
         t.ok--

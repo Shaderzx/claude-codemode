@@ -6179,3 +6179,68 @@ test('A patch whose own record is dropped still outdates a subagent\'s read from
   expect(said).toContain('sub refused: ');
   expect(readFileSync(xfPath, 'utf8')).toBe('PREC\n');
 });
+
+const sightingOfNewer = (how: 'a later lines read in the same run' | 'a later lines read in another run' | 'a refused write') => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const lines = 'await tools.Read({ file_path: ' + v.q + ', offset: 2, limit: 2 })\n';
+  const refusedWrite = 'await write(' + v.q + ', "TRY1\\n").catch(() => undefined)\n';
+  const clobber = 'try { await write(' + v.q + ', "CLOBBERED\\n"); return "wrote over C" } catch (e) { return "refused: " + e.message }';
+  const steps = how === 'a later lines read in another run'
+    ? [{ script: 'await read(' + v.q + ')\nreturn "r1 read"' }, { script: v.toB + lines + 'return "r2 saw B"' }, { script: v.toC + clobber }]
+    : [{ script: 'await read(' + v.q + ')\n' + v.toB + (how === 'a refused write' ? refusedWrite : lines) + v.toC + clobber }];
+  const out = run({ engineForgets: true, steps });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+};
+
+test('Seeing a newer version through later lines of a file in the same run keeps a third version that matches the old read from being written over', () => sightingOfNewer('a later lines read in the same run'));
+test('Seeing a newer version through later lines of a file in another run keeps a third version that matches the old read from being written over', () => sightingOfNewer('a later lines read in another run'));
+test('A write refused because the file changed keeps a third version that matches the old read from being written over', () => sightingOfNewer('a refused write'));
+
+test('A forced write through a link that moves while it reads the old target writes the file the link now names', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'xxxx\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'yyyy\n');
+  const link = join(dir, 'L');
+  const [asked, gate] = ['asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, holdReplyContaining: { text: 'xxxx', asked, gate }, steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script: 'await read(' + JSON.stringify(join(dir, 'Y', 'f.txt')) + ')\nreturn "r0 read Y"' },
+    { script: 'try { await write(' + JSON.stringify(join(link, 'f.txt')) + ', "MINE\\n", { force: true }); return "r1 wrote" } catch (e) { return "r1 failed: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { relink: { from: link, to: join(dir, 'Y') } },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 wrote');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('MINE\n');
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('xxxx\n');
+});
+
+test('A subagent that finished must read its files again in a later turn, while the main agent keeps its own reads', () => {
+  const dir = scratch();
+  const [m, s] = ['m.txt', 's.txt'].map((n) => join(dir, n));
+  writeFileSync(m, 'main\n');
+  writeFileSync(s, 'sub\n');
+  const [qm, qs] = [m, s].map((p) => JSON.stringify(p));
+  const out = run({ steps: [
+    { script: 'await read(' + qm + ')\nreturn "main read"' },
+    { script: 'await read(' + qs + ')\nreturn "sub read"', agentId: 'a1' },
+    { agentEnd: 'a1' },
+    { script: 'const w = await call("Write", { file_path: ' + qs + ', content: "SUB_AGAIN\\n" })\nreturn w.ok ? "sub wrote" : "sub refused: " + w.error', agentId: 'a1' },
+    { agentEnd: 'a1' },
+    { script: 'const w = await call("Write", { file_path: ' + qm + ', content: "MAIN_WROTE\\n" })\nreturn w.ok ? "main wrote" : "main refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('sub refused: ');
+  expect(said).toContain('main wrote');
+  expect(readFileSync(s, 'utf8')).toBe('sub\n');
+  expect(readFileSync(m, 'utf8')).toBe('MAIN_WROTE\n');
+});

@@ -5166,6 +5166,20 @@ test('An unawaited patch answered after its run hung never blocks another run\'s
   expect(readFileSync(f, 'utf8')).toBe('cccc\n');
 });
 
+test('An older read whose answer failed and a newer untaken read of one file in a killed run leave it unread', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'PRECIOUS\n');
+  const q = JSON.stringify(f);
+  const out = run({ engineForgets: true, failReplyAfter: { fail: 1, after: 2 }, steps: [
+    { script: '// @options: {"timeout_ms": 1000}\nvoid tools.Read({ file_path: ' + q + ' })\nvoid tools.Read({ file_path: ' + q + ' })\nwhile (true) {}' },
+    { untilQuiet: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },
+  ] });
+  expect(readFileSync(f, 'utf8')).toBe('PRECIOUS\n');
+  expect(out.results.map((r) => r.text).join('\n')).not.toContain('later wrote');
+});
+
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {
   const dir = scratch();
   const f = join(dir, 'f.txt');

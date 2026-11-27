@@ -287,7 +287,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     finished = true
     try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
     if (failure && failure.length > 100000) failure = failure.slice(0, safeEnd(failure, 100000)) + '…'
-    send({ done: true, failure, kind, failedId, alongside: failedId ? alongsideOf(failedId) : 0 }, () => process.exit(0))
+    const alongsideIds = failedId ? alongsideOf(failedId) : []
+    send({ done: true, failure, kind, failedId, alongside: alongsideIds.length, alongsideIds, answered: answeredIds }, () => process.exit(0))
   }
   const timedOut = () => finish('timed out after ' + timeout + 'ms', 'timeout')
   const endTimedOut = () => {
@@ -302,12 +303,13 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   let seq = 0
   let tick = 0
   const timing = new Map()
+  const answeredIds = []
   const alongsideOf = (id) => {
     const f = timing.get(id)
-    if (!f) return 0
-    let n = 0
-    for (const [k, t] of timing) if (k !== id && (t.ok || t.answered === undefined) && t.sent < (f.answered ?? Infinity) && (t.answered ?? Infinity) > f.sent) n++
-    return n
+    if (!f) return []
+    const ids = []
+    for (const [k, t] of timing) if (k !== id && (t.ok || t.answered === undefined) && t.sent < (f.answered ?? Infinity) && (t.answered ?? Infinity) > f.sent) ids.push(k)
+    return ids
   }
   const req = async (kind, payload) => {
     const id = ++seq
@@ -324,6 +326,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       try { res = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { continue }
       try { fs.unlinkSync(file) } catch {}
       t.answered = ++tick
+      answeredIds.push(id)
       t.ok = !!(res && res.ok)
       if (res && typeof res === 'object') {
         if (res.resultIsText) res.result = res.text
@@ -1468,7 +1471,7 @@ const show = (v: unknown): string => {
 }
 
 type Request = { id: number; kind: 'call' | 'describe' | 'store' | 'load' | 'ask' | 'fresh' | 'cut' | 'jobs' | 'cancel'; payload: Record<string, unknown> }
-type Done = { done: true; failure?: string; kind?: string; failedId?: number; alongside?: number }
+type Done = { done: true; failure?: string; kind?: string; failedId?: number; alongside?: number; alongsideIds?: number[]; answered?: number[] }
 const KINDS = new Set(['call', 'describe', 'store', 'load', 'ask', 'fresh', 'cut', 'jobs', 'cancel'])
 
 // Keys `$.tool.call` reads beside a tool's arguments. `consent` would stand in
@@ -2181,9 +2184,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (tool === 'Skill' && !release)
       return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
     const since = skillSeq
+    const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const askedAt = readClock
     const forgottenSinceAsked = (real?: string) => forgottenFor(real, askedAt, readBefore)
-    const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
     const patchPath = (v: unknown) => (typeof v === 'string' && !!v.trim() && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
     const isPatch = isPatchTool(tool)
@@ -2302,6 +2305,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (counted) calls.set(tool, tally)
     tally.open++
     if (counted) open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
+    startedCalls.add(m.id as number)
     let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
       tally.open--
       tally.failed++
@@ -2404,6 +2408,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         tally.ok--
         tally.failed++
         tally.arg ??= firstArg(args)
+        if (isPatch || writeKey !== undefined) return { ok: false, error: `The answer of ${tool} is ${text.length} chars, too large to hand to the script, but it may have changed the file; read the file again before changing it.` }
         return { ok: false, error: `The result of ${tool} is ${text.length} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
       }
       const target = typeof args.file_path === 'string' ? args.file_path : undefined
@@ -2687,6 +2692,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     m.payload.args = args
     return lost.length ? namesNoFile(lost[0] as string) : undefined
   }
+  const untakenAnswers = new Map<number, () => void>()
+  const startedCalls = new Set<number>()
   const respond = async (m: Request) => {
     const lost = await resolveClimbs(m)
     let out: Record<string, unknown>
@@ -2769,10 +2776,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       await $.fs.write(file, JSON.stringify(failed)).catch(() => {})
       return false
     })()
-    const reply = delivered.then((ok) => {
-      if (ok) return
+    const cleanUp = () => {
       undo?.()
       ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
+    }
+    const reply = delivered.then((ok) => {
+      if (!ok) return cleanUp()
+      if (undo || out[UNDELIVERED as never]) untakenAnswers.set(m.id as number, cleanUp)
     })
     writes.add(reply)
     void reply.finally(() => writes.delete(reply))
@@ -2858,7 +2868,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         }
         if (m.done === true) {
           job.exited = true
-          done = { done: true, failure: m.failure, kind: m.kind, failedId: (m as { failedId?: number }).failedId, alongside: Number((m as { alongside?: unknown }).alongside) || 0 }
+          const idsOf = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is number => Number.isSafeInteger(x)) : undefined)
+          done = { done: true, failure: m.failure, kind: m.kind, failedId: (m as { failedId?: number }).failedId, alongside: Number((m as { alongside?: unknown }).alongside) || 0, alongsideIds: idsOf((m as { alongsideIds?: unknown }).alongsideIds), answered: idsOf((m as { answered?: unknown }).answered) }
           over = true
         } else if (m.out === 'log' && typeof m.text === 'string') {
           const t = take(m.text)
@@ -2904,6 +2915,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   watchdog.cancel()
   // A reply already being written could recreate the dir after it is removed.
   await Promise.allSettled([...writes])
+  const answered = new Set(done?.answered ?? [])
+  for (const [id, cleanUp] of untakenAnswers) if (!answered.has(id)) cleanUp()
+  untakenAnswers.clear()
   await $.process.run(['rm', '-rf', dir]).catch(() => {})
   let ended: Ended = job.cancelledBy
     ? { items, keys, logs, kind: job.stopKind ?? 'cancelled', failure: job.stopKind === 'aborted' ? 'stopped because its turn was interrupted; what it printed is above, and its tool calls may have run.' : `stopped by cancel() from ${job.cancelledBy}; what it printed is above, and its tool calls may have run.` }
@@ -2947,7 +2961,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
   const ran = echo ? '' : ledger(calls)
   if (ended.failure && ran) ended = { ...ended, failure: `${ended.failure}\nTool calls before the failure: ${ran}` }
   const now = Date.now()
-  const alongside = done?.failedId ? (done.alongside ?? 0) : 0
+  const alongside = !done?.failedId ? 0 : done.alongsideIds ? done.alongsideIds.filter((id) => startedCalls.has(id)).length : (done.alongside ?? 0)
   if (ended.failure && ended.kind === 'tool' && alongside > 0)
     ended = {
       ...ended,

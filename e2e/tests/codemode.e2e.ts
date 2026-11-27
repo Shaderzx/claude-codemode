@@ -4591,12 +4591,13 @@ const changeNeverReadBack = (how: 'patch create left unawaited' | 'Write left un
     { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },
   ] });
   const said = out.results.map((r) => r.text).join('\n');
-  expect(said).toContain('later refused: ');
-  expect(readFileSync(f, 'utf8')).toBe('PRECIOUS\n');
+  const runnerTookTheAnswer = how !== 'Write in a run killed after its timeout';
+  expect(said).toContain(runnerTookTheAnswer ? 'later wrote' : 'later refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(runnerTookTheAnswer ? 'CLOBBERED\n' : 'PRECIOUS\n');
 };
 
-test('A file a patch created while its run never took the answer is not counted as read', () => changeNeverReadBack('patch create left unawaited'));
-test('A file a Write made while its run never took the answer is not counted as read', () => changeNeverReadBack('Write left unawaited'));
+test('A file a run created by a patch it left unawaited counts as its own write once its runner took the answer', () => changeNeverReadBack('patch create left unawaited'));
+test('A file a run made by a Write it left unawaited counts as its own write once its runner took the answer', () => changeNeverReadBack('Write left unawaited'));
 test('A file a Write made in a run killed after its timeout is not counted as read', () => changeNeverReadBack('Write in a run killed after its timeout'));
 
 test('A read whose start races a patch landing still counts once it saw the patched file', () => {

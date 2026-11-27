@@ -4269,7 +4269,7 @@ test('A run whose older read another run\'s edit superseded never marks the file
 test('A run whose older read another run\'s edit superseded cannot write over an outside change', () => olderReadAfterAnotherRunsEdit('write'));
 test('A compaction never revives a run\'s older read that a newer read of the file superseded', () => olderReadAfterAnotherRunsEdit('write', true));
 
-const patchDuringAnotherRunsRead = (patch: 'one op' | 'batch failing on a later op' | 'batch failing in a wrapped error' | 'call lost after it applied' | 'native edit') => {
+const patchDuringAnotherRunsRead = (patch: 'one op' | 'batch failing on a later op' | 'batch failing in a wrapped error' | 'call lost after it applied' | 'native edit' | 'native edit lost after it applied') => {
   const dir = scratch();
   const big = join(dir, 'big.txt');
   const ref = join(dir, 'ref');
@@ -4282,12 +4282,13 @@ const patchDuringAnotherRunsRead = (patch: 'one op' | 'batch failing on a later 
   const step = '{ op: "replace_unique", path: ' + b + ', old_text: "A 0001", new_text: "C 0001" }';
   const batch = patch === 'batch failing on a later op' || patch === 'batch failing in a wrapped error';
   const args = batch ? '{ ops: [' + step + ', { op: "replace_unique", path: ' + b + ', old_text: "NOT THERE", new_text: "x" }] }' : step;
+  const native = patch === 'native edit' || patch === 'native edit lost after it applied';
   const succeeds = patch === 'one op' || patch === 'native edit';
   const own = succeeds ? '' : 'const mine = await write(' + b + ', "MINE\\n").then(() => " | patcher wrote", (e) => " | patcher refused: " + e.message)\n';
-  const change = patch === 'native edit' ? 'const r = await edit(' + b + ', "A 0001", "C 0001").then(() => ({ ok: true }), (e) => ({ ok: false, error: e.message }))' : 'const r = await call("mcp__lean-ctx__ctx_patch", ' + args + ')';
+  const change = native ? 'const r = await edit(' + b + ', "A 0001", "C 0001").then(() => ({ ok: true }), (e) => ({ ok: false, error: e.message }))' : 'const r = await call("mcp__lean-ctx__ctx_patch", ' + args + ')';
   const patcher = 'await tools.Read({ file_path: ' + b + ' })\n' + change + '\nawait sh("touch -r ' + ref + ' ' + big + '")\n' + own + 'return (r.ok ? "patched" : "patch failed: " + r.error)' + (own ? ' + mine' : '');
   const [asked, gate] = ['later-asked', 'gate'].map((n) => join(dir, n));
-  const out = run({ ...(patch === 'native edit' ? {} : { tools: NO_BASH }), holdLaterPages: { asked, gate }, ...(patch === 'call lost after it applied' ? { patchLostAfterApply: true } : {}), ...(patch === 'batch failing in a wrapped error' ? { patchErrorWrapped: true } : {}), steps: [
+  const out = run({ ...(native ? {} : { tools: NO_BASH }), holdLaterPages: { asked, gate }, ...(patch === 'call lost after it applied' || patch === 'native edit lost after it applied' ? { patchLostAfterApply: true } : {}), ...(patch === 'batch failing in a wrapped error' ? { patchErrorWrapped: true } : {}), steps: [
     { script: reader, keepTurn: true },
     { untilFile: asked },
     { script: patcher, keepTurn: true },
@@ -4309,6 +4310,30 @@ test('A batch patch that fails after changing the file still fails another run\'
 test('A patch whose call is lost after it changed the file still fails another run\'s open read() and its own read', () => patchDuringAnotherRunsRead('call lost after it applied'));
 test('A batch patch whose failure comes wrapped as a tool error still fails another run\'s open read() and its own read', () => patchDuringAnotherRunsRead('batch failing in a wrapped error'));
 test('An edit through the Edit tool fails another run\'s open read() so its write never undoes the edit', () => patchDuringAnotherRunsRead('native edit'));
+test('An Edit whose call is lost after it changed the file still fails another run\'s open read() and the writer\'s own read', () => patchDuringAnotherRunsRead('native edit lost after it applied'));
+
+test('A patch from a run that read the file leaves a page chain another run started after it landed intact', () => {
+  const dir = scratch();
+  const file = join(dir, 'f.txt');
+  writeFileSync(file, 'alpha\nline 0002\nline 0003\n');
+  const f = JSON.stringify(file);
+  const [applied, answer, started, go] = ['applied', 'answer', 'started', 'go'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, patchAnswerGate: { applied, gate: answer }, steps: [
+    { script: 'await tools.Read({ file_path: ' + f + ' })\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + f + ', old_text: "alpha", new_text: "patched" })\nreturn r.ok ? "patched" : r.error', keepTurn: true },
+    { untilFile: applied },
+    { script: 'await tools.Read({ file_path: ' + f + ', offset: 1, limit: 1 })\nawait sh("touch ' + started + '")\nawait waitFor(() => sh("test -f ' + go + '"), { every: 2000, timeout: 60000 })\nawait tools.Read({ file_path: ' + f + ', offset: 2 })\ntry { await edit(' + f + ', "patched", "edited"); return "edited" } catch (e) { return "failed: " + e.message }', keepTurn: true },
+    { untilFile: started },
+    { touch: answer },
+    { untilQuiet: true },
+    { touch: go },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('patched');
+  expect(said).toContain('edited');
+  expect(readFileSync(file, 'utf8').startsWith('edited')).toBe(true);
+});
 
 const lateOldSessionPatch = (reader: 'later run' | 'paged read') => {
   const dir = scratch();
@@ -4447,10 +4472,11 @@ test('A Write whose answer cannot be handed to the script makes the writer read 
   utimesSync(f, 1_700_000_000, 1_700_000_000);
   utimesSync(ref, 1_700_000_000, 1_700_000_000);
   const q = JSON.stringify(f);
-  const script = 'await read(' + q + ')\nconst r = await call("Write", { file_path: ' + q + ', content: "bbbb\\n" })\nif (r.ok) return "wrote"\nawait sh("touch -r ' + ref + ' ' + f + '")\ntry { await write(' + q + ', "cccc\\n"); return "failed | writer wrote again" } catch (e) { return "failed | writer refused: " + e.message }';
+  const script = 'await read(' + q + ')\nconst r = await call("Write", { file_path: ' + q + ', content: "bbbb\\n" })\nif (r.ok) return "wrote"\nawait sh("touch -r ' + ref + ' ' + f + '")\ntry { await write(' + q + ', "cccc\\n"); return "failed: " + r.error + " | writer wrote again" } catch (e) { return "failed: " + r.error + " | writer refused: " + e.message }';
   const out = run({ engineForgets: true, failReplyAfter: { fail: 2, after: 2 }, steps: [{ script }] });
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('writer refused: ');
+  expect(said).toContain('may have changed the file');
   expect(readFileSync(f, 'utf8')).toBe('bbbb\n');
 });
 

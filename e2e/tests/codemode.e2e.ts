@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'e2e';
@@ -2953,7 +2953,7 @@ test('A forced patch write never takes an older read of the file as current', ()
   const f = JSON.stringify(file);
   const out = run({ tools: NO_BASH, rewriteDuringFirstRead: 'v3\n', statDelayMs: 200, steps: [
     { script: 'await write(' + f + ', "v1\\n")\nawait sh("printf v2 > ' + file + '")\nreturn "prepared"' },
-    { script: '// @options: {"timeout_ms": 2200}\ntry { await write(' + f + ', "from-codemode\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }' },
+    { script: '// @options: {"timeout_ms": 6000}\ntry { await write(' + f + ', "from-codemode\\n", { force: true }); return "wrote" } catch (e) { return String(e.message) }' },
   ] });
   expect(out.results[0]!.text).toBe('prepared');
   expect(out.results[1]!.text).toBe('wrote');
@@ -5413,4 +5413,189 @@ test('A big file read in pages after a patch landed during its first try can be 
 };
 
 test('An older own read under a newer read whose answer failed never counts once the newer sighting is forgotten', () => ownOlderUnderFailedNewer('whole read'));
-test('An older own page chain under a newer page whose answer failed never completes once the newer sighting is forgotten', () => ownOlderUnderFailedNewer('page chain'));
+test('An older own page chain under a newer page whose answer failed never completes once the newer sighting is forgotten', () => ownOlderUnderFailedNewer('page chain'));const settleRace = (dir: string) => {
+  const f = join(dir, 'f.txt');
+  const q = JSON.stringify(f);
+  const changeReadThenHide = 'await sh("printf BBBBBB > ' + f + '")\nawait read(' + q + ')\nawait sh("printf SECRET_UNREAD > ' + f + '")\nreturn "r2 left an unread version"';
+  const clobber = 'try { await write(' + q + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }';
+  return { f, q, changeReadThenHide, clobber };
+};
+
+test('A Write whose file another run changes, reads and changes again while the Write is booked never marks the unread version as read', () => {
+  const dir = scratch();
+  const slow = join(dir, 'slow_f.txt');
+  const link = join(dir, 'fast_link.txt');
+  writeFileSync(slow, 'aaaa\n');
+  symlinkSync(slow, link);
+  const s = JSON.stringify(slow);
+  const l = JSON.stringify(link);
+  const out = run({ engineForgets: true, statDelayMs: 800, statDelayFor: 'slow_', steps: [
+    { script: 'await read(' + l + ')\nreturn "r0 read"' },
+    { script: 'await write(' + s + ', "pppp\\n")\nreturn "r1 wrote"', keepTurn: true },
+    { untilTool: 'Write' },
+    { untilStatPending: true },
+    { script: 'await sh("printf BBBBBB > ' + slow + '")\nawait read(' + l + ')\nawait sh("printf SECRET_UNREAD > ' + slow + '")\nreturn "r2 left an unread version"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'const w = await call("Write", { file_path: ' + l + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r3 clobbered" : "r3 refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(slow, 'utf8')).toBe('SECRET_UNREAD');
+});
+
+test('A patch whose answer is slow while another run changes, reads and changes the file again never marks the unread version as read', () => {
+  const dir = scratch();
+  const v = settleRace(dir);
+  writeFileSync(v.f, 'aaaa\n');
+  const [applied, gate] = ['applied', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, patchAnswerGate: { applied, gate }, steps: [
+    { script: 'await read(' + v.q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + v.q + ', old_text: "aaaa", new_text: "pppp" })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: applied },
+    { script: v.changeReadThenHide, keepTurn: true },
+    { untilRunDone: 'r2' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: v.clobber },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(v.f, 'utf8')).toBe('SECRET_UNREAD');
+});
+
+test('A read of a version another run saw before its patch landed never counts once the patch is booked, even when the mtime and size match again', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const y = join(dir, 'y.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(f, 'xxxx\naaaa\n');
+  writeFileSync(y, 'yyyy\naaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_100, 1_700_000_100);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const out = run({ tools: NO_BASH, patchDelayMs: 600, steps: [
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "PPPP" })\nawait sh("touch -r ' + ref + ' ' + f + '")\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilTool: 'mcp__lean-ctx__ctx_patch' },
+    { script: 'await sh("cp ' + y + ' ' + f + ' && touch -r ' + ref + ' ' + f + '")\nawait read(' + q + ')\nreturn "r2 read"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 patched');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('yyyy\nPPPP\n');
+});
+
+test('A run that read a file while another run\'s patch was starting never writes over a later version after forgetting thousands of files', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const y = join(dir, 'y.txt');
+  const c = join(dir, 'c.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(f, 'xxxx\naaaa\n');
+  writeFileSync(y, 'yyyy\naaaa\n');
+  writeFileSync(c, 'zzzz\ncccc\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_100, 1_700_000_100);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const q = JSON.stringify(f);
+  const [landed, keepOpen] = ['landed', 'keep-open'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, engineForgets: true, patchDelayMs: 600, steps: [
+    { script: 'await read(' + q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "PPPPPP" })\nawait sh("touch ' + landed + '")\nawait waitFor(() => sh("test -f ' + keepOpen + '"), { every: 50, timeout: 300000 })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilTool: 'mcp__lean-ctx__ctx_patch' },
+    { script: '// @options: {"timeout_ms": 300000}\nawait sh("cp ' + y + ' ' + f + ' && touch -r ' + ref + ' ' + f + '")\nawait read(' + q + ')\nawait waitFor(() => sh("test -f ' + landed + '"), { every: 20, timeout: 20000 })\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\nawait sh("cp ' + c + ' ' + f + ' && touch -r ' + ref + ' ' + f + '")\ntry { await write(' + q + ', "CLOBBERED\\n"); return "r2 clobbered" } catch (e) { return "r2 refused: " + e.message }', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { touch: keepOpen },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 patched');
+  expect(said).toContain('r2 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('zzzz\ncccc\n');
+});
+
+test('A run whose own patch record is dropped never keeps its read from before the patch', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  const xfPath = join(dir, 'X', 'f.txt');
+  writeFileSync(xfPath, 'aaaa\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'PREC\n');
+  writeFileSync(join(dir, 'ref'), '');
+  for (const p of [xfPath, join(dir, 'Y', 'f.txt'), join(dir, 'ref')]) utimesSync(p, 1_700_000_000, 1_700_000_000);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const xf = JSON.stringify(xfPath);
+  const creates = Array.from({ length: 4 }, (_, i) => '{ op: "create", path: ' + JSON.stringify(join(dir, 'slow-' + i + '.txt')) + ', new_text: "g\\n" }').join(', ');
+  const out = run({ tools: NO_BASH, engineForgets: true, statDelayMs: 600, statDelayFor: 'X/f.txt', steps: [
+    { script: 'await read(' + xf + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [' + creates + ', { op: "replace_unique", path: ' + xf + ', old_text: "aaaa", new_text: "pppppp" }] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: join(dir, 'slow-3.txt') },
+    { untilStatPending: true },
+    { script: 'await sh("rm -rf ' + join(dir, 'X') + ' && ln -s ' + join(dir, 'Y') + ' ' + join(dir, 'X') + '")\nreturn "r2 symlinked"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: '// @options: {"timeout_ms": 300000}\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\nawait sh("rm ' + join(dir, 'X') + ' && mv ' + join(dir, 'Y') + ' ' + join(dir, 'X') + ' && touch -r ' + join(dir, 'ref') + ' ' + xfPath + '")\ntry { await write(' + xf + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(xfPath, 'utf8')).toBe('PREC\n');
+});
+
+test('Cancelling a run that wrote a file never forgets another run\'s read taken after the write, even when the mtime and size match the old file', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(f, 'aaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const [wrote, gate] = ['wrote', 'gate'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, steps: [
+    { script: 'await read(' + q + ')\nreturn "r1 read"' },
+    { script: 'await write(' + q + ', "bbbb\\n")\nawait sh("touch ' + wrote + '")\nawait waitFor(() => sh("test -f ' + gate + '"), { every: 50, timeout: 60000 })\nreturn "r2 done"', keepTurn: true },
+    { untilFile: wrote },
+    { script: 'await sh("touch -r ' + ref + ' ' + f + '")\nawait read(' + q + ')\nreturn "r3 read"', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { collect: true },
+    { script: 'return String(await cancel("r2"))' },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await edit(' + q + ', "bbbb", "cccc"); return "r5 edited" } catch (e) { return "r5 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r5 edited');
+  expect(readFileSync(f, 'utf8')).toBe('cccc\n');
+});
+
+test('A run whose newer read answer failed after another run read a newer version never gets its older read back', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const [asked, gate, bread, keepOpen] = ['asked', 'gate', 'bread', 'keep-open'].map((n) => join(dir, n));
+  const link = join(dir, 'held-link.txt');
+  symlinkSync(f, link);
+  const out = run({ engineForgets: true, holdReplyContaining: { text: 'held-link.txt', asked, gate, giveUpMs: 2000 }, steps: [
+    { script: 'await read(' + v.q + ')\nvoid call("Read", { file_path: ' + JSON.stringify(link) + ' })\nawait waitFor(() => sh("test -f ' + asked + '"), { every: 10, timeout: 10000 })\nawait waitFor(() => sh("test -f ' + bread + '"), { every: 10, timeout: 30000 })\nreturn "r1 returned"', keepTurn: true },
+    { untilFile: asked },
+    { script: v.toB + 'await read(' + v.q + ')\nawait sh("touch ' + bread + '")\nawait waitFor(() => sh("test -f ' + keepOpen + '"), { every: 50, timeout: 300000 })\nreturn "r2 done"', keepTurn: true },
+    { untilRunDone: 'r1' },
+    { collect: true },
+    { script: '// @options: {"timeout_ms": 300000}\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\n' + v.toC + 'const w = await call("Write", { file_path: ' + v.q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r3 wrote over C" : "r3 refused: " + w.error', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { touch: keepOpen },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});

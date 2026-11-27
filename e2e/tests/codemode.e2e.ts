@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; untilReadlink?: string; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { changeEveryRead?: boolean; readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; patchDelayMs?: number; patchLostAfterApply?: boolean; patchErrorWrapped?: boolean; padPatchReply?: number; patchAnswerGate?: { applied: string; gate: string }; existsGapMs?: number; lastPartMayBeMissing?: boolean; holdLaterPages?: { asked: string; gate: string }; holdReplyContaining?: { text: string; asked: string; gate: string }; statDelayMs?: number; statDelayFor?: string; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { changeEveryRead?: boolean; readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; patchDelayMs?: number; patchLostAfterApply?: boolean; patchErrorWrapped?: boolean; padPatchReply?: number; patchAnswerGate?: { applied: string; gate: string }; existsGapMs?: number; lastPartMayBeMissing?: boolean; holdLaterPages?: { asked: string; gate: string }; holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }; statDelayMs?: number; statDelayFor?: string; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; clockMarks?: number[]; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
@@ -5230,6 +5230,38 @@ test('A Write whose folder becomes a symlink while it is booked never marks the 
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('r3 refused: ');
   expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('PRECIOUS\n');
+});
+
+test('A first line read after an untaken whole read never leaves the whole file counted as read', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, Array.from({ length: 50 }, (_, i) => 'PRECIOUS_' + i).join('\n') + '\n');
+  const q = JSON.stringify(f);
+  const [asked, gate] = ['asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, holdReplyContaining: { text: 'PRECIOUS_49', asked, gate, giveUpMs: 2000 }, steps: [
+    { script: 'void call("Read", { file_path: ' + q + ' })\nawait waitFor(() => sh("test -f ' + asked + '"), { every: 10, timeout: 10000 })\nawait tools.Read({ file_path: ' + q + ', offset: 1, limit: 1 })\nreturn "only line 1"', keepTurn: true },
+    { untilFile: asked },
+    { untilRunsDone: true },
+    { untilQuiet: true },
+    { collect: true },
+    { script: 'const w = await call("Write", { file_path: ' + q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "later wrote" : "later refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('later refused: ');
+  expect(readFileSync(f, 'utf8').startsWith('PRECIOUS_0')).toBe(true);
+});
+
+test('A run that paged a newer version of a file it read whole never writes over a third version after forgetting thousands of files', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const script = '// @options: {"timeout_ms": 300000}\nawait read(' + v.q + ')\n' + v.toB + 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\n' + v.toC + 'const w = await call("Write", { file_path: ' + v.q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "wrote over C" : "refused: " + w.error';
+  const out = run({ engineForgets: true, steps: [{ script }] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
 });
 
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {

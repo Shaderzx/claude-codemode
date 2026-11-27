@@ -17,7 +17,7 @@ type Case = {
   existsGapMs?: number
   lastPartMayBeMissing?: boolean
   holdLaterPages?: { asked: string; gate: string }
-  holdReplyContaining?: { text: string; asked: string; gate: string }
+  holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }
   statDelayMs?: number
   statDelayFor?: string
   hangListMs?: number
@@ -568,7 +568,7 @@ const $ = {
       if (holding && !replyHeld && p.endsWith('.json') && t.includes(holding.text)) {
         replyHeld = true
         writeFileSync(holding.asked, '')
-        await until(() => existsSync(holding.gate), 30_000, holding.gate + ' appearing')
+        await until(() => existsSync(holding.gate), holding.giveUpMs ?? 30_000, holding.gate + ' appearing')
       }
       inflight++
       try {

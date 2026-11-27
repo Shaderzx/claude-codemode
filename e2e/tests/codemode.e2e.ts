@@ -6031,13 +6031,14 @@ test('A big Read whose link moves before it pages never stitches pages across a 
   utimesSync(ref, 1_700_000_000, 1_700_000_000);
   symlinkSync(big1, link);
   const b2 = JSON.stringify(big2);
-  const creates = (from: number) => Array.from({ length: 500 }, (_, i) => '{ op: "create", path: ' + JSON.stringify(join(dir, 'n' + (from + i) + '.txt')) + ', new_text: "n\\n" }').join(', ');
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
   const out = run({ tools: NO_BASH, readDelayMs: 400, holdLaterPages: { asked, gate }, steps: [
     { script: 'const r = await call("Read", { file_path: ' + JSON.stringify(link) + ' })\nreturn r.ok ? "r1 ok torn=" + (String(r.text).includes("alpha 00000") && String(r.text).includes("PATCH 05999")) : "r1 refused: " + r.error', keepTurn: true },
     { untilTool: 'Read' },
     { relink: { from: link, to: big2 } },
     { untilFile: asked },
-    { script: '// @options: {"timeout_ms": 300000}\nconst p = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + b2 + ', old_text: "alpha 00000", new_text: "PATCH 00000" }, { op: "replace_unique", path: ' + b2 + ', old_text: "alpha 05999", new_text: "PATCH 05999" }] })\nawait sh("touch -r ' + ref + ' ' + big2 + '")\n' + [0, 500, 1000, 1500, 2000].map((f) => 'await call("mcp__lean-ctx__ctx_patch", { ops: [' + creates(f) + '] })\n').join('') + 'return p.ok ? "r2 patched and created" : p.error', keepTurn: true },
+    { script: '// @options: {"timeout_ms": 300000}\nconst p = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + b2 + ', old_text: "alpha 00000", new_text: "PATCH 00000" }, { op: "replace_unique", path: ' + b2 + ', old_text: "alpha 05999", new_text: "PATCH 05999" }] })\nawait sh("touch -r ' + ref + ' ' + big2 + '")\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\nreturn p.ok ? "r2 patched and read 2000" : p.error', keepTurn: true },
     { untilRunDone: 'r2' },
     { touch: gate },
     { untilRunsDone: true },

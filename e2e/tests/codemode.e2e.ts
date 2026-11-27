@@ -4448,15 +4448,14 @@ const changeLandingAfterItsRunEnded = (how: 'patch beside a failing call' | 'cre
     ? 'await read(' + q + ')\nawait Promise.all([tools.mcp__lean_ctx__ctx_patch({ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "AAAA" }), tools.mcp__lean_ctx__ctx_shell(' + failOnceApplied + ')])'
     : how === 'write beside a failing call'
       ? 'await read(' + q + ')\nawait Promise.all([tools.Write({ file_path: ' + q + ', content: "AAAA\\nbeta\\n" }), tools.Bash(' + failOnceApplied + ')])'
-      : '// @options: {"timeout_ms": 1000}\nwhile (deadline() > 250) {}\nawait call("mcp__lean-ctx__ctx_patch", { op: "create", path: ' + q + ', new_text: "PRECIOUS\\n" })';
-  const beside = how !== 'create in a run that timed out';
-  const out = run({ ...(how === 'write beside a failing call' ? { engineForgets: true } : { tools: NO_BASH }), ...(beside ? { patchAnswerGate: { applied, gate: answer } } : { patchDelayMs: 600 }), steps: [
+      : '// @options: {"timeout_ms": 1000}\nawait call("mcp__lean-ctx__ctx_patch", { op: "create", path: ' + q + ', new_text: "PRECIOUS\\n" })';
+  const out = run({ ...(how === 'write beside a failing call' ? { engineForgets: true } : { tools: NO_BASH }), patchAnswerGate: { applied, gate: answer }, steps: [
     { script: first, keepTurn: true },
     { untilRunsDone: true },
-    ...(beside ? [{ touch: answer }] : []),
+    { touch: answer },
     { untilQuiet: true },
     { collect: true },
-    { script: (how === 'write beside a failing call' ? 'await sh("touch -r ' + ref + ' ' + f + '")\n' : '') + 'try { await write(' + q + ', "ZZZZ\\nbeta\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },
+    { script: (how !== 'create in a run that timed out' ? 'await sh("touch -r ' + ref + ' ' + f + '")\n' : '') + 'try { await write(' + q + ', "ZZZZ\\nbeta\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },
   ] });
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('later refused: ');

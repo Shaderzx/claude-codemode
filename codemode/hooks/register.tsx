@@ -1746,7 +1746,7 @@ const keepForgotten = (real: string, f: Forgotten) => {
 const noteSeen = (real: string, at: number, version: string | undefined) => {
   if (version === undefined) return
   const f = forgottenEntry(real)
-  keepForgotten(real, { ...f, seen: [...f.seen, { at, version }].slice(-16) })
+  keepForgotten(real, { ...f, seen: [...f.seen.filter((e) => e.version !== version), { at, version }].slice(-16) })
 }
 const chainIsCurrent = (chain: { version?: string } | undefined, chainAt: number, newer: [number | undefined, string | undefined][]) =>
   chain !== undefined && newer.every(([at, version]) => (at ?? 0) <= chainAt || version === chain.version)
@@ -1830,9 +1830,14 @@ const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionRead
 const outdateOlderViews = (j: Job, p: string, v: string | undefined, at: number) => {
   const olderAndDiffering = (stamp: number | undefined, version: string | undefined) => (stamp ?? 0) < at && version !== v
   if (readPaths.has(p) && olderAndDiffering(versionAt.get(p), readVersions.get(p))) readVersions.delete(p)
+  if (readProgress.has(p) && olderAndDiffering(progressAt.get(p), readProgress.get(p)?.version)) readProgress.delete(p)
   for (const other of jobsById.values()) {
     if (other === j || other.gen !== sessionGen) continue
     if (other.reads.has(p) && olderAndDiffering(other.readAt.get(p), other.reads.get(p))) other.reads.set(p, undefined)
+    if (other.progress.has(p) && olderAndDiffering(other.progressAt.get(p), other.progress.get(p)?.version)) {
+      other.progress.delete(p)
+      other.progressAt.delete(p)
+    }
     for (const [id, started] of other.pages) if (started.real === p && olderAndDiffering(started.at, started.version)) other.pages.set(id, {})
   }
 }
@@ -2206,11 +2211,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const liveChains = (k: string) => {
       const own = job.progress.get(k)
       const session = readProgress.get(k)
-      const ownAt = job.progressAt.get(k) ?? 0
-      const sessionAt = progressAt.get(k) ?? 0
+      const ownAt = own ? job.progressAt.get(k) : undefined
+      const sessionAt = session ? progressAt.get(k) : undefined
       return [
-        chainIsCurrent(own, ownAt, [[readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)], [sessionAt, session?.version]]) ? own : undefined,
-        chainIsCurrent(session, sessionAt, [[job.reads.has(k) ? job.readAt.get(k) : undefined, job.reads.get(k)], [ownAt, own?.version], [readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)]]) ? session : undefined,
+        chainIsCurrent(own, ownAt ?? 0, [[readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)], [sessionAt, session?.version]]) ? own : undefined,
+        chainIsCurrent(session, sessionAt ?? 0, [[job.reads.has(k) ? job.readAt.get(k) : undefined, job.reads.get(k)], [ownAt, own?.version], [readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)]]) ? session : undefined,
       ]
     }
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
@@ -2299,6 +2304,11 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (sawBeforeSent(k, readProgress.get(k)?.version, progressAt.get(k))) readProgress.delete(k)
       stampForgotten(k)
     }
+    const forgetOwnView = (k: string) => {
+      if (job.reads.has(k)) job.reads.set(k, undefined)
+      job.progress.delete(k)
+      job.progressAt.delete(k)
+    }
     const patchUnsure = (appliedBefore = Infinity) => {
       const opPaths = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).slice(0, appliedBefore).map((o) => patchPath(o?.path ?? args.path)) : appliedBefore > 0 ? [patchPath(args.path)] : []
       const changed = new Set(opPaths.map((v) => patchKeys.get(v ?? '') ?? (v ? [...patchKeys.values()].find((k) => k === v) : undefined)).filter((k): k is string => !!k))
@@ -2308,13 +2318,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
           continue
         }
         outdateEverywhere(key)
-        if (job.reads.has(key)) job.reads.set(key, undefined)
+        forgetOwnView(key)
       }
     }
     const writeUnsure = () => {
       if (writeKey === undefined) return
       outdateEverywhere(writeKey)
-      if (job.reads.has(writeKey)) job.reads.set(writeKey, undefined)
+      forgetOwnView(writeKey)
     }
     const changeUnsure = () => {
       if (isPatch) patchUnsure()

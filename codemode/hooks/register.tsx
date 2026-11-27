@@ -1719,7 +1719,15 @@ const handedSpills = new Map<string, number>()
 const ownSpills = new Set<string>()
 const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
-const forgottenAt = new Map<string, number>()
+const forgottenAt = new Map<string, { before: number; pending: { settledAt: number; sentVersion?: string }[] }>()
+const forgottenFor = (real: string | undefined, askedAt: number, readBefore: string | undefined) => {
+  const f = real === undefined ? undefined : forgottenAt.get(real)
+  return !!f && (askedAt < f.before || f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || readBefore === e.sentVersion)))
+}
+const forgottenStamp = (real: string) => {
+  const f = forgottenAt.get(real)
+  return f?.pending.at(-1)?.settledAt ?? f?.before ?? 0
+}
 let readClock = 0
 let jobSeq = 0
 let mainTurn = false
@@ -1797,13 +1805,26 @@ const readVersionFor = (j: Job, k: string) => {
   return sessionReadIsNewer(j, k) && readVersions.get(k) !== own ? undefined : own
 }
 const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionReadIsNewer(j, k) ? j.reads.get(k) : readPaths.has(k) ? readVersions.get(k) : undefined)
+const outdateOlderViews = (j: Job, p: string, v: string | undefined, at: number) => {
+  const olderAndDiffering = (stamp: number | undefined, version: string | undefined) => (stamp ?? 0) < at && version !== v
+  if (readPaths.has(p) && olderAndDiffering(versionAt.get(p), readVersions.get(p))) readVersions.delete(p)
+  if (readProgress.has(p) && olderAndDiffering(progressAt.get(p), readProgress.get(p)?.version)) readProgress.delete(p)
+  for (const other of jobsById.values()) {
+    if (other === j || other.gen !== sessionGen) continue
+    if (other.reads.has(p) && olderAndDiffering(other.readAt.get(p), other.reads.get(p))) other.reads.set(p, undefined)
+    if (other.progress.has(p) && olderAndDiffering(other.progressAt.get(p), other.progress.get(p)?.version)) {
+      other.progress.delete(p)
+      other.progressAt.delete(p)
+    }
+    for (const [id, started] of other.pages) if (started.real === p && olderAndDiffering(started.at, started.version)) other.pages.set(id, {})
+  }
+}
 const promoteReads = (j: Job) => {
   if (j.stopped || j.gen !== sessionGen) return
   for (const [p, v] of j.reads) {
     const at = j.readAt.get(p) ?? 0
     if (at < (versionAt.get(p) ?? 0)) continue
-    for (const other of jobsById.values())
-      if (other !== j && other.gen === sessionGen && other.reads.has(p) && (other.readAt.get(p) ?? 0) < at && other.reads.get(p) !== v) other.reads.set(p, undefined)
+    outdateOlderViews(j, p, v, at)
     readPaths.delete(p)
     readPaths.add(p)
     versionAt.delete(p)
@@ -1814,6 +1835,7 @@ const promoteReads = (j: Job) => {
   for (const [p, chain] of j.progress) {
     const at = j.progressAt.get(p) ?? 0
     if (at < (progressAt.get(p) ?? 0)) continue
+    outdateOlderViews(j, p, chain.version, at)
     progressAt.delete(p)
     progressAt.set(p, at)
     readProgress.delete(p)
@@ -2160,7 +2182,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
     const since = skillSeq
     const askedAt = readClock
-    const forgottenSinceAsked = (real?: string) => real !== undefined && (forgottenAt.get(real) ?? 0) > askedAt
+    const forgottenSinceAsked = (real?: string) => forgottenFor(real, askedAt, readBefore)
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
     const patchPath = (v: unknown) => (typeof v === 'string' && !!v.trim() && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
@@ -2193,15 +2215,15 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         patchFresh.set(key, was !== undefined && was === now)
       }
     if (writeKey !== undefined) sentVersions.set(writeKey, writeVersion)
-    const sentAt = readClock
+    const sentAt = ++readClock
     let settledAt = sentAt
-    const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) => at === undefined || at <= sentAt || version === undefined || version === sentVersions.get(k)
-    const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt + 0.5)
+    const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) => at === undefined || at < sentAt || version === undefined || version === sentVersions.get(k)
+    const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
     const stampForgotten = (k: string) => {
-      const at = Math.max(forgottenAt.get(k) ?? 0, settledAt)
+      const prev = forgottenAt.get(k)
       forgottenAt.delete(k)
-      forgottenAt.set(k, at)
-      dropOldest(forgottenAt.keys(), 2000, (f) => forgottenAt.get(f) ?? 0, (f) => forgottenAt.delete(f), forgottenAt.size)
+      forgottenAt.set(k, { before: Math.max(prev?.before ?? 0, sentAt), pending: [...(prev?.pending ?? []), { settledAt, sentVersion: sentVersions.get(k) }].slice(-16) })
+      dropOldest(forgottenAt.keys(), 2000, forgottenStamp, (f) => forgottenAt.delete(f), forgottenAt.size)
     }
     const resetOpenPages = (j: Job, k: string) => {
       for (const [id, started] of j.pages) if (started.real === k && sawBeforeSent(k, started.version, started.at)) j.pages.set(id, {})
@@ -2505,7 +2527,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const version = await versionOf(file)
     const real = await realOf(file)
     const pagingFrom = readClock
-    const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real || (forgottenAt.get(real) ?? 0) > pagingFrom
+    const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real || forgottenFor(real, pagingFrom, version)
     for (let guard = 0; guard < 10_000; guard++) {
       if (over) return undefined
       const r = late() ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
@@ -2681,7 +2703,10 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     open.delete(m.id)
     // The child is gone after a timeout; writing would recreate its run dir.
-    if (over) return
+    if (over) {
+      ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
+      return
+    }
     const file = `${dir}/${m.id}.json`
     const receipt = out[READ as never] as Receipt | undefined
     let undo: (() => void) | undefined

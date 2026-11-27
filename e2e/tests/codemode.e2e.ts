@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; untilReadlink?: string; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { changeEveryRead?: boolean; readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; patchDelayMs?: number; patchLostAfterApply?: boolean; patchErrorWrapped?: boolean; padPatchReply?: number; patchAnswerGate?: { applied: string; gate: string }; existsGapMs?: number; lastPartMayBeMissing?: boolean; holdLaterPages?: { asked: string; gate: string }; holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }; holdRealpath?: { match: string; afterTool: string; asked: string; gate: string }; statDelayMs?: number; statDelayFor?: string; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { changeEveryRead?: boolean; readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; patchDelayMs?: number; patchLostAfterApply?: boolean; patchErrorWrapped?: boolean; padPatchReply?: number; patchAnswerGate?: { applied: string; gate: string }; existsGapMs?: number; lastPartMayBeMissing?: boolean; holdLaterPages?: { asked: string; gate: string }; holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }; holdRealpath?: { match: string; afterTool: string; asked: string; gate: string }; denyWritePaths?: string[]; statDelayMs?: number; statDelayFor?: string; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; clockMarks?: number[]; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
@@ -5759,4 +5759,97 @@ test('A Write whose file another run sets back to the old mtime and size, reads 
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('r3 refused: ');
   expect(readFileSync(slow, 'utf8')).toBe('SECRET_UNREAD');
+});test('A batch patch that fails partway keeps the files its failed and unreached ops name counted as read', () => {
+  const dir = scratch();
+  const [a, b, c] = ['a.txt', 'b.txt', 'c.txt'].map((n) => join(dir, n));
+  writeFileSync(a, 'oldA\n');
+  writeFileSync(b, 'oldB\n');
+  writeFileSync(c, 'oldC\n');
+  const [qa, qb, qc] = [a, b, c].map((p) => JSON.stringify(p));
+  const out = run({ tools: NO_BASH, steps: [
+    { script: 'await read(' + qa + ')\nawait read(' + qb + ')\nawait read(' + qc + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + qa + ', old_text: "oldA", new_text: "newA" }, { op: "replace_unique", path: ' + qb + ', old_text: "MISSING", new_text: "newB" }, { op: "replace_unique", path: ' + qc + ', old_text: "oldC", new_text: "newC" }] })\nconst e = async (q, from, to) => edit(q, from, to).then(() => "edited", (x) => "refused: " + x.message)\nreturn "batch ok=" + r.ok + " | b " + await e(' + qb + ', "oldB", "editedB") + " | c " + await e(' + qc + ', "oldC", "editedC")' },
+  ] });
+  expect(out.results[0]!.text).toBe('batch ok=false | b edited | c edited');
+  expect(readFileSync(a, 'utf8')).toBe('newA\n');
+  expect(readFileSync(b, 'utf8')).toBe('editedB\n');
+  expect(readFileSync(c, 'utf8')).toBe('editedC\n');
+});
+
+test('A read of the patched file that finishes while the patch is still being booked lets its run edit the file', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'alpha 0\n');
+  const q = JSON.stringify(f);
+  const [applied, answer] = ['applied', 'answer'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, patchAnswerGate: { applied, gate: answer }, statDelayMs: 1200, statDelayFor: 'slow-', readLagMs: 350, steps: [
+    { script: 'await read(' + q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "create", path: ' + JSON.stringify(join(dir, 'slow-0.txt')) + ', new_text: "g\\n" }, { op: "replace_unique", path: ' + q + ', old_text: "alpha 0", new_text: "patched 0" }] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: applied },
+    { script: 'const t = await read(' + q + ')\ntry { await edit(' + q + ', "patched 0", "EDITED 0"); return "r2 saw=" + t.includes("patched 0") + " edited" } catch (e) { return "r2 saw=" + t.includes("patched 0") + " refused: " + e.message }', keepTurn: true },
+    { untilCalls: { tool: 'Read', count: 2 } },
+    { touch: answer },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 patched');
+  expect(said).toContain('r2 saw=true edited');
+  expect(readFileSync(f, 'utf8')).toBe('EDITED 0\n');
+});
+
+test('A Write the permission check refuses keeps the file it named counted as read', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'alpha\n');
+  const q = JSON.stringify(f);
+  const out = run({ denyWritePaths: ['f.txt'], steps: [
+    { script: 'await read(' + q + ')\nconst w = await call("Write", { file_path: ' + q + ', content: "blocked\\n" })\ntry { await edit(' + q + ', "alpha", "BETA"); return "write ok=" + w.ok + " | edited" } catch (e) { return "write ok=" + w.ok + " | refused: " + e.message }' },
+  ] });
+  expect(out.results[0]!.text).toBe('write ok=false | edited');
+  expect(readFileSync(f, 'utf8')).toBe('BETA\n');
+});
+
+test('A patch whose answer waits while another run reads thousands of files never marks a version left unread meanwhile as read', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'aaaa\n');
+  const q = JSON.stringify(f);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const [applied, gate] = ['applied', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, engineForgets: true, patchAnswerGate: { applied, gate }, steps: [
+    { script: 'await read(' + q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "pppp" })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: applied },
+    { script: '// @options: {"timeout_ms": 300000}\nawait sh("printf BBBBBB > ' + f + '")\nawait read(' + q + ')\nawait sh("printf SECRET_UNREAD > ' + f + '")\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\nreturn "r2 left an unread version"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('SECRET_UNREAD');
+});
+
+test('A page chain from before a patch never completes while the patch is being booked, even after thousands of other reads and a matching mtime and size', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const slow = join(dir, 'slow-0.txt');
+  const out = run({ tools: NO_BASH, engineForgets: true, statDelayMs: 8000, statDelayFor: 'slow-', steps: [
+    { script: 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\nreturn "r0 chain"' },
+    { script: 'await read(' + v.q + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "create", path: ' + JSON.stringify(slow) + ', new_text: "g\\n" }, { op: "replace_unique", path: ' + v.q + ', old_text: "AAAA 00000", new_text: "PPPP 00000" }] })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilFile: slow },
+    { untilStatPending: true },
+    { script: '// @options: {"timeout_ms": 300000}\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\n' + v.toC + 'await tools.Read({ file_path: ' + v.q + ', offset: 3 })\nreturn "r2 read the rest"', keepTurn: true },
+    { untilRunDone: 'r2' },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: v.toC + 'try { await write(' + v.q + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
 });

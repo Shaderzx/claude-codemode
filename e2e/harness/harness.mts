@@ -19,6 +19,7 @@ type Case = {
   holdLaterPages?: { asked: string; gate: string }
   holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }
   holdRealpath?: { match: string; afterTool: string; asked: string; gate: string }
+  denyWritePaths?: string[]
   statDelayMs?: number
   statDelayFor?: string
   hangListMs?: number
@@ -200,6 +201,7 @@ const shell = (command: string, keepCwd = false) => {
 
 const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<string, unknown>> => {
   calls.push({ tool, args: a })
+  if (tool === 'Write' && (c.denyWritePaths ?? []).some((d) => String(a.file_path ?? '').endsWith(d))) return { deny: 'Permission to write ' + String(a.file_path) + ' has been denied.' }
   if (tool === 'Bash' && (c.deniedCommands ?? []).some((d) => String(a.command ?? '').includes(d)))
     return err(c.deniedMessage ?? 'PreToolUse:Bash hook error: blocked: this command is not allowed here')
   if ((c.denied ?? []).includes(tool))

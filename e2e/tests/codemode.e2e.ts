@@ -5389,4 +5389,28 @@ test('A big file read in pages after a patch landed during its first try can be 
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('saw=true edited');
   expect(readFileSync(big, 'utf8').startsWith('EDITED 00000')).toBe(true);
-});
+});const ownOlderUnderFailedNewer = (kept: 'whole read' | 'page chain') => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const [asked, gate] = ['asked', 'gate'].map((n) => join(dir, n));
+  const older = kept === 'whole read' ? 'await read(' + v.q + ')\n' : 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\n';
+  const newer = kept === 'whole read' ? 'void call("Read", { file_path: ' + v.q + ' })\n' : 'void call("Read", { file_path: ' + v.q + ', offset: 1, limit: 2 })\n';
+  const held = kept === 'whole read' ? 'BBBBBB 00003' : 'BBBBBB 00001';
+  const out = run({ engineForgets: true, holdReplyContaining: { text: held, asked, gate, giveUpMs: 2000 }, steps: [
+    { script: older + v.toB + newer + 'await waitFor(() => sh("test -f ' + asked + '"), { every: 10, timeout: 10000 })\nreturn "r1 returned"', keepTurn: true },
+    { untilFile: asked },
+    { untilRunsDone: true },
+    { untilQuiet: true },
+    { collect: true },
+    { script: '// @options: {"timeout_ms": 300000}\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 64) await Promise.all(all.slice(i, i + 64).map((o) => read(o)))\n' + v.toC + (kept === 'page chain' ? 'await tools.Read({ file_path: ' + v.q + ', offset: 3 })\n' : '') + 'const w = await call("Write", { file_path: ' + v.q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r2 wrote over C" : "r2 refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+};
+
+test('An older own read under a newer read whose answer failed never counts once the newer sighting is forgotten', () => ownOlderUnderFailedNewer('whole read'));
+test('An older own page chain under a newer page whose answer failed never completes once the newer sighting is forgotten', () => ownOlderUnderFailedNewer('page chain'));

@@ -2265,7 +2265,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
     const stampForgotten = (k: string) => {
       const prev = forgottenEntry(k)
-      keepForgotten(k, { ...prev, before: Math.max(prev.before, sentAt), pending: [...prev.pending, { settledAt, sentVersion: sentVersions.get(k) }].slice(-16) })
+      const stamped = prev.pending.some((e) => e.settledAt === settledAt)
+      keepForgotten(k, { ...prev, before: Math.max(prev.before, sentAt), pending: stamped ? prev.pending : [...prev.pending, { settledAt, sentVersion: sentVersions.get(k) }].slice(-16) })
     }
     const resetOpenPages = (j: Job, k: string) => {
       for (const [id, started] of j.pages) if (started.real === k && sawBeforeSent(k, started.version, started.at)) j.pages.set(id, {})
@@ -2478,6 +2479,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         return (await realOf(key)) === key ? version : undefined
       }
       const changedKeys = [...new Set([...patchOps.map((o) => patchKeys.get(o.path) as string), ...(wrote && writeKey !== undefined ? [writeKey] : [])])]
+      for (const key of changedKeys) stampForgotten(key)
       for (const [key, version] of await Promise.all(changedKeys.map(async (key) => [key, await stillNamed(key)] as const))) afterVersions.set(key, version)
       const windowOf = (key: string): ChangeWindow => ({ sentAt, sentVersion: sentVersions.get(key) })
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
@@ -2845,7 +2847,6 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const restores = patched.map(({ key: f, version }) => {
         const restore = booked(f, { reads: true, chain: true })
         const stamp = ++readClock
-        outdateOwnUndo(f, version, stamp)
         job.progress.delete(f)
         job.progressAt.delete(f)
         job.reads.delete(f)

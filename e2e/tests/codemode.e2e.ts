@@ -5035,6 +5035,42 @@ test('Sixteen older versions handed back never push out the newest sighting a pa
   expect(readFileSync(big, 'utf8')).toBe(v.c);
 });
 
+test('A two-step patch of one file whose answer the runner never took leaves the file unread', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'aaaa\ncccc\n');
+  const q = JSON.stringify(f);
+  const first = '// @options: {"timeout_ms": 1000}\nawait read(' + q + ')\nvoid call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "bbbb" }, { op: "replace_unique", path: ' + q + ', old_text: "cccc", new_text: "dddd" }] })\nwhile (true) {}';
+  const out = run({ tools: NO_BASH, steps: [
+    { script: first },
+    { untilQuiet: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "later wrote" } catch (e) { return "later refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('later refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('bbbb\ndddd\n');
+});
+
+test('A handed-back page chain never completes across a newer read another open run made', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const [newer, keepOpen] = ['newer', 'keep-open'].map((n) => join(dir, n));
+  const out = run({ engineForgets: true, steps: [
+    { script: 'await tools.Read({ file_path: ' + v.q + ', offset: 1, limit: 2 })\nreturn "r1 chain"' },
+    { script: v.toB + 'await read(' + v.q + ')\n' + v.toC + 'await sh("touch ' + newer + '")\nawait waitFor(() => sh("test -f ' + keepOpen + '"), { every: 20, timeout: 30000 })\nreturn "r2 done"', keepTurn: true },
+    { untilFile: newer },
+    { script: 'await tools.Read({ file_path: ' + v.q + ', offset: 3 })\nconst w = await call("Write", { file_path: ' + v.q + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r3 wrote" : "r3 refused: " + w.error', keepTurn: true },
+    { untilRunDone: 'r3' },
+    { touch: keepOpen },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});
+
 const stalePatchDuringOnePageRead = (reader: 'tools.Read' | 'read') => {
   const dir = scratch();
   const f = join(dir, 'f.txt');

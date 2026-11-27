@@ -19,6 +19,7 @@ type Case = {
   holdLaterPages?: { asked: string; gate: string }
   holdReplyContaining?: { text: string; asked: string; gate: string }
   statDelayMs?: number
+  statDelayFor?: string
   hangListMs?: number
   hangListCount?: number
   strictRealpath?: boolean
@@ -600,7 +601,7 @@ const $ = {
       return found
     },
     stat: async (p: string) => {
-      if (c.statDelayMs && sessionStarted) {
+      if (c.statDelayMs && sessionStarted && (!c.statDelayFor || String(p).includes(c.statDelayFor))) {
         statsPending++
         await new Promise((r) => setTimeout(r, c.statDelayMs))
         statsPending--

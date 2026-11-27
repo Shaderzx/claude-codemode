@@ -1746,7 +1746,8 @@ const keepForgotten = (real: string, f: Forgotten) => {
 const noteSeen = (real: string, at: number, version: string | undefined) => {
   if (version === undefined) return
   const f = forgottenEntry(real)
-  keepForgotten(real, { ...f, seen: [...f.seen.filter((e) => e.version !== version), { at, version }].slice(-16) })
+  const latest = Math.max(at, ...f.seen.filter((e) => e.version === version).map((e) => e.at))
+  keepForgotten(real, { ...f, seen: [...f.seen.filter((e) => e.version !== version), { at: latest, version }].slice(-16) })
 }
 const chainIsCurrent = (chain: { version?: string } | undefined, chainAt: number, newer: [number | undefined, string | undefined][]) =>
   chain !== undefined && newer.every(([at, version]) => (at ?? 0) <= chainAt || version === chain.version)

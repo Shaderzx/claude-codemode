@@ -20,6 +20,7 @@ type Case = {
   holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }
   holdRealpath?: { match: string; afterTool: string; asked: string; gate: string }
   denyWritePaths?: string[]
+  throwNoToolFor?: string[]
   statDelayMs?: number
   statDelayFor?: string
   hangListMs?: number
@@ -142,7 +143,6 @@ let replyHeld = false
 let realpathHolds = 0
 const realpathsAsked: string[] = []
 const realpathHeld = async (argv: string[]) => {
-  if (argv[0] === 'realpath') realpathsAsked.push(String(argv[1]))
   const hold = c.holdRealpath
   if (!hold || realpathHolds || argv[0] !== 'realpath' || !String(argv[1]).includes(hold.match) || !calls.some((x) => x.tool === hold.afterTool)) return
   realpathHolds++
@@ -203,6 +203,7 @@ const shell = (command: string, keepCwd = false) => {
 
 const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<string, unknown>> => {
   calls.push({ tool, args: a })
+  if ((c.throwNoToolFor ?? []).includes(tool)) throw new Error('codemode: $.tool.call: no tool named "' + tool + '" in this session')
   if (tool === 'Write' && (c.denyWritePaths ?? []).some((d) => String(a.file_path ?? '').endsWith(d))) return { deny: 'Permission to write ' + String(a.file_path) + ' has been denied.' }
   if (tool === 'Bash' && (c.deniedCommands ?? []).some((d) => String(a.command ?? '').includes(d)))
     return err(c.deniedMessage ?? 'PreToolUse:Bash hook error: blocked: this command is not allowed here')
@@ -682,7 +683,10 @@ const $ = {
         p.on('close', (code) => {
           done({ exitCode: code ?? 1, stdout, stderr })
         })
-      })))),
+      })))).then((answer) => {
+        if (argv[0] === 'realpath') realpathsAsked.push(String(argv[1]))
+        return answer
+      }),
   },
   clock: {
     now: async () => {

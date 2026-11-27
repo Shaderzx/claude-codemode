@@ -18,6 +18,7 @@ type Case = {
   lastPartMayBeMissing?: boolean
   holdLaterPages?: { asked: string; gate: string }
   holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }
+  holdRealpath?: { match: string; afterTool: string; asked: string; gate: string }
   statDelayMs?: number
   statDelayFor?: string
   hangListMs?: number
@@ -137,6 +138,14 @@ const firewalled = (id: string, body: string) => '[Firewalled ctx_shell output â
 const archive = (id: string) => join(home, '.local', 'share', 'lean-ctx', 'archives', id.slice(0, 2), id + '.txt')
 let archived = 0
 let replyHeld = false
+let realpathHolds = 0
+const realpathHeld = async (argv: string[]) => {
+  const hold = c.holdRealpath
+  if (!hold || realpathHolds || argv[0] !== 'realpath' || !String(argv[1]).includes(hold.match) || !calls.some((x) => x.tool === hold.afterTool)) return
+  realpathHolds++
+  writeFileSync(hold.asked, '')
+  await until(() => existsSync(hold.gate), 30_000, hold.gate + ' appearing')
+}
 let heldFakes = 0
 let swapped = 0
 const tokensOf = (rows: string[]) => rows.reduce((n, l) => n + (l.length > 200 && !/\s/.test(l) ? l.length : Math.ceil(l.length / 4)) + 1, 0)
@@ -647,7 +656,7 @@ const $ = {
         }
       })()
     },
-    run: (argv: string[], _init?: unknown) =>
+    run: (argv: string[], _init?: unknown) => realpathHeld(argv).then(() =>
       c.lastPartMayBeMissing && argv[0] === 'realpath' && !lstatSafe(String(argv[1])) && existsSync(dirname(String(argv[1])))
         ? Promise.resolve({ exitCode: 0, stdout: join(realpathSync(dirname(String(argv[1]))), basename(String(argv[1]))) + '\n', stderr: '' })
         : c.strictRealpath && argv[0] === 'realpath' && !existsSync(String(argv[1]))
@@ -669,7 +678,7 @@ const $ = {
         p.on('close', (code) => {
           done({ exitCode: code ?? 1, stdout, stderr })
         })
-      }))),
+      })))),
   },
   clock: {
     now: async () => {

@@ -7,7 +7,7 @@ import { expect, test } from 'e2e';
 const harness = join(import.meta.dirname, '..', 'harness', 'harness.mts');
 
 type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; untilReadlink?: string; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string };
-type Case = { changeEveryRead?: boolean; readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; patchDelayMs?: number; patchLostAfterApply?: boolean; patchErrorWrapped?: boolean; padPatchReply?: number; patchAnswerGate?: { applied: string; gate: string }; existsGapMs?: number; lastPartMayBeMissing?: boolean; holdLaterPages?: { asked: string; gate: string }; holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }; statDelayMs?: number; statDelayFor?: string; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
+type Case = { changeEveryRead?: boolean; readLagMs?: number; rewriteDuringFirstRead?: string; strictRealpath?: boolean; clockNowDelayMs?: number; loadDelayMs?: number; failReplyAfter?: { fail: number; after: number }; hangListCount?: number; clockEarlyMs?: number; clockFrozen?: boolean; killDelayMs?: number; writeDelayMs?: number; patchDelayMs?: number; patchLostAfterApply?: boolean; patchErrorWrapped?: boolean; padPatchReply?: number; patchAnswerGate?: { applied: string; gate: string }; existsGapMs?: number; lastPartMayBeMissing?: boolean; holdLaterPages?: { asked: string; gate: string }; holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }; holdRealpath?: { match: string; afterTool: string; asked: string; gate: string }; statDelayMs?: number; statDelayFor?: string; hangListMs?: number; surfaces?: string[]; submitRefusals?: number; submitDelayMs?: number; hangListDuringRuns?: boolean; tools?: string[]; denied?: string[]; home?: string; cwd?: string; env?: Record<string, string>; store?: Record<string, unknown>; steps: Step[]; abortAfterMs?: number; dedupReads?: boolean; deniedCommands?: string[]; deniedMessage?: string; readRewrite?: string; denyReadFrom?: number; rewriteFromOffset?: string; compressShell?: boolean; denyReadPaths?: string[]; deniedShellCommands?: string[]; hugePageAt?: number; persistBash?: boolean; deniedWriteMessage?: string; deniedCreateMessage?: string; pageErrorAt?: number; truncateLimited?: boolean; abortStyle?: string; engineForgets?: boolean; changeAfterPage?: number; readDelayMs?: number; listThrows?: boolean; detachAfterMs?: number; slowWritesMs?: number; leanTimeoutMs?: number; archiveWithheld?: boolean; archiveTruncated?: boolean; deniedReplaceMessage?: string; archiveWithheldText?: string; jobNoExit?: boolean; headerOnly?: boolean; pageWithheld?: boolean; bytesShort?: boolean; swapFormat?: string; archiveBytes?: string; shortPages?: number; leanCap?: number; noSwap?: boolean; archiveWithheldError?: boolean; shellWithheld?: boolean; expandEmptyBody?: boolean; shellAdvice?: string };
 type Out = { description: string; results: { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }[]; calls: { tool: string; args: Record<string, unknown> }[]; store: Record<string, unknown>; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; clockMarks?: number[]; bashWaits?: number; runnersSpawned?: number };
 
 const made: string[] = [];
@@ -5389,7 +5389,9 @@ test('A big file read in pages after a patch landed during its first try can be 
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('saw=true edited');
   expect(readFileSync(big, 'utf8').startsWith('EDITED 00000')).toBe(true);
-});const ownOlderUnderFailedNewer = (kept: 'whole read' | 'page chain') => {
+});
+
+const ownOlderUnderFailedNewer = (kept: 'whole read' | 'page chain') => {
   const dir = scratch();
   const f = join(dir, 'f.txt');
   const v = threeVersions(dir, f, 4);
@@ -5413,7 +5415,9 @@ test('A big file read in pages after a patch landed during its first try can be 
 };
 
 test('An older own read under a newer read whose answer failed never counts once the newer sighting is forgotten', () => ownOlderUnderFailedNewer('whole read'));
-test('An older own page chain under a newer page whose answer failed never completes once the newer sighting is forgotten', () => ownOlderUnderFailedNewer('page chain'));const settleRace = (dir: string) => {
+test('An older own page chain under a newer page whose answer failed never completes once the newer sighting is forgotten', () => ownOlderUnderFailedNewer('page chain'));
+
+const settleRace = (dir: string) => {
   const f = join(dir, 'f.txt');
   const q = JSON.stringify(f);
   const changeReadThenHide = 'await sh("printf BBBBBB > ' + f + '")\nawait read(' + q + ')\nawait sh("printf SECRET_UNREAD > ' + f + '")\nreturn "r2 left an unread version"';
@@ -5598,4 +5602,33 @@ test('A run whose newer read answer failed after another run read a newer versio
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('r3 refused: ');
   expect(readFileSync(f, 'utf8')).toBe(v.c);
+});test('A read checked while another run\'s patch is still being booked never counts once the patch lands, even when the mtime and size match again', () => {
+  const dir = scratch();
+  const slow = join(dir, 'slow_f.txt');
+  const link = join(dir, 'late_link.txt');
+  const ref = join(dir, 'ref');
+  writeFileSync(slow, 'aaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(slow, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  symlinkSync(slow, link);
+  const s = JSON.stringify(slow);
+  const [asked, gate, applied, answer] = ['asked', 'gate', 'applied', 'answer'].map((n) => join(dir, n));
+  writeFileSync(answer, '');
+  const out = run({ tools: NO_BASH, statDelayMs: 800, statDelayFor: 'slow_f', patchAnswerGate: { applied, gate: answer }, holdRealpath: { match: 'late_link', afterTool: 'Read', asked, gate }, steps: [
+    { script: 'await tools.Read({ file_path: ' + JSON.stringify(link) + ' })\nreturn "r1 read"', keepTurn: true },
+    { untilFile: asked },
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + s + ', old_text: "aaaa", new_text: "pppp" })\nawait sh("touch -r ' + ref + ' ' + slow + '")\nreturn r.ok ? "r2 patched" : r.error', keepTurn: true },
+    { untilFile: applied },
+    { untilStatPending: true },
+    { touch: gate },
+    { untilRunDone: 'r1' },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + s + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 patched');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(slow, 'utf8')).toBe('pppp\n');
 });

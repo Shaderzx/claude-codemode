@@ -1481,7 +1481,7 @@ const failedScripts = new Map<string, { first: string; at: number }>()
 const READ = Symbol('read')
 const UNDELIVERED = Symbol('undelivered')
 const PATCH_READS = Symbol('patch reads')
-type ChangeWindow = { sentAt: number; sentVersion?: string }
+type ChangeWindow = { sentAt: number; settledAt: number; sentVersion?: string }
 type PatchRead = { key: string; version?: string; window: ChangeWindow }
 const readProgress = new Map<string, { next: number; version?: string }>()
 const readVersions = new Map<string, string>()
@@ -1724,19 +1724,20 @@ const handedSpills = new Map<string, number>()
 const ownSpills = new Set<string>()
 const progressAt = new Map<string, number>()
 const versionAt = new Map<string, number>()
-type Forgotten = { before: number; pending: { settledAt: number; sentVersion?: string }[]; seen: { at: number; version: string }[] }
+type PendingChange = { settledAt: number; sentVersion?: string; after?: { version?: string } }
+type Forgotten = { before: number; pending: PendingChange[]; seen: { at: number; version: string }[] }
 const forgottenAt = new Map<string, Forgotten>()
 const forgottenFor = (real: string | undefined, askedAt: number, readBefore: string | undefined) => {
   const f = real === undefined ? undefined : forgottenAt.get(real)
   return (
     !!f &&
     (askedAt < f.before ||
-      f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || readBefore === e.sentVersion)) ||
+      f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || (e.after ? readBefore !== e.after.version : readBefore === e.sentVersion))) ||
       f.seen.some((e) => askedAt < e.at && readBefore !== e.version))
   )
 }
 const changeHeld = (f: string, version: string | undefined, w: ChangeWindow) =>
-  version !== undefined && !(forgottenAt.get(f)?.seen.some((e) => w.sentAt < e.at && e.version !== version && e.version !== w.sentVersion) ?? false)
+  version !== undefined && !(forgottenAt.get(f)?.seen.some((e) => w.sentAt < e.at && e.version !== version && (w.settledAt < e.at || e.version !== w.sentVersion)) ?? false)
 const forgottenStamp = (real: string) => {
   const f = forgottenAt.get(real)
   return Math.max(f?.pending.at(-1)?.settledAt ?? 0, f?.seen.at(-1)?.at ?? 0, f?.before ?? 0)
@@ -2265,8 +2266,8 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
     const stampForgotten = (k: string) => {
       const prev = forgottenEntry(k)
-      const stamped = prev.pending.some((e) => e.settledAt === settledAt)
-      keepForgotten(k, { ...prev, before: Math.max(prev.before, sentAt), pending: stamped ? prev.pending : [...prev.pending, { settledAt, sentVersion: sentVersions.get(k) }].slice(-16) })
+      const entry: PendingChange = { settledAt, sentVersion: sentVersions.get(k), ...(afterVersions.has(k) ? { after: { version: afterVersions.get(k) } } : {}) }
+      keepForgotten(k, { ...prev, before: Math.max(prev.before, sentAt), pending: [...prev.pending.filter((e) => e.settledAt !== settledAt), entry].sort((x, y) => x.settledAt - y.settledAt).slice(-16) })
     }
     const resetOpenPages = (j: Job, k: string) => {
       for (const [id, started] of j.pages) if (started.real === k && sawBeforeSent(k, started.version, started.at)) j.pages.set(id, {})
@@ -2356,26 +2357,40 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     tally.open++
     if (counted) open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
     startedCalls.add(m.id as number)
-    let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
+    const changedKeys = [...new Set([...patchOps.map((o) => patchKeys.get(o.path) as string), ...(writeKey !== undefined ? [writeKey] : [])])]
+    const stillNamed = async (key: string) => {
+      const version = await versionOf(key)
+      return (await realOf(key)) === key ? version : undefined
+    }
+    const settle = async (mayHaveChanged: boolean) => {
+      settledAt = ++readClock
+      if (!mayHaveChanged) return
+      for (const key of changedKeys) {
+        afterVersions.set(key, undefined)
+        stampForgotten(key)
+      }
+      for (const [key, version] of await Promise.all(changedKeys.map(async (key) => [key, await stillNamed(key)] as const))) afterVersions.set(key, version)
+      for (const key of changedKeys) stampForgotten(key)
+    }
+    let r = await $.tool.call({ ...args, tool: target } as never).catch(async (err: unknown) => {
       tally.open--
       tally.failed++
       tally.arg ??= firstArg(args)
       release?.()
-      settledAt = ++readClock
+      await settle(true)
       changeUnsure()
       const msg = (err as Error)?.message ?? String(err)
       // A tool a setting or another mod removed: name what may replace it.
       const near = msg.includes('no tool named') ? similar(tool, all.map((x) => x.name)) : []
       throw new Error(near.length ? `${msg}; similar: ${near.join(', ')}` : msg)
     })
-    settledAt = ++readClock
+    const failedSaid = isPatch && r.isError ? String(r.text ?? show(r.result)).replace(/^\s*(?:<tool_use_error>)?\s*/, '') : ''
+    const failedAt = /^ops\[(\d+)\]/.exec(failedSaid)
+    const partlyApplied = !!failedAt && /Earlier ops in this batch were already applied/.test(failedSaid)
+    await settle(!r.isError || partlyApplied)
     const body = release ? skillTexts.get(key) : undefined
     release?.()
-    if (isPatch && r.isError) {
-      const said = String(r.text ?? show(r.result)).replace(/^\s*(?:<tool_use_error>)?\s*/, '')
-      const failedAt = /^ops\[(\d+)\]/.exec(said)
-      if (failedAt && /Earlier ops in this batch were already applied/.test(said)) patchUnsure(Number(failedAt[1]))
-    }
+    if (partlyApplied) patchUnsure(Number(failedAt?.[1]))
     const capped =
       tool === 'Read' &&
       !r.isError &&
@@ -2474,14 +2489,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         tally.arg ??= firstArg(args)
         return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
       }
-      const stillNamed = async (key: string) => {
-        const version = await versionOf(key)
-        return (await realOf(key)) === key ? version : undefined
-      }
-      const changedKeys = [...new Set([...patchOps.map((o) => patchKeys.get(o.path) as string), ...(wrote && writeKey !== undefined ? [writeKey] : [])])]
-      for (const key of changedKeys) stampForgotten(key)
-      for (const [key, version] of await Promise.all(changedKeys.map(async (key) => [key, await stillNamed(key)] as const))) afterVersions.set(key, version)
-      const windowOf = (key: string): ChangeWindow => ({ sentAt, sentVersion: sentVersions.get(key) })
+      const windowOf = (key: string): ChangeWindow => ({ sentAt, settledAt, sentVersion: sentVersions.get(key) })
       const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
       const freshKeys = new Set<string>()
       for (const o of patchOps) {

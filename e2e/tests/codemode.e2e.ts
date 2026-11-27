@@ -5631,4 +5631,132 @@ test('A run whose newer read answer failed after another run read a newer versio
   expect(said).toContain('r2 patched');
   expect(said).toContain('r3 refused: ');
   expect(readFileSync(slow, 'utf8')).toBe('pppp\n');
+});test('A read in flight across another run\'s unread patch never counts the version it saw before the patch, even when the mtime and size match again', () => {
+  const dir = scratch();
+  const [f, y, ref] = ['f.txt', 'y.txt', 'ref'].map((n) => join(dir, n));
+  writeFileSync(f, 'xxxx\naaaa\n');
+  writeFileSync(y, 'yyyy\naaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_100, 1_700_000_100);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const out = run({ tools: NO_BASH, patchDelayMs: 300, readLagMs: 700, steps: [
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "PPPP" })\nawait sh("touch -r ' + ref + ' ' + f + '")\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilTool: 'mcp__lean-ctx__ctx_patch' },
+    { script: 'await sh("cp ' + y + ' ' + f + ' && touch -r ' + ref + ' ' + f + '")\nconst saw = await read(' + q + ')\nreturn "r2 saw=" + JSON.stringify(saw)', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 patched');
+  expect(said).toContain('r2 saw="yyyy\\naaaa\\n"');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('yyyy\nPPPP\n');
+});
+
+test('A read of what an unawaited Write left, taken before that Write answered, still lets a later edit land when the mtime and size match the old file', () => {
+  const dir = scratch();
+  const [f, ref, applied, gate] = ['f.txt', 'ref', 'applied', 'gate'].map((n) => join(dir, n));
+  writeFileSync(f, 'aaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const out = run({ engineForgets: true, patchAnswerGate: { applied, gate }, steps: [
+    { script: 'await read(' + q + ')\nreturn "r0 read"' },
+    { script: 'void call("Write", { file_path: ' + q + ', content: "bbbb\\n" })\nawait waitFor(() => sh("test -f ' + applied + '"), { every: 20, timeout: 20000 })\nreturn "r1 returned early"', keepTurn: true },
+    { script: 'await waitFor(() => sh("test -f ' + applied + '"), { every: 20, timeout: 20000 })\nawait sh("touch -r ' + ref + ' ' + f + '")\nconst saw = await read(' + q + ')\nreturn "r2 saw=" + JSON.stringify(saw)', keepTurn: true },
+    { untilRunsDone: true },
+    { touch: gate },
+    { untilQuiet: true },
+    { collect: true },
+    { script: 'try { await edit(' + q + ', "bbbb", "cccc"); return "r3 edited" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 saw="bbbb\\n"');
+  expect(said).toContain('r3 edited');
+  expect(readFileSync(f, 'utf8')).toBe('cccc\n');
+});
+
+const unsureLanding = (how: 'a later op fails' | 'its answer is too big' | 'its answer is lost') => {
+  const dir = scratch();
+  const [f, y, ref] = ['f.txt', 'y.txt', 'ref'].map((n) => join(dir, n));
+  const created = JSON.stringify(join(dir, 'created.txt'));
+  writeFileSync(f, 'xxxx\naaaa\n');
+  writeFileSync(y, 'yyyy\naaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_100, 1_700_000_100);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const replace = '{ op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "PPPP" }';
+  const ops = how === 'a later op fails' ? '{ ops: [{ op: "create", path: ' + created + ', new_text: "g\\n" }, ' + replace + ', { op: "replace_unique", path: ' + q + ', old_text: "MISSING", new_text: "z" }] }' : how === 'its answer is too big' ? '{ ops: [' + replace + '] }' : replace;
+  const extra = how === 'its answer is too big' ? { noSwap: true, padPatchReply: 3_900_000 } : how === 'its answer is lost' ? { patchLostAfterApply: true } : {};
+  const out = run({ tools: NO_BASH, patchDelayMs: 350, ...extra, steps: [
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", ' + ops + ')\nawait sh("touch -r ' + ref + ' ' + f + '")\nreturn "r1 ok=" + r.ok', keepTurn: true },
+    { untilTool: 'mcp__lean-ctx__ctx_patch' },
+    { script: 'await sh("cp ' + y + ' ' + f + ' && touch -r ' + ref + ' ' + f + '")\nconst saw = await read(' + q + ')\nreturn "r2 saw=" + JSON.stringify(saw)', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "r3 clobbered" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 ok=false');
+  expect(said).toContain('r2 saw="yyyy\\naaaa\\n"');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('yyyy\nPPPP\n');
+};
+
+test('A patch that lands but fails because a later op fails never lets a read of the version before it count', () => unsureLanding('a later op fails'));
+test('A patch that lands but whose answer is too big never lets a read of the version before it count', () => unsureLanding('its answer is too big'));
+test('A patch that lands but whose answer is lost never lets a read of the version before it count', () => unsureLanding('its answer is lost'));
+
+test('A read that started before another run\'s batch patch and finished while the patch was being booked never counts', () => {
+  const dir = scratch();
+  const [f, ref, slow] = ['f.txt', 'ref', 'slow-0.txt'].map((n) => join(dir, n));
+  writeFileSync(f, 'xxxx\naaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  const q = JSON.stringify(f);
+  const out = run({ tools: NO_BASH, readLagMs: 400, statDelayMs: 900, statDelayFor: 'slow-', steps: [
+    { script: 'const saw = await read(' + q + ')\nreturn "r1 saw=" + JSON.stringify(saw)', keepTurn: true },
+    { untilCalls: { tool: 'Read', count: 1 } },
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { ops: [{ op: "create", path: ' + JSON.stringify(slow) + ', new_text: "g\\n" }, { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "PPPP" }] })\nreturn r.ok ? "r2 patched" : r.error', keepTurn: true },
+    { untilFile: slow },
+    { untilStatPending: true },
+    { script: 'await sh("touch -r ' + ref + ' ' + f + '")\nreturn "r3 touched"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "r4 clobbered" } catch (e) { return "r4 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 saw="xxxx\\naaaa\\n"');
+  expect(said).toContain('r2 patched');
+  expect(said).toContain('r4 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('xxxx\nPPPP\n');
+});
+
+test('A Write whose file another run sets back to the old mtime and size, reads and changes again while the Write is booked never marks the unread version as read', () => {
+  const dir = scratch();
+  const [slow, link, ref] = ['slow_f.txt', 'fast_link.txt', 'ref'].map((n) => join(dir, n));
+  writeFileSync(slow, 'aaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(slow, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  symlinkSync(slow, link);
+  const [s, l] = [JSON.stringify(slow), JSON.stringify(link)];
+  const out = run({ engineForgets: true, statDelayMs: 800, statDelayFor: 'slow_', steps: [
+    { script: 'await read(' + l + ')\nreturn "r0 read"' },
+    { script: 'await write(' + s + ', "pppp\\n")\nreturn "r1 wrote"', keepTurn: true },
+    { untilTool: 'Write' },
+    { untilStatPending: true },
+    { script: 'await sh("printf BBBB\\\\\\\\n > ' + slow + ' && touch -r ' + ref + ' ' + slow + '")\nawait read(' + l + ')\nawait sh("printf SECRET_UNREAD > ' + slow + '")\nreturn "r2 left an unread version"', keepTurn: true },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'const w = await call("Write", { file_path: ' + l + ', content: "CLOBBERED\\n" })\nreturn w.ok ? "r3 clobbered" : "r3 refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(slow, 'utf8')).toBe('SECRET_UNREAD');
 });

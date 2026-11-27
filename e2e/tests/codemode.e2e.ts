@@ -5895,3 +5895,44 @@ test('A call to a tool the session does not have keeps the file it named counted
   expect(out.results[0]!.text).toBe('write ok=false | edited');
   expect(readFileSync(f, 'utf8')).toBe('BETA\n');
 });
+
+const oldTextAcrossKeptStamp = (when: 'booked before the patch settled' | 'still being checked when the patch settled') => {
+  const dir = scratch();
+  const [f, ref, applied, gate, readAll, keepOpen, checkGate, checkAsked] = ['f.txt', 'ref', 'applied', 'gate', 'read-all', 'keep-open', 'check-gate', 'check-asked'].map((n) => join(dir, n));
+  const link = join(dir, 'late_link.txt');
+  writeFileSync(f, 'aaaa\n');
+  writeFileSync(ref, '');
+  utimesSync(f, 1_700_000_000, 1_700_000_000);
+  utimesSync(ref, 1_700_000_000, 1_700_000_000);
+  symlinkSync(f, link);
+  const others = Array.from({ length: 2000 }, (_, i) => join(dir, 'o' + i + '.txt'));
+  for (const o of others) writeFileSync(o, 'o\n');
+  const q = JSON.stringify(f);
+  const held = when === 'still being checked when the patch settled';
+  const out = run({ tools: NO_BASH, engineForgets: true, patchDelayMs: 500, patchAnswerGate: { applied, gate }, ...(held ? { holdRealpath: { match: 'late_link', afterTool: 'Read', asked: checkAsked, gate: checkGate } } : {}), steps: [
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + q + ', old_text: "aaaa", new_text: "pppp" })\nreturn r.ok ? "r1 patched" : r.error', keepTurn: true },
+    { untilTool: 'mcp__lean-ctx__ctx_patch' },
+    { script: 'const saw = String(await tools.Read({ file_path: ' + JSON.stringify(link) + ' }))\nreturn "r2 saw old=" + saw.includes("aaaa")', keepTurn: true },
+    ...(held ? [{ untilFile: checkAsked }] : [{ untilRunDone: 'r2' }]),
+    { untilFile: applied },
+    { script: 'await sh("touch -r ' + ref + ' ' + f + ' && touch ' + gate + '")\nreturn "r3 touched"', keepTurn: true },
+    { untilRunDone: 'r1' },
+    { script: '// @options: {"timeout_ms": 300000}\nconst all = ' + JSON.stringify(others) + '\nfor (let i = 0; i < all.length; i += 500) await Promise.all(all.slice(i, i + 500).map((o) => read(o)))\nawait sh("touch ' + readAll + '")\nawait waitFor(() => sh("test -f ' + keepOpen + '"), { every: 50, timeout: 300000 })\nreturn "r4 done"', keepTurn: true },
+    { untilFile: readAll },
+    ...(held ? [{ touch: checkGate }] : []),
+    { untilRunDone: 'r2' },
+    { collect: true },
+    { script: 'try { await write(' + q + ', "CLOBBERED\\n"); return "r5 clobbered" } catch (e) { return "r5 refused: " + e.message }', keepTurn: true },
+    { untilRunDone: 'r5' },
+    { touch: keepOpen },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 saw old=true');
+  expect(said).toContain('r5 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('pppp\n');
+};
+
+test('A read of the old text booked before a patch that keeps the mtime and size settled never counts once an open run reads thousands of other files', () => oldTextAcrossKeptStamp('booked before the patch settled'));
+test('A read of the old text still being checked when a patch that keeps the mtime and size settled never counts once an open run reads thousands of other files', () => oldTextAcrossKeptStamp('still being checked when the patch settled'));

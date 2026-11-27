@@ -1499,7 +1499,7 @@ const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number)
   for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
   return 0
 }
-type Receipt = { file: string; whole: boolean; next?: number; version?: string }
+type Receipt = { file: string; whole: boolean; next?: number; version?: string; sampledAt?: number }
 type FileInfo = { startLine?: unknown; numLines?: unknown; totalLines?: unknown; truncatedByTokenCap?: unknown }
 const infoOf = (result: unknown): FileInfo | undefined => {
   const f = result && typeof result === 'object' ? (result as { file?: unknown }).file : undefined
@@ -1858,7 +1858,8 @@ const promoteReads = (j: Job) => {
     versionAt.delete(p)
     versionAt.set(p, at)
     readVersions.delete(p)
-    if (v !== undefined) readVersions.set(p, v)
+    const kept = unforgotten(p, v, at)
+    if (kept !== undefined) readVersions.set(p, kept)
   }
   for (const [p, chain] of j.progress) {
     const at = j.progressAt.get(p) ?? 0
@@ -1868,7 +1869,7 @@ const promoteReads = (j: Job) => {
     progressAt.delete(p)
     progressAt.set(p, at)
     readProgress.delete(p)
-    readProgress.set(p, chain)
+    if (!forgottenFor(p, at, chain.version)) readProgress.set(p, chain)
   }
   const readStamp = (k: string) => versionAt.get(k) ?? 0
   const pageStamp = (k: string) => progressAt.get(k) ?? 0
@@ -2495,12 +2496,15 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const receipt =
         tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
           ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter) ? readBefore : undefined, [ownChain, ...liveChains(realAfter ?? args.file_path)])
-          : wrote && typeof target === 'string' && target.startsWith('/')
-            ? ({ file: normal(target), whole: true } as Receipt)
-            : undefined
+          : wrote && writeKey !== undefined
+            ? ({ file: writeKey, whole: true, sampledAt: readClock } as Receipt)
+            : wrote && typeof target === 'string' && target.startsWith('/')
+              ? ({ file: normal(target), whole: true } as Receipt)
+              : undefined
+      if (receipt && tool === 'Read') receipt.sampledAt = askedAt
       if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
       if (ownPages && receipt && !receipt.whole && receipt.next !== undefined) ownPages.next = receipt.next
-      if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : await realOf(receipt.file)
+      if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : wrote && writeKey !== undefined ? writeKey : await realOf(receipt.file)
       if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
       else if (isStub(text, tool) && p.handled !== true) {
         stubs.add(tool)
@@ -2775,14 +2779,18 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     }
     open.delete(m.id)
     // The child is gone after a timeout; writing would recreate its run dir.
-    if (over) return
+    if (over) {
+      ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
+      return
+    }
     const file = `${dir}/${m.id}.json`
     const receipt = out[READ as never] as Receipt | undefined
     let undo: (() => void) | undefined
-    if (receipt) {
+    if (receipt && !(receipt.version !== undefined && forgottenFor(receipt.file, receipt.sampledAt ?? 0, receipt.version))) {
       const f = receipt.file
       const stamp = ++readClock
       noteSeen(f, stamp, receipt.version)
+      if (receipt.version !== undefined) outdateOlderViews(job, f, receipt.version, stamp)
       for (const [id, started] of job.pages) if (started.real === f && (started.at ?? 0) < stamp && started.version !== receipt.version) job.pages.set(id, {})
       if (receipt.whole) {
         undo = booked(f)
@@ -2812,6 +2820,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         job.readAt.delete(f)
         job.readAt.set(f, stamp)
         noteSeen(f, stamp, version)
+        outdateOlderViews(job, f, version, stamp)
         return restore
       })
       const undoReceipt = undo

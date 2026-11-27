@@ -1730,6 +1730,7 @@ const forgottenAt = new Map<string, Forgotten>()
 const changingFiles = new Map<string, number>()
 const readPins = new Map<Request, () => void>()
 const samplingFiles = new Map<string, Promise<unknown>>()
+const sampledNow = (real: string | undefined) => (real === undefined ? undefined : samplingFiles.get(real)?.then(() => undefined, () => undefined))
 const holdChanging = (files: Iterable<string>) => {
   const held = [...new Set(files)]
   for (const f of held) changingFiles.set(f, (changingFiles.get(f) ?? 0) + 1)
@@ -2114,6 +2115,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (m.kind === 'fresh') {
       const asked = normal(String(p.path))
       const path = await realOf(asked)
+      await sampledNow(path)
       const read = job.reads.has(path) || readPaths.has(path)
       const was = readVersionFor(job, path)
       const now = was === undefined ? undefined : await versionOf(path)
@@ -2530,7 +2532,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const patchReads: PatchRead[] = [...freshKeys].map((key) => ({ key, version: afterVersions.get(key), window: windowOf(key) }))
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
-      if (realAfter !== undefined) await samplingFiles.get(realAfter)?.then(() => undefined, () => undefined)
+      await sampledNow(realAfter)
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
         const from = typeof args.offset === 'number' ? args.offset : 1
         const pages = typeof p.readId === 'number' ? `#${p.readId}` : args.file_path
@@ -2629,7 +2631,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const version = await versionOf(file)
     const real = await realOf(file)
     const pagingFrom = readClock
-    const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real || forgottenFor(real, pagingFrom, version)
+    const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real || (await sampledNow(real), forgottenFor(real, pagingFrom, version))
     for (let guard = 0; guard < 10_000; guard++) {
       if (over) return undefined
       const r = late() ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)

@@ -837,7 +837,7 @@ for (const s of c.steps) {
     continue
   }
   if (s.relink) {
-    rmSync(s.relink.from, { force: true })
+    rmSync(s.relink.from, { force: true, recursive: true })
     symlinkSync(s.relink.to, s.relink.from)
     continue
   }

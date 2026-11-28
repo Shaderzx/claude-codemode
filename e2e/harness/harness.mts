@@ -92,17 +92,27 @@ const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
 const work = mkdtempSync(join(tmpdir(), 'codemode-mod-'))
 const live = new Set<number>()
+const direct = new Set<number>()
 const stop = (pid: number | undefined) => {
   if (pid === undefined) return
   live.delete(pid)
   try { process.kill(-pid, 'SIGKILL') } catch {}
 }
+const stopDirect = (pid: number | undefined) => {
+  if (pid === undefined) return
+  direct.delete(pid)
+  try { process.kill(pid, 'SIGKILL') } catch {}
+}
 const home = c.home ?? mkdtempSync(join(tmpdir(), 'codemode-home-'))
-process.on('exit', () => {
+const cleanup = () => {
   for (const pid of [...live]) stop(pid)
+  for (const pid of [...direct]) stopDirect(pid)
   rmSync(work, { recursive: true, force: true })
   if (c.home === undefined) rmSync(home, { recursive: true, force: true })
-})
+}
+process.on('exit', cleanup)
+process.on('SIGTERM', () => process.exit(143))
+process.on('SIGINT', () => process.exit(130))
 copyFileSync(join(root, 'codemode/hooks/register.tsx'), join(work, 'register.mts'))
 Reflect.deleteProperty(globalThis, 'Buffer')
 const mod = await import(join(work, 'register.mts'))
@@ -629,6 +639,11 @@ const $ = {
       if (argv.includes('--permission')) runsStarted++
       const child = spawn(argv[0] as string, argv.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
       const runner = argv.includes('--permission')
+      if (child.pid !== undefined) {
+        direct.add(child.pid)
+        child.on('close', () => direct.delete(child.pid as number))
+        child.on('error', () => direct.delete(child.pid as number))
+      }
       if (!runner && child.pid) {
         waits.add(child.pid)
         child.on('close', () => waits.delete(child.pid as number))
@@ -669,11 +684,12 @@ const $ = {
         : (argv[0] === 'kill' ? kills.push([...argv]) : 0, (argv[0] === 'kill' && c.killDelayMs ? new Promise((r) => setTimeout(r, c.killDelayMs)) : Promise.resolve()).then(() => new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
         if (argv[0] === 'readlink') linksRead.push(String(argv[1]))
         const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
-        if (p.pid !== undefined) live.add(p.pid)
+        if (p.pid !== undefined) direct.add(p.pid)
         if (argv[0] === 'bash') bashWaits++
         if (p.pid) {
           waits.add(p.pid)
-          p.on('close', () => waits.delete(p.pid as number))
+          p.on('close', () => { waits.delete(p.pid as number); direct.delete(p.pid as number) })
+          p.on('error', () => { waits.delete(p.pid as number); direct.delete(p.pid as number) })
         }
         let stdout = ''
         let stderr = ''

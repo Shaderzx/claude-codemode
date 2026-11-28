@@ -6313,3 +6313,121 @@ test('A big Read that sees the file change between pages keeps a third version t
   expect(said).toContain('r5 refused: ');
   expect(readFileSync(f, 'utf8')).toBe(v.c);
 });
+
+test('A read() that sees the file change on a later page keeps a third version that matches the old read from being written over', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 2400);
+  const [asked, gate, setB] = ['asked', 'gate', 'set-b'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, holdLaterPages: { asked, gate }, steps: [
+    { touch: gate },
+    { script: 'await read(' + v.q + ')\nawait sh("rm ' + gate + ' ' + asked + '")\nreturn "r1 read A"' },
+    { script: 'try { await read(' + v.q + '); return "r2 read whole" } catch (e) { return "r2 failed: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { script: v.toB + 'await sh("touch ' + setB + '")\nreturn "r3 set B"', keepTurn: true },
+    { untilFile: setB },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: v.toC + 'return "r4 set C"' },
+    { script: 'try { await write(' + v.q + ', "CLOBBERED\\n"); return "r5 wrote over C" } catch (e) { return "r5 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 failed: ');
+  expect(said).toContain('r5 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});
+
+const failedSighting = (how: 'a Read over the token cap' | 'a patch that does not apply') => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  writeFileSync(join(dir, 'b.txt'), how === 'a Read over the token cap' ? 'B'.repeat(30_000) + '\n' : 'BBBBBB\n');
+  const look = how === 'a Read over the token cap'
+    ? 'const seen = await call("Read", { file_path: ' + v.q + ', limit: 1 })\n'
+    : 'const seen = await call("mcp__lean-ctx__ctx_patch", { op: "replace_unique", path: ' + v.q + ', old_text: "AAAA 00000", new_text: "TRY1" })\n';
+  const out = run({ tools: NO_BASH, engineForgets: true, steps: [
+    { script: 'await read(' + v.q + ')\n' + v.toB + look + v.toC + 'if (seen.ok) return "the look worked"\ntry { await write(' + v.q + ', "CLOBBERED\\n"); return "wrote over C" } catch (e) { return "refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+};
+
+test('A Read that fails over the token cap after the file changed keeps a third version that matches the old read from being written over', () => failedSighting('a Read over the token cap'));
+test('A patch that does not apply after the file changed keeps a third version that matches the old read from being written over', () => failedSighting('a patch that does not apply'));
+
+test('A guarded edit that finds the file changed after its fresh check keeps a third version that matches the old read from being written over', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const [asked, gate, setB] = ['asked', 'gate', 'set-b'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, engineForgets: true, holdReplyContaining: { text: '"fresh":true', asked, gate }, steps: [
+    { script: 'await read(' + v.q + ')\nreturn "r0 read A"' },
+    { script: 'try { await edit(' + v.q + ', "AAAA 00000", "TRY1"); return "r1 edited" } catch (e) { return "r1 failed: " + e.message }', keepTurn: true },
+    { untilFile: asked },
+    { script: v.toB + 'await sh("touch ' + setB + '")\nreturn "r2 set B"', keepTurn: true },
+    { untilFile: setB },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: v.toC + 'try { await write(' + v.q + ', "CLOBBERED\\n"); return "r3 wrote over C" } catch (e) { return "r3 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r1 failed: ');
+  expect(said).toContain('r3 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});
+
+const linkMovesAndBack = (force: boolean) => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'xxxx\n');
+  writeFileSync(join(dir, 'Y', 'f.txt'), 'HEADER\nxxxx\nFOOTER\n');
+  const link = join(dir, 'L');
+  const [asked, gate] = ['asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ tools: NO_BASH, readDelayMs: 600, holdReplyContaining: { text: '1\\txxxx', asked, gate }, steps: [
+    { link: { from: link, to: join(dir, 'Y') } },
+    { script: 'await read(' + JSON.stringify(join(link, 'f.txt')) + ')\nreturn "r0 read Y"' },
+    { script: 'try { await write(' + JSON.stringify(join(link, 'f.txt')) + ', "MINE\\n"' + (force ? ', { force: true }' : '') + '); return "r1 wrote" } catch (e) { return "r1 failed: " + e.message }', keepTurn: true },
+    { untilCalls: { tool: 'Read', count: 2 } },
+    { relink: { from: link, to: join(dir, 'X') } },
+    { untilFile: asked },
+    { relink: { from: link, to: join(dir, 'Y') } },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+  ] });
+  const y = readFileSync(join(dir, 'Y', 'f.txt'), 'utf8');
+  expect(['HEADER\nxxxx\nFOOTER\n', 'MINE\n']).toContain(y);
+  expect(readFileSync(join(dir, 'X', 'f.txt'), 'utf8')).toBe('xxxx\n');
+  expect(out.results.map((r) => r.text).join('\n')).toContain(y === 'MINE\n' ? 'r1 wrote' : 'r1 failed: ');
+};
+
+test('A write through a link that moves away and back while it reads never patches the other file\'s text into the file it names', () => linkMovesAndBack(false));
+test('A forced write through a link that moves away and back while it reads never patches the other file\'s text into the file it names', () => linkMovesAndBack(true));
+
+test('A Read through a link that moves before its path is checked does not outdate the file the link moved to', () => {
+  const dir = scratch();
+  mkdirSync(join(dir, 'X'));
+  mkdirSync(join(dir, 'Y'));
+  writeFileSync(join(dir, 'X', 'f.txt'), 'xx\n');
+  const link = join(dir, 'late_link');
+  const [asked, gate] = ['asked', 'gate'].map((n) => join(dir, n));
+  const yf = JSON.stringify(join(dir, 'Y', 'f.txt'));
+  const out = run({ tools: NO_BASH, holdRealpath: { match: 'late_link', afterTool: 'Read', asked, gate }, steps: [
+    { link: { from: link, to: join(dir, 'X') } },
+    { script: 'await write(' + yf + ', "yyyy\\n")\nreturn "r0 made Y"' },
+    { script: 'await tools.Read({ file_path: ' + JSON.stringify(join(link, 'f.txt')) + ' })\nreturn "r1 read"', keepTurn: true },
+    { untilFile: asked },
+    { relink: { from: link, to: join(dir, 'Y') } },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await edit(' + yf + ', "yyyy", "ZZZZ"); return "r2 edited" } catch (e) { return "r2 failed: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 edited');
+  expect(readFileSync(join(dir, 'Y', 'f.txt'), 'utf8')).toBe('ZZZZ\n');
+});

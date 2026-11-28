@@ -6246,3 +6246,22 @@ test('A subagent that finished must read its files again in a later turn, while 
   expect(readFileSync(s, 'utf8')).toBe('sub\n');
   expect(readFileSync(m, 'utf8')).toBe('MAIN_WROTE\n');
 });
+
+test('A run still open when the session is cleared never makes its read count in the new session', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  writeFileSync(f, 'before clear\n');
+  const q = JSON.stringify(f);
+  const gate = join(dir, 'gate');
+  const out = run({ steps: [
+    { script: 'await read(' + q + ')\nawait waitFor(() => sh("test -f ' + gate + '"), { every: 20, timeout: 30000 })\nreturn "old run done"', keepTurn: true },
+    { untilCalls: { tool: 'Read', count: 1 } },
+    { newSession: true },
+    { touch: gate },
+    { untilQuiet: true },
+    { script: 'const w = await call("Write", { file_path: ' + q + ', content: "NEW_SESSION\\n" })\nreturn w.ok ? "new session wrote" : "new session refused: " + w.error' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('new session refused: ');
+  expect(readFileSync(f, 'utf8')).toBe('before clear\n');
+});

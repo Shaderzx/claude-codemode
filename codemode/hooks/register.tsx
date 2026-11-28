@@ -2681,7 +2681,17 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     if (pinFor) pinRead(pinFor, real)
     const version = await versionOf(file)
     const pagingFrom = readClock
-    const moved = async () => version === undefined || (await versionOf(file)) !== version || (await realOf(file)) !== real || (await sampledNow(real), forgottenFor(real, pagingFrom, version))
+    recordSighting(real, version)
+    const moved = async () => {
+      const now = await versionOf(file)
+      const stillThere = (await realOf(file)) === real
+      if (version === undefined || now !== version || !stillThere) {
+        if (stillThere) recordSighting(real, now)
+        return true
+      }
+      await sampledNow(real)
+      return forgottenFor(real, pagingFrom, version)
+    }
     for (let guard = 0; guard < 10_000; guard++) {
       if (over) return undefined
       const r = late() ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
@@ -3297,6 +3307,7 @@ export const register: Register = (on) => {
           j.expiry?.cancel()
           jobsById.delete(j.id)
         }
+        sessionReads.delete(agent)
       } else {
         if ((e as { isAborted?: unknown }).isAborted === true) {
           const jobs = agentJobs(MAIN).filter((j) => (turnId ? j.turnId === turnId : current && j.turnSeq === seq))

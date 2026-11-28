@@ -6272,12 +6272,13 @@ test('A big Read that sees a newer version and fails between pages keeps a third
   const v = threeVersions(dir, f, 4);
   const big = join(dir, 'big.txt');
   writeFileSync(big, Array.from({ length: 6000 }, (_, i) => 'BBBBBB ' + String(i).padStart(5, '0') + ' ' + 'x'.repeat(45)).join('\n') + '\n');
-  const [asked, gate] = ['asked', 'gate'].map((n) => join(dir, n));
+  const [asked, gate, setC] = ['asked', 'gate', 'set-c'].map((n) => join(dir, n));
   const out = run({ holdLaterPages: { asked, gate }, steps: [
     { script: 'await read(' + v.q + ')\nreturn "r1 read A"' },
     { script: 'await sh("cp ' + big + ' ' + f + '")\nconst r = await call("Read", { file_path: ' + v.q + ' })\nreturn r.ok ? "r2 read whole" : "r2 failed: " + r.error', keepTurn: true },
     { untilFile: asked },
-    { script: v.toC + 'return "r3 set C"' },
+    { script: v.toC + 'await sh("touch ' + setC + '")\nreturn "r3 set C"', keepTurn: true },
+    { untilFile: setC },
     { touch: gate },
     { untilRunsDone: true },
     { collect: true },
@@ -6286,5 +6287,29 @@ test('A big Read that sees a newer version and fails between pages keeps a third
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('r2 failed: ');
   expect(said).toContain('r4 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});
+
+test('A big Read that sees the file change between pages keeps a third version that matches the old read from being written over', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 6000, 45);
+  const [asked, gate, setB] = ['asked', 'gate', 'set-b'].map((n) => join(dir, n));
+  const out = run({ holdLaterPages: { asked, gate }, steps: [
+    { touch: gate },
+    { script: 'await read(' + v.q + ')\nawait sh("rm ' + gate + ' ' + asked + '")\nreturn "r1 read A"' },
+    { script: 'const r = await call("Read", { file_path: ' + v.q + ' })\nreturn r.ok ? "r2 read whole" : "r2 failed: " + r.error', keepTurn: true },
+    { untilFile: asked },
+    { script: v.toB + 'await sh("touch ' + setB + '")\nreturn "r3 set B"', keepTurn: true },
+    { untilFile: setB },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: v.toC + 'return "r4 set C"' },
+    { script: 'try { await write(' + v.q + ', "CLOBBERED\\n"); return "r5 wrote over C" } catch (e) { return "r5 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 failed: ');
+  expect(said).toContain('r5 refused: ');
   expect(readFileSync(f, 'utf8')).toBe(v.c);
 });

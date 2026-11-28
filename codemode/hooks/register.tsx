@@ -689,6 +689,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const settleBy = Date.now() + 5000
     for (let n = 0; ; n++) {
       if (n) await pause(n)
+      const before = await freshOf(file, what)
       let text
       try {
         text = await read(file)
@@ -697,7 +698,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       }
       if (text !== undefined) {
         const check = await freshOf(file, what)
-        if (check.fresh === true && typeof check.version === 'string') return { text, check }
+        if (check.fresh === true && typeof check.version === 'string' && check.real === before.real) return { text, check }
       }
       if (started + timeout - Date.now() < 300) throw toolError(what + ': ' + file + ' was not replaced: the run ran out of time while it kept changing; try again once it settles, or give the run a longer timeout_ms')
       if (Date.now() >= settleBy) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
@@ -2129,6 +2130,19 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       () => undefined,
     )
 
+  const recordSighting = (f: string, version: string | undefined) => {
+    if (version === undefined) return
+    const stamp = ++readClock
+    noteSeen(f, stamp, version)
+    outdateOlderViews(job, f, version, stamp)
+    if (job.reads.has(f) && (job.readAt.get(f) ?? 0) < stamp && job.reads.get(f) !== version) job.reads.set(f, undefined)
+    if (job.progress.has(f) && (job.progressAt.get(f) ?? 0) < stamp && job.progress.get(f)?.version !== version) {
+      job.progress.delete(f)
+      job.progressAt.delete(f)
+    }
+    for (const [id, started] of job.pages) if (started.real === f && (started.at ?? 0) < stamp && started.version !== version) job.pages.set(id, {})
+    invalidateQueued(job, f, (seen, at) => (at ?? 0) < stamp && seen !== version, true)
+  }
   const handle = async (m: Request): Promise<Record<string, unknown>> => {
     const p = m.payload
     if (late()) return refusal('request')
@@ -2147,6 +2161,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const read = job.reads.has(path) || readPaths.has(path)
       const was = readVersionFor(job, path)
       const now = was === undefined ? undefined : await versionOf(path)
+      if (now !== was) recordSighting(path, now)
       return { ok: true, read, fresh: was !== undefined && now !== undefined && now === was, version: was, real: path }
     }
     if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
@@ -2229,6 +2244,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (exists) {
         const was = readVersionFor(job, key)
         const now = await versionOf(key)
+        if (now !== was) recordSighting(key, now)
         if (was === undefined || now === undefined || now !== was || (await movedSinceLocked(m, path, key)))
           return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
         args.file_path = key
@@ -2593,6 +2609,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (receipt?.whole && receipt.version === undefined && !receipt.window) receipt.version = await versionOf(receipt.file)
       if (ownPages && receipt && !receipt.whole && receipt.next !== undefined) ownPages.next = receipt.next
       if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : wrote && writeKey !== undefined ? writeKey : await realOf(receipt.file)
+      else if (tool === 'Read' && realAfter !== undefined) recordSighting(realAfter, readAfter)
       if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
       else if (isStub(text, tool) && p.handled !== true) {
         stubs.add(tool)

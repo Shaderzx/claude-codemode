@@ -626,7 +626,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     throw toolError('sh: ' + r.error, r)
   }
   let readSeq = 0
-  const read = (path) => readText(path, false)
+  const read = async (path) => (await readText(path, false)).text
   const readText = async (path, internal) => {
     const readId = ++readSeq
     if (!names.has('Read')) throw toolError('read: this session has no Read tool')
@@ -637,6 +637,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let stubbed = 0
     let tried = new Set()
     let cap = 2000
+    let real
     for (;;) {
       const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true, readId, ...(internal ? { internal: true } : {}) })
       const cutAtCap = r.ok && r.result && r.result.file && r.result.file.truncatedByTokenCap === true
@@ -662,6 +663,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (!got.length && !NOTICE.test(t))
         throw toolError('read: Read answered with no file lines (a picture, a binary file, or a hook rewrote the answer): ' + t.slice(0, 200), r)
       rows.push(...got)
+      real = offset === 1 ? r.real : real === r.real ? real : null
       const total = r.result && r.result.file && typeof r.result.file.totalLines === 'number' ? r.result.file.totalLines : undefined
       const more = total !== undefined && offset + got.length - 1 < total
       if ((got.length < limit && !more) || r.whole === true) break
@@ -671,7 +673,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       limit = Math.min(2000, limit * 2)
       stubbed = 0
     }
-    return rows.join('\n')
+    return { text: rows.join('\n'), real: typeof real === 'string' ? real : undefined }
   }
   const UNREAD = /read it first|has not been read|modified since read|changed since (?:it was )?last read/i
   const MOVED = /modified since read|changed since (?:it was )?last read/i
@@ -689,16 +691,15 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const settleBy = Date.now() + 5000
     for (let n = 0; ; n++) {
       if (n) await pause(n)
-      const before = await freshOf(file, what)
-      let text
+      let got
       try {
-        text = await read(file)
+        got = await readText(file, false)
       } catch (err) {
         if (!/changed while it was read/i.test(String(err && err.message))) throw err
       }
-      if (text !== undefined) {
+      if (got !== undefined) {
         const check = await freshOf(file, what)
-        if (check.fresh === true && typeof check.version === 'string' && check.real === before.real) return { text, check }
+        if (check.fresh === true && typeof check.version === 'string' && got.real !== undefined && check.real === got.real) return { text: got.text, check }
       }
       if (started + timeout - Date.now() < 300) throw toolError(what + ': ' + file + ' was not replaced: the run ran out of time while it kept changing; try again once it settles, or give the run a longer timeout_ms')
       if (Date.now() >= settleBy) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
@@ -743,7 +744,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       const check = await freshOf(file, 'write')
       if (!check.read) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
       if (check.fresh === false) throw moved()
-      const now = await readText(file, true)
+      const got = await readText(file, true)
+      if (got.real === undefined || got.real !== check.real) throw moved()
+      const now = got.text
       if (!now) throw empty()
       r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
@@ -2261,7 +2264,9 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const real = typeof p.expectedReal === 'string' ? p.expectedReal : await realOf(path)
       if (!job.reads.has(real) && !readPaths.has(real)) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
       const recorded = readVersionFor(job, real)
-      if (recorded !== p.expectedVersion || (await versionOf(real)) !== p.expectedVersion || (await movedSinceLocked(m, path, real))) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+      const now = await versionOf(real)
+      if (now !== recorded) recordSighting(real, now)
+      if (recorded !== p.expectedVersion || now !== p.expectedVersion || (await movedSinceLocked(m, path, real))) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
       args.path = real
     }
     if (tool === 'Read' && typeof args.file_path === 'string') args.file_path = absolute(args.file_path.trim(), cwd, home)
@@ -2281,6 +2286,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
     const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
     pinRead(m, realBefore)
     const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+    if (realBefore !== undefined && (await realOf(String(args.file_path))) === realBefore) recordSighting(realBefore, readBefore)
     const askedAt = readClock
     const forgottenSinceAsked = (real?: string) => forgottenFor(real, askedAt, readBefore)
     const liveChains = (k: string) => {
@@ -2319,6 +2325,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
         const key = patchKeys.get(o.path) as string
         const was = latestReadVersion(job, key)
         const now = await versionOf(key)
+        if (now !== was) recordSighting(key, now)
         sentVersions.set(key, now)
         patchFresh.set(key, was !== undefined && was === now)
       }
@@ -2581,6 +2588,7 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
       const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
       await sampledNow(realAfter)
+      if (tool === 'Read' && realAfter !== undefined) recordSighting(realAfter, realAfter === realBefore ? readAfter : await stillNamed(realAfter))
       if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
         const from = typeof args.offset === 'number' ? args.offset : 1
         const pages = typeof p.readId === 'number' ? `#${p.readId}` : args.file_path
@@ -2609,14 +2617,13 @@ const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: 
       if (receipt?.whole && receipt.version === undefined && !receipt.window) receipt.version = await versionOf(receipt.file)
       if (ownPages && receipt && !receipt.whole && receipt.next !== undefined) ownPages.next = receipt.next
       if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : wrote && writeKey !== undefined ? writeKey : await realOf(receipt.file)
-      else if (tool === 'Read' && realAfter !== undefined) recordSighting(realAfter, readAfter)
       if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
       else if (isStub(text, tool) && p.handled !== true) {
         stubs.add(tool)
         if (/read-dedup/.test(text)) deduped = true
       }
       const leanJob = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
-      return { ok: true, text, result, ...exit, ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(receipt ? { [READ]: receipt } : {}), ...(patchReads.length ? { [PATCH_READS]: patchReads } : {}), ...(isPatch || writeKey !== undefined ? { [UNDELIVERED]: changeUnsure } : {}) }
+      return { ok: true, text, result, ...exit, ...(tool === 'Read' && p.handled === true ? { real: heldVersion !== undefined && realBefore === realAfter ? realAfter : null } : {}), ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(receipt ? { [READ]: receipt } : {}), ...(patchReads.length ? { [PATCH_READS]: patchReads } : {}), ...(isPatch || writeKey !== undefined ? { [UNDELIVERED]: changeUnsure } : {}) }
     }
     const bad = tidy(tool, text)
     if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {

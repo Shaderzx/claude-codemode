@@ -6165,8 +6165,9 @@ test('A patch whose own record is dropped still outdates a subagent\'s read from
   const xf = JSON.stringify(xfPath);
   const creates = Array.from({ length: 4 }, (_, i) => '{ op: "create", path: ' + JSON.stringify(join(dir, 'slow-' + i + '.txt')) + ', new_text: "g\\n" }').join(', ');
   const out = run({ tools: NO_BASH, engineForgets: true, statDelayMs: 600, statDelayFor: 'X/f.txt', steps: [
+    { script: 'await read(' + xf + ')\nreturn "main read"' },
     { script: 'await read(' + xf + ')\nreturn "sub read"', agentId: 'a1' },
-    { script: 'await read(' + xf + ')\nconst r = await call("mcp__lean-ctx__ctx_patch", { ops: [' + creates + ', { op: "replace_unique", path: ' + xf + ', old_text: "aaaa", new_text: "pppppp" }] })\nreturn r.ok ? "main patched" : r.error', keepTurn: true },
+    { script: 'const r = await call("mcp__lean-ctx__ctx_patch", { ops: [' + creates + ', { op: "replace_unique", path: ' + xf + ', old_text: "aaaa", new_text: "pppppp" }] })\nreturn r.ok ? "main patched" : r.error', keepTurn: true },
     { untilFile: join(dir, 'slow-3.txt') },
     { untilStatPending: true },
     { script: 'await sh("rm -rf ' + join(dir, 'X') + ' && ln -s ' + join(dir, 'Y') + ' ' + join(dir, 'X') + '")\nreturn "main symlinked"', keepTurn: true },

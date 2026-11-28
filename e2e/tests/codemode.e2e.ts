@@ -6265,3 +6265,26 @@ test('A run still open when the session is cleared never makes its read count in
   expect(said).toContain('new session refused: ');
   expect(readFileSync(f, 'utf8')).toBe('before clear\n');
 });
+
+test('A big Read that sees a newer version and fails between pages keeps a third version that matches the old read from being written over', () => {
+  const dir = scratch();
+  const f = join(dir, 'f.txt');
+  const v = threeVersions(dir, f, 4);
+  const big = join(dir, 'big.txt');
+  writeFileSync(big, Array.from({ length: 6000 }, (_, i) => 'BBBBBB ' + String(i).padStart(5, '0') + ' ' + 'x'.repeat(45)).join('\n') + '\n');
+  const [asked, gate] = ['asked', 'gate'].map((n) => join(dir, n));
+  const out = run({ holdLaterPages: { asked, gate }, steps: [
+    { script: 'await read(' + v.q + ')\nreturn "r1 read A"' },
+    { script: 'await sh("cp ' + big + ' ' + f + '")\nconst r = await call("Read", { file_path: ' + v.q + ' })\nreturn r.ok ? "r2 read whole" : "r2 failed: " + r.error', keepTurn: true },
+    { untilFile: asked },
+    { script: v.toC + 'return "r3 set C"' },
+    { touch: gate },
+    { untilRunsDone: true },
+    { collect: true },
+    { script: 'try { await write(' + v.q + ', "CLOBBERED\\n"); return "r4 wrote over C" } catch (e) { return "r4 refused: " + e.message }' },
+  ] });
+  const said = out.results.map((r) => r.text).join('\n');
+  expect(said).toContain('r2 failed: ');
+  expect(said).toContain('r4 refused: ');
+  expect(readFileSync(f, 'utf8')).toBe(v.c);
+});

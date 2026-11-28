@@ -6180,17 +6180,17 @@ test('A patch whose own record is dropped still outdates a subagent\'s read from
   expect(readFileSync(xfPath, 'utf8')).toBe('PREC\n');
 });
 
-const sightingOfNewer = (how: 'a later lines read in the same run' | 'a later lines read in another run' | 'a refused write') => {
+const sightingOfNewer = (how: 'a later lines read in the same run' | 'a later lines read in another run' | 'a refused write' | 'a refused patch-tool write' | 'a refused patch-tool edit') => {
   const dir = scratch();
   const f = join(dir, 'f.txt');
   const v = threeVersions(dir, f, 4);
   const lines = 'await tools.Read({ file_path: ' + v.q + ', offset: 2, limit: 2 })\n';
-  const refusedWrite = 'await write(' + v.q + ', "TRY1\\n").catch(() => undefined)\n';
+  const refusedWrite = how === 'a refused patch-tool edit' ? 'await edit(' + v.q + ', "AAAA", "TRY1").catch(() => undefined)\n' : 'await write(' + v.q + ', "TRY1\\n").catch(() => undefined)\n';
   const clobber = 'try { await write(' + v.q + ', "CLOBBERED\\n"); return "wrote over C" } catch (e) { return "refused: " + e.message }';
   const steps = how === 'a later lines read in another run'
     ? [{ script: 'await read(' + v.q + ')\nreturn "r1 read"' }, { script: v.toB + lines + 'return "r2 saw B"' }, { script: v.toC + clobber }]
-    : [{ script: 'await read(' + v.q + ')\n' + v.toB + (how === 'a refused write' ? refusedWrite : lines) + v.toC + clobber }];
-  const out = run({ engineForgets: true, steps });
+    : [{ script: 'await read(' + v.q + ')\n' + v.toB + (how.startsWith('a refused') ? refusedWrite : lines) + v.toC + clobber }];
+  const out = run({ engineForgets: true, ...(how.includes('patch-tool') ? { tools: NO_BASH } : {}), steps });
   const said = out.results.map((r) => r.text).join('\n');
   expect(said).toContain('refused: ');
   expect(readFileSync(f, 'utf8')).toBe(v.c);
@@ -6199,6 +6199,8 @@ const sightingOfNewer = (how: 'a later lines read in the same run' | 'a later li
 test('Seeing a newer version through later lines of a file in the same run keeps a third version that matches the old read from being written over', () => sightingOfNewer('a later lines read in the same run'));
 test('Seeing a newer version through later lines of a file in another run keeps a third version that matches the old read from being written over', () => sightingOfNewer('a later lines read in another run'));
 test('A write refused because the file changed keeps a third version that matches the old read from being written over', () => sightingOfNewer('a refused write'));
+test('A patch-tool write refused because the file changed keeps a third version that matches the old read from being written over', () => sightingOfNewer('a refused patch-tool write'));
+test('A patch-tool edit refused because the file changed keeps a third version that matches the old read from being written over', () => sightingOfNewer('a refused patch-tool edit'));
 
 test('A forced write through a link that moves while it reads the old target writes the file the link now names', () => {
   const dir = scratch();

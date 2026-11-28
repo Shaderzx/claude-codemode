@@ -1,4 +1,7 @@
-import type { Register } from 'claude-code'
+import type { Hook, Register } from 'claude-code'
+
+const patchToolName = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/
+const isPatchTool = (name: string) => patchToolName.test(name)
 
 // The one tool the model calls. Every other tool is deferred and refused when
 // the model calls it directly; scripts reach them through `tools.<name>()`.
@@ -58,25 +61,28 @@ export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<stri
   return [
     'Run a JavaScript script that calls tools. It is the only tool that does work: every other tool is called from inside a script, and a direct call is refused. Only what the script outputs reaches you.',
     '',
-    'Each run is a round trip that re-sends the whole conversation, so do a whole step in one script: start every call you can already name at once with Promise.all, and chain the steps that need no judgment in between (search, then read the hits, then filter) inside the script. Return when the next step needs your judgment, with only what you need.',
+    'Every run goes to the background: the call answers at once with its id (r1, r2, ...). A finished run\'s output comes with your next run\'s reply, and an empty script runs nothing and fetches it. End your turn with runs going and a notice comes when they finish. Never poll (empty scripts, jobs() or a waiting script): work on, or end your turn. Esc stops runs.',
+    '',
+    'Each run re-sends the whole conversation, so do a whole step per script: start every call you can already name at once with Promise.all, and chain steps that need no judgment inside the script.',
     '',
     '`script` is the body of an async function: top-level await and return work. An optional first line sets limits:',
     '// @options: {"timeout_ms": 600000, "max_output_chars": 20000}',
-    'Longer output is cut, each item keeping a share, and the cut names a file that holds all of it.',
+    'Longer output is cut, and the cut names a file that holds all of it.',
     'Text holding ${, backticks or # (shell, Python, HTML) goes in a raw block, never in a template literal: a line // @text NAME, the text, then a line // @end; the script reads it as TEXT.NAME.',
     '',
     'Globals:',
-    '- sh(cmd) runs a command on the session\'s shell (Bash or what replaces it) and resolves to its text, with .exitCode and .ok; a non-zero exit does not throw. quote(s) makes s one safe shell word.',
-    '- read(path) is a file\'s whole text without line numbers (a relative path starts at the session folder); write(path, text, { force }?) and edit(path, old, new, { all, force }?) take absolute paths and go through Write/Edit or the session\'s patch tool, which keep their read-before-write check: changing a file not yet read takes { force: true }, which reads it first. read() gives line endings back as \\n.',
-    '- waitFor(check, { every = 1000, timeout }) calls check until it returns something truthy, and returns that; deadline() is the ms left before the run times out.',
-    '- tools.<Name>(args): call a tool by its exact name (characters invalid in identifiers become _: tools.mcp__lean_ctx__ctx_read for mcp__lean-ctx__ctx_read; a unique suffix such as tools.ctx_read works too). Resolves to the result text; rejects on a denied or failed call.',
-    '- call(name, args): the same, but never throws: { ok, text, result, error, exitCode? }, result being the structured output; String(r) is its text. Promise.allSettled also keeps partial results.',
-    '- A returned value and text(value) add output items (an object holding multi-line strings prints them raw, one heading per key); console.log/warn/error add lines to a <console_output> block.',
-    '- describeTool(name): async { name, description, input }, input being the arguments as a TypeScript type when known. A built-in tool called with bad arguments answers with its type.',
-    '- ask(prompt, { model = "haiku", system, maxTokens = 1024 }?): one completion by another model, without tools; boil large data down with it so only the answer reaches you.',
-    '- Images and PDFs arrive as markers like [image #1 image/png 12KB]; a marker in the output attaches the picture for you to see.',
-    '- ALL_TOOLS: [{ name, description }] (first sentences); searchTools(query, { limit = 8 }?) ranks them.',
-    '- store(key, value) / load(key): small JSON values kept across runs. exit(): stop successfully. btoa, atob, TextEncoder, TextDecoder and Buffer work.',
+    '- sh(cmd): runs a command on the session\'s shell; resolves to its text with .exitCode and .ok, never throws on a non-zero exit. quote(s) makes s one shell word.',
+    '- read(path): a file\'s whole text, no line numbers, line endings as \\n; a relative path starts at the session folder. write(path, text, { force }?), edit(path, old, new, { all, force }?): absolute paths, read the file first ({ force: true } reads it for you).',
+    '- waitFor(check, { every = 1000, timeout }): calls check until it returns something truthy; deadline(): ms left.',
+    '- tools.<Name>(args): call a tool by its exact name (invalid characters become _: tools.mcp__lean_ctx__ctx_read; a unique suffix such as tools.ctx_read works). Resolves to its text; rejects on failure.',
+    '- call(name, args): the same, never throws: { ok, text, result, error, exitCode? }; String(r) is its text. Promise.allSettled also keeps partial results.',
+    '- A returned value and text(value) add output items; console.log adds lines.',
+    '- describeTool(name): { name, description, input } with input as a TypeScript type when known.',
+    '- ask(prompt, { model = "haiku", system, maxTokens }?): one completion by another model, no tools.',
+    '- Images and PDFs arrive as markers like [image #1 image/png 12KB]; a marker in the output attaches the picture.',
+    '- ALL_TOOLS: [{ name, description }]; searchTools(query, { limit = 8 }?) ranks them.',
+    '- jobs(): promise of your other runs still going, [{ id, state, seconds }]; cancel(id) stops one, and its output comes back marked [cancelled].',
+    '- store(key, value) / load(key): small JSON kept across runs. exit(): stop successfully. btoa, atob, TextEncoder, TextDecoder, Buffer.',
     'No fetch, timers, process, require or import: only tools reach the outside world.',
     '',
     'Common arguments:',
@@ -84,7 +90,7 @@ export const describeRun = (names: ReadonlySet<string>, denied: ReadonlyMap<stri
     ...(missing.length ? [`Not in this session: ${missing.join(', ')}. searchTools() finds other tools.`] : []),
     ...(refused.length ? [`${refused.join(', ')}: denied by a hook here.`] : []),
     '',
-    'Tool calls are real: a later failure undoes nothing, and calls still running when the script ends or times out are abandoned, not stopped.',
+    'Tool calls are real: a later failure undoes none, and calls still running when a run ends are abandoned, not stopped.',
     '',
     'Example:',
     example,
@@ -103,7 +109,8 @@ process.stdin.on('data', (d) => { input += d })
 process.stdin.on('end', () => { main(JSON.parse(input)) })
 const send = (o, cb) => process.stdout.write(MARK + JSON.stringify(o) + '\n', cb)
 for (const k of Object.keys(process.env)) delete process.env[k]
-send({ pid: process.pid })
+const booted = Date.now()
+send({ pid: process.pid, started: booted })
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const thenable = (v) => {
   try { return v !== null && (typeof v === 'object' || typeof v === 'function') && typeof v.then === 'function' } catch { return false }
@@ -245,9 +252,9 @@ const isDedup = (t) => {
   const rows = String(t).split('\n').filter((l) => /^\s*\d+\t/.test(l))
   return rows.length <= 2 && /^\s*1\t\S[^\n]* \[unchanged \d+L · lean-ctx read-dedup\]\s*$/.test(rows[0] || '')
 }
-async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied: deniedList, shell: shellPref, seen: seenList }) {
+async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied: deniedList, shell: shellPref }) {
   fs.mkdirSync(dir, { recursive: true })
-  const started = Date.now()
+  const started = booted
   let room = 1000000
   const keep = (out, s, v) => {
     if (room <= 0) return
@@ -280,9 +287,15 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     finished = true
     try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
     if (failure && failure.length > 100000) failure = failure.slice(0, safeEnd(failure, 100000)) + '…'
-    send({ done: true, failure, kind, failedId, alongside: failedId ? alongsideOf(failedId) : 0 }, () => process.exit(0))
+    const alongsideIds = failedId ? alongsideOf(failedId) : []
+    send({ done: true, failure, kind, failedId, alongside: alongsideIds.length, alongsideIds, answered: answeredIds }, () => process.exit(0))
   }
-  setTimeout(() => finish('timed out after ' + timeout + 'ms', 'timeout'), timeout)
+  const timedOut = () => finish('timed out after ' + timeout + 'ms', 'timeout')
+  const endTimedOut = () => {
+    timedOut()
+    return new Promise(() => {})
+  }
+  setTimeout(timedOut, Math.max(0, started + timeout - Date.now()))
   const unhandled = new Map()
   process.on('unhandledRejection', (err, p) => { unhandled.set(p, err) })
   process.on('rejectionHandled', (p) => { unhandled.delete(p) })
@@ -290,17 +303,19 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   let seq = 0
   let tick = 0
   const timing = new Map()
+  const answeredIds = []
   const alongsideOf = (id) => {
     const f = timing.get(id)
-    if (!f) return 0
-    let n = 0
-    for (const [k, t] of timing) if (k !== id && (t.ok || t.answered === undefined) && t.sent < (f.answered ?? Infinity) && (t.answered ?? Infinity) > f.sent) n++
-    return n
+    if (!f) return []
+    const ids = []
+    for (const [k, t] of timing) if (k !== id && (t.ok || t.answered === undefined) && t.sent < (f.answered ?? Infinity) && (t.answered ?? Infinity) > f.sent) ids.push(k)
+    return ids
   }
   const req = async (kind, payload) => {
     const id = ++seq
     // The mod drops a line this long, which would leave the call waiting forever.
     if (JSON.stringify(payload).length > 7000000) return { ok: false, error: 'The request is too large to pass to the mod.', id }
+    if (Date.now() >= started + timeout) return endTimedOut()
     const t = { sent: ++tick }
     if (kind === 'call') timing.set(id, t)
     send({ id, kind, payload })
@@ -311,6 +326,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       try { res = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { continue }
       try { fs.unlinkSync(file) } catch {}
       t.answered = ++tick
+      answeredIds.push(id)
       t.ok = !!(res && res.ok)
       if (res && typeof res === 'object') {
         if (res.resultIsText) res.result = res.text
@@ -325,7 +341,6 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const byIdent = new Map(all.map((t) => [ident(t.name), t.name]))
   const names = new Set(all.map((t) => t.name))
   const denied = new Set(deniedList || [])
-  const seen = new Set(seenList || [])
   const resolve = (name) => {
     const n = String(name)
     if (names.has(n)) return n
@@ -350,13 +365,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   }
   const norm = (s) => {
     if (!s.startsWith('/')) return s
-    const out = []
-    for (const seg of s.split('/')) {
-      if (seg === '' || seg === '.') continue
-      if (seg === '..') out.pop()
-      else out.push(seg)
-    }
-    return '/' + out.join('/')
+    return '/' + s.split('/').filter((seg) => seg !== '' && seg !== '.').join('/')
   }
   const abs = (p) => {
     const s = String(p).trim()
@@ -365,11 +374,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     return cwd ? norm(cwd.replace(/\/$/, '') + '/' + s.replace(/^\.\//, '')) : s
   }
   const noteRead = (tool, args, r) => {
-    const target = args && (typeof args.file_path === 'string' ? args.file_path : args.path)
-    if (r.ok && r.whole === true && typeof target === 'string') seen.add(abs(target))
-    if (r.ok && Array.isArray(r.readNow)) for (const f of r.readNow) seen.add(f)
     delete r.whole
-    delete r.readNow
     if (r.denied && r.alt) denied.add(tool)
     else if (r.ok) denied.delete(tool)
   }
@@ -403,11 +408,12 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
   const usable = (n) => names.has(n) && !denied.has(n)
   const named = (re) => all.map((t) => t.name).filter((n) => re.test(n) && !denied.has(n))
   const LEAN_SHELL = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/
+  const LEAN_PATCH = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/
   const shells = () => {
     const order = [...new Set([...(shellPref && usable(shellPref) ? [shellPref] : []), ...(usable('Bash') ? ['Bash'] : []), ...named(LEAN_SHELL)])]
     return order.length || !names.has('Bash') ? order : ['Bash']
   }
-  const patcher = () => named(/^mcp__lean[-_]ctx__(?:ctx_)?patch$/)[0]
+  const patcher = () => named(LEAN_PATCH)[0]
   const shResult = (text, code, tool) => Object.assign(new String(text), { exitCode: code, ok: code === 0, tool }, text && text.withheld === true ? { withheld: true, truncated: true } : {})
   const withheldOutput = (t) => Object.assign(new String(t), { withheld: true })
   const LIMIT = 7000
@@ -619,7 +625,10 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (r.alt) denied.add(order[0])
     throw toolError('sh: ' + r.error, r)
   }
-  const read = async (path) => {
+  let readSeq = 0
+  const read = async (path) => (await readText(path, false)).text
+  const readText = async (path, internal) => {
+    const readId = ++readSeq
     if (!names.has('Read')) throw toolError('read: this session has no Read tool')
     const file = abs(path)
     const rows = []
@@ -628,9 +637,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let stubbed = 0
     let tried = new Set()
     let cap = 2000
-    let whole = false
+    let real
     for (;;) {
-      const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true })
+      const r = await req('call', { tool: 'Read', args: { file_path: file, offset, limit }, handled: true, readId, ...(internal ? { internal: true } : {}) })
       const cutAtCap = r.ok && r.result && r.result.file && r.result.file.truncatedByTokenCap === true
       if (!r.ok || cutAtCap) {
         if (cutAtCap || /exceeds maximum allowed/i.test(String(r.error))) {
@@ -640,9 +649,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
           if (limit) continue
           throw toolError('read: ' + file + ' has a line over Read\'s token cap at line ' + offset + ', so it cannot be read in pages; read part of it with sh() and head -c', r)
         }
+        if (/EISDIR/.test(String(r.error))) throw toolError('read: ' + file + ' is a folder, not a file', r)
         throw toolError('read: ' + r.error, r)
       }
-      if (r.whole === true) whole = true
       const t = String(r.text)
       if (isDedup(t)) {
         tried.add(limit)
@@ -654,6 +663,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       if (!got.length && !NOTICE.test(t))
         throw toolError('read: Read answered with no file lines (a picture, a binary file, or a hook rewrote the answer): ' + t.slice(0, 200), r)
       rows.push(...got)
+      real = offset === 1 ? r.real : real === r.real ? real : null
       const total = r.result && r.result.file && typeof r.result.file.totalLines === 'number' ? r.result.file.totalLines : undefined
       const more = total !== undefined && offset + got.length - 1 < total
       if ((got.length < limit && !more) || r.whole === true) break
@@ -663,15 +673,39 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       limit = Math.min(2000, limit * 2)
       stubbed = 0
     }
-    if (whole) seen.add(file)
-    return rows.join('\n')
+    return { text: rows.join('\n'), real: typeof real === 'string' ? real : undefined }
   }
   const UNREAD = /read it first|has not been read|modified since read|changed since (?:it was )?last read/i
   const MOVED = /modified since read|changed since (?:it was )?last read/i
   const wrote = (file, verb = 'wrote') => {
-    seen.add(file)
     return verb + ' ' + file
   }
+  const timeToRetry = (tryStarted) => started + timeout - Date.now() > Math.max(500, Date.now() - tryStarted + 100)
+  const pause = (n) => sleep(Math.min(Math.min(500, 10 * 2 ** n) * (1 + Math.random()), Math.max(0, started + timeout - Date.now() - 400)))
+  const freshOf = async (file, what) => {
+    const check = await req('fresh', { path: file })
+    if (!check || check.ok === false) throw toolError(what + ': ' + (check && check.error), check)
+    return check
+  }
+  const forcedRead = async (file, what) => {
+    const settleBy = Date.now() + 5000
+    for (let n = 0; ; n++) {
+      if (n) await pause(n)
+      let got
+      try {
+        got = await readText(file, false)
+      } catch (err) {
+        if (!/changed while it was read/i.test(String(err && err.message))) throw err
+      }
+      if (got !== undefined) {
+        const check = await freshOf(file, what)
+        if (check.fresh === true && typeof check.version === 'string' && got.real !== undefined && check.real === got.real) return { text: got.text, check }
+      }
+      if (started + timeout - Date.now() < 300) throw toolError(what + ': ' + file + ' was not replaced: the run ran out of time while it kept changing; try again once it settles, or give the run a longer timeout_ms')
+      if (Date.now() >= settleBy) throw toolError(what + ': ' + file + ' keeps changing while it is read, so it was not replaced; try again once it settles')
+    }
+  }
+  const guardOf = (check) => (typeof check.version === 'string' ? { expectedVersion: check.version, ...(typeof check.real === 'string' ? { expectedReal: check.real } : {}) } : {})
   const unreadWrite = (r) => !r.ok && !r.refused && !r.denied && UNREAD.test(String(r.error))
   const write = async (path, content, opts) => {
     const file = absOnly(path, 'write')
@@ -679,11 +713,14 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     const force = !!(opts && typeof opts === 'object' && opts.force)
     if (usable('Write')) {
       let r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
-      if (unreadWrite(r)) {
-        if (!force && MOVED.test(String(r.error))) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
-        if (!force) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace it unread', r)
-        await read(file)
+      if (unreadWrite(r) && !force && MOVED.test(String(r.error))) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
+      if (unreadWrite(r) && !force) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace it unread', r)
+      for (let n = 0; unreadWrite(r); n++) {
+        if (n) await pause(n)
+        const tryStarted = Date.now()
+        await forcedRead(file, 'write')
         r = await req('call', { tool: 'Write', args: { file_path: file, content: body } })
+        if (!timeToRetry(tryStarted)) break
       }
       if (r.ok) return wrote(file)
       if (r.denied && r.alt) denied.add('Write')
@@ -694,15 +731,37 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     let r = await req('call', { tool: patch, args: { op: 'create', path: file, new_text: body } })
     if (r.ok) return wrote(file)
     if (r.refused || r.denied || !/already exists/i.test(String(r.error))) throw toolError('write: ' + r.error, r)
-    if (!force && !seen.has(file)) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
-    if (!force && (await req('fresh', { path: file })).fresh === false) throw toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it')
-    const now = await read(file)
-    if (!now) throw toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
-    r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now, new_text: body } })
-    if (r.ok) return wrote(file)
-    if (!r.refused && !r.denied && /not found/i.test(String(r.error)) && !now.includes('\r')) {
-      r = await req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: now.split('\n').join('\r\n'), new_text: body } })
+    const moved = () => toolError('write: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true } to replace it', r)
+    const empty = () => toolError('write: ' + file + ' exists and is empty, and the patch tool cannot replace an empty file; use Write, or remove the file first')
+    const replaceWhole = async (now, check) => {
+      const guard = guardOf(check)
+      const once = (old) => req('call', { tool: patch, args: { op: 'replace_unique', path: file, old_text: old, new_text: body }, ...guard })
+      const first = await once(now)
+      const crlf = !first.ok && !first.refused && !first.denied && !unreadWrite(first) && /not found/i.test(String(first.error)) && !now.includes('\r')
+      return crlf ? once(now.split('\n').join('\r\n')) : first
+    }
+    if (!force) {
+      const check = await freshOf(file, 'write')
+      if (!check.read) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
+      if (check.fresh === false) throw moved()
+      const got = await readText(file, true)
+      if (got.real === undefined || got.real !== check.real) throw moved()
+      const now = got.text
+      if (!now) throw empty()
+      r = await replaceWhole(now, check)
       if (r.ok) return wrote(file)
+      if (unreadWrite(r) && !MOVED.test(String(r.error))) throw toolError('write: ' + file + ' exists and this session has not read it: read(path) it first, or pass { force: true } to replace its whole text unread', r)
+      if (unreadWrite(r)) throw moved()
+      throw toolError('write: ' + r.error + endings(r.error), r)
+    }
+    for (let n = 0; ; n++) {
+      if (n) await pause(n)
+      const tryStarted = Date.now()
+      const { text: now, check } = await forcedRead(file, 'write')
+      if (!now) throw empty()
+      r = await replaceWhole(now, check)
+      if (r.ok) return wrote(file)
+      if (!unreadWrite(r) || !timeToRetry(tryStarted)) break
     }
     throw toolError('write: ' + r.error + endings(r.error), r)
   }
@@ -715,11 +774,14 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     if (usable('Edit')) {
       const args = { file_path: file, old_string: String(from), new_string: String(to), ...(all ? { replace_all: true } : {}) }
       let r = await req('call', { tool: 'Edit', args })
-      if (unreadWrite(r)) {
-        if (!force && MOVED.test(String(r.error))) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
-        if (!force) throw unread(r)
-        await read(file)
+      if (unreadWrite(r) && !force && MOVED.test(String(r.error))) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
+      if (unreadWrite(r) && !force) throw unread(r)
+      for (let n = 0; unreadWrite(r); n++) {
+        if (n) await pause(n)
+        const tryStarted = Date.now()
+        await forcedRead(file, 'edit')
         r = await req('call', { tool: 'Edit', args })
+        if (!timeToRetry(tryStarted)) break
       }
       if (r.ok) return wrote(file, 'edited')
       if (r.denied && r.alt) denied.add('Edit')
@@ -727,15 +789,26 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     }
     const patch = patcher()
     if (!patch) throw toolError('edit: this session has no Edit tool and no patch tool')
-    if (!seen.has(file)) {
-      if (!force) throw unread()
-      await read(file)
-    } else if ((await req('fresh', { path: file })).fresh === false) {
-      if (!force) throw toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }')
-      await read(file)
+    const moved = (r) => toolError('edit: ' + file + ' changed since this session read it: read(path) it again, or pass { force: true }', r)
+    let tryStarted = Date.now()
+    let check = await freshOf(file, 'edit')
+    let reread = false
+    if (!check.read || check.fresh === false) {
+      if (!force) throw check.read ? moved() : unread()
+      check = (await forcedRead(file, 'edit')).check
+      reread = true
     }
-    const r = await req('call', { tool: patch, args: { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) } })
+    const args = { op: all ? 'replace_all' : 'replace_unique', path: file, old_text: String(from), new_text: String(to) }
+    let r = await req('call', { tool: patch, args, ...guardOf(check) })
+    for (let n = 1; force && unreadWrite(r) && (!reread || timeToRetry(tryStarted)); n++) {
+      if (reread) await pause(n)
+      reread = true
+      tryStarted = Date.now()
+      r = await req('call', { tool: patch, args, ...guardOf((await forcedRead(file, 'edit')).check) })
+    }
     if (r.ok) return wrote(file, 'edited')
+    if (unreadWrite(r) && !force && !MOVED.test(String(r.error))) throw unread(r)
+    if (unreadWrite(r)) throw moved(r)
     throw toolError('edit: ' + r.error + endings(r.error), r)
   }
   const deadline = () => Math.max(0, started + timeout - Date.now())
@@ -794,6 +867,11 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     }).filter((x) => x.score > 0).sort((a, b) => b.score - a.score).slice(0, (opts && opts.limit) || 8).map((x) => x.t)
   }
   const log = (...a) => { keep('log', a.map(show).join(' ')) }
+  const answer = async (name, kind, payload) => {
+    const r = await req(kind, payload)
+    if (!r.ok) throw new Error(name + ': ' + r.error)
+    return r.value
+  }
   const ctx = vm.createContext({
     tools, call, ALL_TOOLS: listed, searchTools,
     TEXT: new Proxy(Object.freeze(Object.assign(Object.create(null), texts || {})), {
@@ -806,7 +884,7 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
     btoa, atob, TextEncoder, TextDecoder, Buffer,
     text: (v) => { keep('item', show(v), v) },
     console: { log, info: log, warn: log, error: log, debug: log },
-    describeTool: async (name) => (await req('describe', { tool: resolve(name) })).value,
+    describeTool: (name) => answer('describeTool', 'describe', { tool: resolve(name) }),
     ask: async (prompt, opts) => {
       const o = opts && typeof opts === 'object' ? opts : {}
       const r = await req('ask', { prompt: String(prompt), model: o.model, system: o.system, maxTokens: o.maxTokens, effort: o.effort })
@@ -814,7 +892,9 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       return r.text
     },
     store: async (key, value) => { const r = await req('store', { key: String(key), value }); if (!r.ok) throw new Error('store: ' + r.error) },
-    load: async (key) => (await req('load', { key: String(key) })).value,
+    load: (key) => answer('load', 'load', { key: String(key) }),
+    jobs: () => answer('jobs', 'jobs', {}),
+    cancel: async (id) => { const r = await req('cancel', { id: String(id) }); if (!r.ok) throw new Error('cancel: ' + r.error); return r.value },
     exit: () => { throw new Exit() },
   })
   vm.runInContext('(() => { const parse = JSON.parse; JSON.parse = function (text, reviver) { let tried = false; const watch = typeof reviver === "function" ? function (...a) { tried = true; return reviver.apply(this, a) } : reviver; try { return parse.call(JSON, text, watch) } catch (e) { if (tried || !(e instanceof SyntaxError)) throw e; let s; try { s = String(text) } catch { s = typeof text }; throw new SyntaxError(e.message + " (the text starts: " + JSON.stringify(s.slice(0, 60)) + (s.length > 60 ? "…" : "") + ")") } } })()', ctx, { filename: 'codemode-prelude.js' })
@@ -841,7 +921,8 @@ async function main({ script, tools: all, dir, timeout, texts, cwd, home, denied
       failedId = err && err.codemodeId
     }
   }
-  finish(failure, kind, failedId)
+  if (Date.now() >= started + timeout) timedOut()
+  else finish(failure, kind, failedId)
 }
 
 `
@@ -1074,7 +1155,7 @@ export const sections = (ms: number, d: Ended, split = false): string[] => {
   parts.push(...(d.notes ?? []))
   if (d.failure)
     parts.push(
-      d.kind === 'aborted' ? `Script stopped after ${ms}ms [aborted]: ${d.failure}` : `Script failed after ${ms}ms [${d.kind ?? 'script'}]: ${d.failure}`,
+      d.kind === 'aborted' || d.kind === 'cancelled' ? `Script stopped after ${ms}ms [${d.kind}]: ${d.failure}` : `Script failed after ${ms}ms [${d.kind ?? 'script'}]: ${d.failure}`,
     )
   return parts.length ? parts : ['(no output)']
 }
@@ -1362,14 +1443,14 @@ export const similar = (name: string, names: string[]): string[] => {
     .map((x) => x.n)
 }
 
-type Tally = { ok: number; failed: number; open: number; arg?: string }
+type Tally = { ok: number; failed: number; open: number; cutOff?: number; arg?: string }
 
 // What a run had called by the time it failed: those side effects stand, and
 // the next run should not repeat them blind.
 export const ledger = (calls: Map<string, Tally>): string =>
   [...calls]
     .map(([n, t]) => {
-      const parts = [t.ok ? `${t.ok} ok` : '', t.failed ? `${t.failed} failed${t.arg ? ` (${t.arg})` : ''}` : '', t.open ? `${t.open} still running (may still finish)` : '']
+      const parts = [t.ok ? `${t.ok} ok` : '', t.failed ? `${t.failed} failed${t.arg ? ` (${t.arg})` : ''}` : '', t.cutOff ? `${t.cutOff} cut off by the run's end (the mod stopped reading it)` : '', t.open ? `${t.open} still running (may still finish)` : '']
       return `${n} ${parts.filter(Boolean).join(', ')}`
     })
     .slice(0, 12)
@@ -1384,9 +1465,9 @@ const show = (v: unknown): string => {
   }
 }
 
-type Request = { id: number; kind: 'call' | 'describe' | 'store' | 'load' | 'ask' | 'fresh'; payload: Record<string, unknown> }
-type Done = { done: true; failure?: string; kind?: string; failedId?: number; alongside?: number }
-const KINDS = new Set(['call', 'describe', 'store', 'load', 'ask', 'fresh', 'cut'])
+type Request = { id: number; kind: 'call' | 'describe' | 'store' | 'load' | 'ask' | 'fresh' | 'cut' | 'jobs' | 'cancel'; payload: Record<string, unknown> }
+type Done = { done: true; failure?: string; kind?: string; failedId?: number; alongside?: number; alongsideIds?: number[]; answered?: number[] }
+const KINDS = new Set(['call', 'describe', 'store', 'load', 'ask', 'fresh', 'cut', 'jobs', 'cancel'])
 
 // Keys `$.tool.call` reads beside a tool's arguments. `consent` would stand in
 // for the user's own approval, so a script never gets to set any of them.
@@ -1397,21 +1478,21 @@ const num = (v: unknown, fallback: number, min: number, max: number) =>
 
 let runs = 0
 let sessionCwd: string | undefined
-const readPaths = new Set<string>()
 const deniedTools = new Map<string, { alt?: string; at: number }>()
 const failedScripts = new Map<string, { first: string; at: number }>()
 
 const READ = Symbol('read')
-const readProgress = new Map<string, { next: number; version?: string }>()
-const readVersions = new Map<string, string>()
-const pageStart = new Map<string, string | undefined>()
+const UNDELIVERED = Symbol('undelivered')
+const PATCH_READS = Symbol('patch reads')
+type ChangeWindow = { sentAt: number; settledAt: number; sentVersion?: string }
+type PatchRead = { key: string; version?: string; window: ChangeWindow }
 const NOTICE = /^\s*<system-reminder>Warning: the file exists but (?:the contents are empty|is shorter than the provided offset \(\d+\)\. The file has \d+ lines)\.<\/system-reminder>\s*$/
 const pickLimit = (limit: number, tried: Set<number>, cap: number, down: number) => {
   for (let n = Math.min(down, cap); n >= 1; n--) if (!tried.has(n)) return n
   for (let n = limit + 1; n <= Math.min(2000, cap); n++) if (!tried.has(n)) return n
   return 0
 }
-type Receipt = { file: string; whole: boolean; next?: number; version?: string }
+type Receipt = { file: string; whole: boolean; next?: number; version?: string; window?: ChangeWindow }
 type FileInfo = { startLine?: unknown; numLines?: unknown; totalLines?: unknown; truncatedByTokenCap?: unknown }
 const infoOf = (result: unknown): FileInfo | undefined => {
   const f = result && typeof result === 'object' ? (result as { file?: unknown }).file : undefined
@@ -1419,7 +1500,7 @@ const infoOf = (result: unknown): FileInfo | undefined => {
 }
 const reachesEnd = (info: FileInfo | undefined) =>
   !!info && typeof info.startLine === 'number' && typeof info.numLines === 'number' && typeof info.totalLines === 'number' && info.startLine + info.numLines - 1 >= info.totalLines
-const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, version: string | undefined): Receipt | undefined => {
+const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, result: unknown, version: string | undefined, chains: ({ next: number; version?: string } | undefined)[]): Receipt | undefined => {
   if (version === undefined) return undefined
   if (isStub(text)) return undefined
   const info = infoOf(result)
@@ -1427,8 +1508,7 @@ const receiptOf = (file: string, offset: unknown, limit: unknown, text: string, 
   const rows = text.split('\n').filter((l) => /^\s*\d+\t/.test(l)).length
   if (!rows && !NOTICE.test(text)) return undefined
   const from = typeof offset === 'number' ? offset : 1
-  const chain = readProgress.get(file)
-  if (from !== 1 && (!chain || chain.next !== from || chain.version !== version)) return undefined
+  if (from !== 1 && !chains.some((c) => c?.next === from && c.version === version)) return undefined
   if (!rows) return { file, whole: true, version }
   if (!info || rows !== info.numLines) return undefined
   return reachesEnd(info) ? { file, whole: true, version } : { file, whole: false, next: from + rows, version }
@@ -1597,6 +1677,1570 @@ export const skillTurn = async (key: string, limit: Promise<unknown>): Promise<(
   }
 }
 
+type Dollar = Parameters<Hook<'tool.call'>>[0]
+type RunResult = string | { type: string; text?: string }[]
+type ReadsView = { had: boolean; value?: string; at?: number }
+type ChainView = { chain?: { next: number; version?: string }; chainAt?: number }
+const invalidateQueued = (j: Job, k: string, stale: (version: string | undefined, at: number | undefined) => boolean, outdate: boolean) => {
+  for (const e of j.readUndo.get(k) ?? []) if (e.before.had && stale(e.before.value, e.before.at)) e.before = outdate ? { ...e.before, value: undefined } : { had: false }
+  for (const e of j.chainUndo.get(k) ?? []) if (e.before.chain && stale(e.before.chain.version, e.before.chainAt)) e.before = {}
+}
+type Job = {
+  id: string
+  agent: string
+  turnId?: string
+  turnSeq: number
+  started: number
+  deadline: number
+  pid?: number
+  exited: boolean
+  cancelledBy?: string
+  stopKind?: 'cancelled' | 'aborted'
+  stopped: boolean
+  settled: boolean
+  text: string
+  blocks: { type: string }[]
+  ms: number
+  delivered: boolean
+  noticed: boolean
+  quiet: boolean
+  reads: Map<string, string | undefined>
+  readUndo: Map<string, { before: ReadsView }[]>
+  chainUndo: Map<string, { before: ChainView }[]>
+  readAt: Map<string, number>
+  pages: Map<string, { version?: string; real?: string; next?: number; at?: number }>
+  progress: Map<string, { next: number; version?: string }>
+  progressAt: Map<string, number>
+  gen: number
+  spill?: string
+  pidKnown: Promise<void>
+  onPid: () => void
+  expiry?: { cancel: () => unknown }
+  done: Promise<void>
+}
+const MAIN = 'main'
+const jobsById = new Map<string, Job>()
+const deliveredIds = new Map<string, string>()
+const handedSpills = new Map<string, number>()
+const ownSpills = new Set<string>()
+type SessionReads = { readPaths: Set<string>; readVersions: Map<string, string>; versionAt: Map<string, number>; readProgress: Map<string, { next: number; version?: string }>; progressAt: Map<string, number> }
+const sessionReads = new Map<string, SessionReads>()
+const forgetSessionReads = (agent: string) => {
+  const known = sessionReads.get(agent)
+  if (!known) return
+  for (const records of Object.values(known)) records.clear()
+}
+const readsOf = (agent: string): SessionReads => {
+  const known = sessionReads.get(agent)
+  if (known) return known
+  const fresh: SessionReads = { readPaths: new Set(), readVersions: new Map(), versionAt: new Map(), readProgress: new Map(), progressAt: new Map() }
+  sessionReads.set(agent, fresh)
+  return fresh
+}
+type PendingChange = { settledAt: number; sentVersion?: string; afterVersion?: string }
+type Forgotten = { before: number; pending: PendingChange[]; seen: { at: number; version: string }[] }
+const forgottenAt = new Map<string, Forgotten>()
+const changingFiles = new Map<string, number>()
+const readPins = new Map<Request, () => void>()
+const pinRead = (m: Request, real: string | undefined) => {
+  if (real === undefined) return
+  const earlier = readPins.get(m)
+  const release = holdChanging([real])
+  readPins.set(m, () => {
+    earlier?.()
+    release()
+  })
+}
+const samplingFiles = new Map<string, Promise<unknown>>()
+const sampledNow = (real: string | undefined) => (real === undefined ? undefined : samplingFiles.get(real)?.then(() => undefined, () => undefined))
+const holdChanging = (files: Iterable<string>) => {
+  const held = [...new Set(files)]
+  for (const f of held) changingFiles.set(f, (changingFiles.get(f) ?? 0) + 1)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    for (const f of held) {
+      const left = (changingFiles.get(f) ?? 1) - 1
+      if (left > 0) changingFiles.set(f, left)
+      else changingFiles.delete(f)
+    }
+  }
+}
+const forgottenFor = (real: string | undefined, askedAt: number, readBefore: string | undefined) => {
+  const f = real === undefined ? undefined : forgottenAt.get(real)
+  return (
+    !!f &&
+    (askedAt < f.before ||
+      f.pending.some((e) => askedAt < e.settledAt && (readBefore === undefined || readBefore !== e.afterVersion || e.afterVersion === e.sentVersion)) ||
+      f.seen.some((e) => askedAt < e.at && readBefore !== e.version))
+  )
+}
+const changeHeld = (f: string, version: string | undefined, w: ChangeWindow) =>
+  version !== undefined && !(forgottenAt.get(f)?.seen.some((e) => w.sentAt < e.at && e.version !== version && (w.settledAt < e.at || e.version !== w.sentVersion)) ?? false)
+const forgottenStamp = (real: string) => {
+  const f = forgottenAt.get(real)
+  return Math.max(f?.pending.at(-1)?.settledAt ?? 0, f?.seen.at(-1)?.at ?? 0, f?.before ?? 0)
+}
+const forgottenEntry = (real: string): Forgotten => forgottenAt.get(real) ?? { before: 0, pending: [], seen: [] }
+const keepForgotten = (real: string, f: Forgotten) => {
+  forgottenAt.delete(real)
+  forgottenAt.set(real, f)
+  const evictable = changingFiles.size ? [...forgottenAt.keys()].filter((k) => !changingFiles.has(k)) : [...forgottenAt.keys()]
+  dropOldest(evictable, Math.max(0, 2000 - (forgottenAt.size - evictable.length)), forgottenStamp, (k) => forgottenAt.delete(k), evictable.length)
+}
+const noteSeen = (real: string, at: number, version: string | undefined) => {
+  if (version === undefined) return
+  const f = forgottenEntry(real)
+  const latest = Math.max(at, ...f.seen.filter((e) => e.version === version).map((e) => e.at))
+  keepForgotten(real, { ...f, seen: [...f.seen.filter((e) => e.version !== version), { at: latest, version }].sort((x, y) => x.at - y.at).slice(-16) })
+}
+const chainIsCurrent = (chain: { version?: string } | undefined, chainAt: number, newer: [number | undefined, string | undefined][]) =>
+  chain !== undefined && newer.every(([at, version]) => (at ?? 0) <= chainAt || version === chain.version)
+let readClock = 0
+let jobSeq = 0
+let mainTurn = false
+let mainTurnId: string | undefined
+let turnSeq = 0
+let sessionGen = 0
+let waking = false
+let wakeAgain = false
+const fileLocks = new Map<string, Promise<void>>()
+const lockFile = async (path: string): Promise<() => void> => {
+  const before = fileLocks.get(path) ?? Promise.resolve()
+  let release: () => void = () => undefined
+  const mine = new Promise<void>((r) => (release = r))
+  const chained = before.then(() => mine)
+  fileLocks.set(path, chained)
+  await before
+  return () => {
+    release()
+    if (fileLocks.get(path) === chained) fileLocks.delete(path)
+  }
+}
+const writeTargets = (m: Request, cwd: string | undefined, home: string, defaults: Record<string, Record<string, unknown>>): string[] => {
+  if (m.kind !== 'call') return []
+  const tool = String(m.payload.tool)
+  const args = { ...(defaults[tool] ?? {}), ...((m.payload.args ?? {}) as Record<string, unknown>) }
+  const ops = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : []
+  const raws = /^(?:Write|Edit|MultiEdit)$/.test(tool)
+    ? [args.file_path]
+    : tool === 'NotebookEdit'
+      ? [args.notebook_path]
+      : isPatchTool(tool)
+        ? [args.path, ...ops.map((o) => o?.path ?? args.path)]
+        : []
+  const paths = raws.filter((r): r is string => typeof r === 'string' && !!r.trim()).map((r) => normal(absolute(r.trim(), cwd, home)))
+  return [...new Set(paths)].sort()
+}
+const expire = (j: Job) => {
+  j.cancelledBy = 'its start deadline'
+  j.stopKind = 'cancelled'
+  j.stopped = true
+  settle(j, format(Date.now() - j.started, { items: [], logs: [], kind: 'runner', failure: 'the run never started its runner within its time; none of its tool calls ran, and it will not start now.' }))
+  j.exited = true
+  j.onPid()
+}
+export const openRunIds = () => [...jobsById.values()].filter((j) => !j.settled).map((j) => j.id)
+const agentOf = (id: unknown) => (typeof id === 'string' && id ? `agent:${id}` : MAIN)
+const startJob = (agent: string, timeout: number): Job => {
+  const job: Job = { id: `r${++jobSeq}`, agent, turnId: agent === MAIN ? mainTurnId : undefined, turnSeq, started: Date.now(), deadline: Date.now() + timeout + 10_000, exited: false, stopped: false, settled: false, text: '', blocks: [], ms: 0, delivered: false, noticed: false, quiet: false, reads: new Map(), readUndo: new Map(), chainUndo: new Map(), readAt: new Map(), pages: new Map(), progress: new Map(), progressAt: new Map(), gen: sessionGen, pidKnown: Promise.resolve(), onPid: () => undefined, done: Promise.resolve() }
+  job.pidKnown = new Promise<void>((r) => (job.onPid = r))
+  jobsById.set(job.id, job)
+  return job
+}
+const settle = (job: Job, result: RunResult) => {
+  if (job.settled) return
+  job.expiry?.cancel()
+  const parts = typeof result === 'string' ? [{ type: 'text', text: result }] : result
+  job.text = parts.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n')
+  job.blocks = parts.filter((b) => b.type !== 'text')
+  job.ms = Date.now() - job.started
+  job.settled = true
+}
+const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`
+const agentJobs = (agent: string) => [...jobsById.values()].filter((j) => j.agent === agent)
+const openJobs = (agent: string) => agentJobs(agent).filter((j) => !j.settled)
+const readyJobs = (agent: string) => agentJobs(agent).filter((j) => j.settled && !j.delivered)
+const running = (asker: Job) =>
+  openJobs(asker.agent)
+    .filter((j) => j !== asker)
+    .map((j) => ({ id: j.id, state: j.exited ? 'finishing' : 'running', seconds: Math.round((Date.now() - j.started) / 1000) }))
+const LATER_ROOM = 300
+const sessionReadIsNewer = (j: Job, k: string) => {
+  const { readPaths, versionAt } = readsOf(j.agent)
+  return readPaths.has(k) && (versionAt.get(k) ?? 0) > (j.readAt.get(k) ?? 0)
+}
+const unforgotten = (k: string, version: string | undefined, at: number | undefined) => (version !== undefined && !forgottenFor(k, at ?? 0, version) ? version : undefined)
+const sessionVersion = (agent: string, k: string) => {
+  const { readPaths, readVersions, versionAt } = readsOf(agent)
+  return readPaths.has(k) ? unforgotten(k, readVersions.get(k), versionAt.get(k)) : undefined
+}
+const readVersionFor = (j: Job, k: string) => {
+  if (!j.reads.has(k)) return sessionVersion(j.agent, k)
+  const own = unforgotten(k, j.reads.get(k), j.readAt.get(k))
+  return sessionReadIsNewer(j, k) && readsOf(j.agent).readVersions.get(k) !== j.reads.get(k) ? undefined : own
+}
+const latestReadVersion = (j: Job, k: string) => (j.reads.has(k) && !sessionReadIsNewer(j, k) ? unforgotten(k, j.reads.get(k), j.readAt.get(k)) : sessionVersion(j.agent, k))
+const outdateOlderViews = (j: Job, p: string, v: string | undefined, at: number) => {
+  const olderAndDiffering = (stamp: number | undefined, version: string | undefined) => (stamp ?? 0) < at && version !== v
+  for (const { readPaths, readVersions, versionAt, readProgress, progressAt } of sessionReads.values()) {
+    if (readPaths.has(p) && olderAndDiffering(versionAt.get(p), readVersions.get(p))) readVersions.delete(p)
+    if (readProgress.has(p) && olderAndDiffering(progressAt.get(p), readProgress.get(p)?.version)) readProgress.delete(p)
+  }
+  for (const other of jobsById.values()) {
+    if (other === j || other.gen !== sessionGen) continue
+    if (other.reads.has(p) && olderAndDiffering(other.readAt.get(p), other.reads.get(p))) other.reads.set(p, undefined)
+    invalidateQueued(other, p, (version, stamp) => olderAndDiffering(stamp, version), true)
+    if (other.progress.has(p) && olderAndDiffering(other.progressAt.get(p), other.progress.get(p)?.version)) {
+      other.progress.delete(p)
+      other.progressAt.delete(p)
+    }
+    for (const [id, started] of other.pages) if (started.real === p && olderAndDiffering(started.at, started.version)) other.pages.set(id, {})
+  }
+}
+const promoteReads = (j: Job) => {
+  const { readPaths, readVersions, versionAt, readProgress, progressAt } = readsOf(j.agent)
+  if (j.stopped || j.gen !== sessionGen) return
+  for (const [p, v] of j.reads) {
+    const at = j.readAt.get(p) ?? 0
+    if (at < (versionAt.get(p) ?? 0)) continue
+    outdateOlderViews(j, p, v, at)
+    noteSeen(p, at, v)
+    readPaths.delete(p)
+    readPaths.add(p)
+    versionAt.delete(p)
+    versionAt.set(p, at)
+    readVersions.delete(p)
+    if (v !== undefined) readVersions.set(p, v)
+  }
+  for (const [p, chain] of j.progress) {
+    const at = j.progressAt.get(p) ?? 0
+    if (at < (progressAt.get(p) ?? 0)) continue
+    outdateOlderViews(j, p, chain.version, at)
+    noteSeen(p, at, chain.version)
+    progressAt.delete(p)
+    progressAt.set(p, at)
+    readProgress.delete(p)
+    readProgress.set(p, chain)
+  }
+  const readStamp = (k: string) => versionAt.get(k) ?? 0
+  const pageStamp = (k: string) => progressAt.get(k) ?? 0
+  dropOldest(readPaths, 2000, readStamp, (k) => {
+    readPaths.delete(k)
+    readVersions.delete(k)
+  })
+  dropOldest(readVersions.keys(), 2000, readStamp, (k) => readVersions.delete(k), readVersions.size)
+  const forgottenReads = [...versionAt.keys()].filter((k) => !readPaths.has(k) && !readVersions.has(k))
+  dropOldest(forgottenReads, 2000, readStamp, (k) => versionAt.delete(k), forgottenReads.length)
+  dropOldest(readProgress.keys(), 200, pageStamp, (k) => readProgress.delete(k), readProgress.size)
+  const forgottenPages = [...progressAt.keys()].filter((k) => !readProgress.has(k))
+  dropOldest(forgottenPages, 2000, pageStamp, (k) => progressAt.delete(k), forgottenPages.length)
+}
+const dropOldest = (keys: Iterable<string>, cap: number, stampOf: (k: string) => number, drop: (k: string) => void, size = (keys as Set<string>).size) => {
+  if (size <= cap) return
+  for (const k of [...keys].sort((a, b) => stampOf(a) - stampOf(b)).slice(0, size - cap)) drop(k)
+}
+const deliver = (agent: string, room: number): { text: string; blocks: { type: string }[] } => {
+  const texts: string[] = []
+  const blocks: { type: string }[] = []
+  const later: string[] = []
+  let used = 0
+  for (const j of readyJobs(agent)) {
+    const attached = j.blocks.length ? `, ${j.blocks.length} attachment${j.blocks.length === 1 ? '' : 's'}` : ''
+    const section = `[${j.id} ${j.stopped ? 'stopped' : 'finished'} after ${seconds(j.ms)}${attached}]\n${j.text}`
+    if (later.length || (texts.length && (used + section.length > room || blocks.length + j.blocks.length > MAX_PICTURES))) {
+      later.push(j.id)
+      j.noticed = false
+      continue
+    }
+    texts.push(section)
+    used += section.length + 2
+    blocks.push(...j.blocks)
+    j.delivered = true
+    promoteReads(j)
+    jobsById.delete(j.id)
+    if (j.spill) handedSpills.set(j.spill, Date.now())
+    while (handedSpills.size > 500) handedSpills.delete(handedSpills.keys().next().value as string)
+    deliveredIds.set(j.id, j.agent)
+    if (deliveredIds.size > 500) deliveredIds.delete(deliveredIds.keys().next().value as string)
+  }
+  if (later.length) texts.push(`${later.slice(0, NAMED).join(', ')}${later.length > NAMED ? ` and ${later.length - NAMED} more` : ''} finished too; ${later.length === 1 ? 'its' : 'their'} output comes with the reply to your next run (an empty script fetches it).`)
+  return { text: texts.join('\n\n'), blocks }
+}
+const NAMED = 9
+const stillRunning = (agent: string, except?: Job) => {
+  const others = openJobs(agent).filter((j) => j !== except)
+  const more = others.length > NAMED ? ` and ${others.length - NAMED} more` : ''
+  return others.length ? ` Still running: ${others.slice(0, NAMED).map((j) => `${j.id} (${seconds(Date.now() - j.started)})`).join(', ')}${more}.` : ''
+}
+const withBlocks = (text: string, blocks: { type: string }[]): RunResult => (blocks.length ? [{ type: 'text', text }, ...blocks] : text)
+const startedReply = (job: Job): RunResult => {
+  const head = `Started ${job.id} in the background.${stillRunning(job.agent, job)}`
+  const finished = deliver(job.agent, DEFAULT_MAX_CHARS - head.length - LATER_ROOM)
+  return withBlocks(`${head}${finished.text ? `\n\n${finished.text}` : ''}`, finished.blocks)
+}
+const collectReply = (agent: string): RunResult => {
+  const still = stillRunning(agent).trim()
+  const finished = deliver(agent, DEFAULT_MAX_CHARS - still.length - LATER_ROOM - 200)
+  const advice = still ? ` ${still} If you need their output before you can go on, end your turn: a notice comes when they finish, so do not call again to check.` : ''
+  return withBlocks(finished.text ? `${finished.text}${still ? `\n\n${still}` : ''}` : `No run has finished output waiting.${advice}`, finished.blocks)
+}
+const notice = (jobs: Job[]) =>
+  `Background run${jobs.length === 1 ? '' : 's'} ${jobs.map((j) => j.id).join(', ')} finished. Call ${FULL} with an empty script to read the output.`
+const wake = async ($: Dollar) => {
+  if (waking) {
+    wakeAgain = true
+    return
+  }
+  waking = true
+  try {
+    const surfaces: unknown = await $.session.surfaces().catch(() => [])
+    if (!Array.isArray(surfaces) || !surfaces.length) return
+    for (;;) {
+      wakeAgain = false
+      if (mainTurn) return
+      const ready = readyJobs(MAIN).filter((j) => !j.noticed && !j.quiet)
+      if (!ready.length) return
+      for (const j of ready) j.noticed = true
+      const sent = await $.prompt.submit({ text: notice(ready) }).then(() => true, () => false)
+      if (!sent) {
+        for (const j of ready) j.noticed = false
+        if (!wakeAgain) return
+      }
+    }
+  } finally {
+    waking = false
+  }
+}
+const clockNow = async ($: Dollar): Promise<number> => {
+  const fallback: { handle?: { cancel: () => unknown } } = {}
+  try {
+    const now = await Promise.race([$.clock.now(), new Promise<undefined>((r) => (fallback.handle = $.clock.after(1000, () => r(undefined))))])
+    return typeof now === 'number' ? now : Date.now()
+  } catch {
+    return Date.now()
+  } finally {
+    fallback.handle?.cancel()
+  }
+}
+const expireLater = ($: Dollar, job: Job) => {
+  job.expiry = $.clock.after(Math.max(0, job.deadline - Date.now()), () => {
+    if (job.settled || job.pid || job.exited || job.cancelledBy) return
+    if (Date.now() < job.deadline) return expireLater($, job)
+    expire(job)
+    if (job.agent === MAIN) void wake($)
+  })
+}
+const stopJobs = async ($: Dollar, jobs: Job[], by: string, kind: 'cancelled' | 'aborted') => {
+  const stopping = jobs.filter((j) => !j.settled && !j.exited && !j.cancelledBy)
+  for (const j of stopping) {
+    j.cancelledBy = by
+    j.stopKind = kind
+    if (j.pid) continue
+    j.stopped = true
+    j.exited = true
+    j.onPid()
+    const why = kind === 'aborted' ? 'stopped because its turn was interrupted before its runner started' : `stopped by cancel() from ${by} before its runner started`
+    settle(j, format(Date.now() - j.started, { items: [], logs: [], kind, failure: `${why}; none of its tool calls ran.` }))
+  }
+  if (stopping.some((j) => j.settled && j.agent === MAIN && !j.quiet)) void wake($)
+  const pids = stopping.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
+  await Promise.all(pids.map((p) => $.process.run(['kill', '-9', String(p)]).catch(() => undefined)))
+  return stopping.length
+}
+const RUNNERS_GONE = 'S=$1; N=$2; shift 2; trap \'rm -f "$S"\' EXIT; for i in $(seq "$N"); do if [ -e "$S" ]; then rm -f "$S"; exit 0; fi; if [ "$#" -gt 0 ]; then alive=0; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done; if [ "$alive" = 0 ]; then exit 0; fi; fi; sleep 0.2; done'
+const holdTurn = async ($: Dollar, agent: string, signal: AbortSignal | undefined): Promise<Job[]> => {
+  const aborted = new Promise<void>((r) => signal?.addEventListener('abort', () => r(), { once: true }))
+  const home = (await $.env.get('HOME')) || '/tmp'
+  let failures = 0
+  for (let round = 0; ; round++) {
+    for (const j of openJobs(agent))
+      if (!j.pid && !j.exited && !j.cancelledBy && Date.now() > j.deadline) expire(j)
+    const open = openJobs(agent)
+    if (!open.length || signal?.aborted || failures >= 3) break
+    const pids = open.map((j) => j.pid).filter((p): p is number => typeof p === 'number')
+    const waitingForPid = open.filter((j) => !j.pid && !j.exited)
+    const stopFile = `${home}/.claude/codemode/runs/hold-${Date.now().toString(36)}-${round}-${Math.random().toString(36).slice(2, 8)}`
+    const untilDeadline = waitingForPid.length ? Math.min(...waitingForPid.map((j) => j.deadline)) - Date.now() : 5_000
+    const ticks = Math.max(1, Math.min(25, Math.ceil(untilDeadline / 200)))
+    const pause = $.process.run(['bash', '-c', RUNNERS_GONE, 'runners', stopFile, String(ticks), ...pids.map(String)], { timeoutMs: 30_000 }).then((r) => r.exitCode === 0, () => false)
+    const settled = Promise.all(open.map((j) => j.done)).then(() => 'settled' as const)
+    const started = waitingForPid.length ? Promise.race(waitingForPid.map((j) => j.pidKnown)).then(() => 'started' as const) : new Promise<never>(() => undefined)
+    const first = await Promise.race([settled, started, pause.then((ok) => (ok ? ('paused' as const) : ('failed' as const))), aborted.then(() => 'aborted' as const)])
+    failures = first === 'failed' ? failures + 1 : 0
+    if (first === 'paused' || first === 'failed') continue
+    await $.fs.write(stopFile, '').catch(() => undefined)
+    await pause
+    await $.process.run(['rm', '-f', stopFile]).catch(() => undefined)
+  }
+  if (signal?.aborted) return []
+  return readyJobs(agent).filter((j) => !j.noticed && !j.quiet)
+}
+const withHeld = (r: unknown, held: string) => {
+  if (!held) return r
+  const base = r && typeof r === 'object' ? (r as { block?: unknown }) : {}
+  return { ...base, block: typeof base.block === 'string' && base.block ? `${base.block}\n\n${held}` : held }
+}
+const execute = async ($: Dollar, job: Job, raw: string, script: string, texts: Record<string, string>, timeout: number, maxChars: number): Promise<{ result: RunResult }> => {
+  const { readPaths, readVersions, versionAt, readProgress, progressAt } = readsOf(job.agent)
+  const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
+  const all = listing.map((t) => ({ name: t.name, description: t.description }))
+  const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
+  // Every tool call this run made, so a failure can say what already ran.
+  const calls = new Map<string, Tally>()
+  const open = new Map<number, { tool: string; arg?: string; at: number }>()
+  const stubs = new Set<string>()
+  let deduped = false
+  let persisted = false
+  const withheld = new Set<string>()
+  const cut = new Set<string>()
+  const savedAway = new Set<string>()
+  const defaults = toolDefaults(await $.env.get('CODEMODE_TOOL_DEFAULTS'))
+  const cwd = sessionCwd ?? (await $.env.get('PWD')) ?? undefined
+  // Stored types belong to one engine version: an upgrade can change a schema.
+  // No version known: nothing is stored or read, rather than a key every version shares.
+  let version: Promise<string> | undefined
+  const typeKey = async (tool: string): Promise<string | undefined> => {
+    version ??= Promise.resolve()
+      .then(() => $.session.version())
+      .then((v) => (typeof v?.version === 'string' ? v.version : ''), () => '')
+    const v = await version
+    return v ? `type:${v}:${tool}` : undefined
+  }
+  const home = (await $.env.get('HOME')) || '/tmp'
+  const configDir = normal((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`)
+  // A host whose own node is older than 25 points this at a newer one.
+  const node = (await $.env.get('CODEMODE_NODE')) || 'node'
+  const root = `${home}/.claude/codemode/runs`
+  const dir = `${root}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${++runs}`
+
+  const lockedReals = new WeakMap<Request, Set<string>>()
+  const climbedFrom = new WeakMap<Request, Map<string, [string, boolean][]>>()
+  const movedSinceLocked = async (m: Request, path: string, real: string) => {
+    if (!(lockedReals.get(m)?.has(real) ?? true)) return true
+    const spellings = climbedFrom.get(m)?.get(path) ?? []
+    for (const [given, relative] of spellings) {
+      const now = await onDisk(given, relative)
+      if (now === undefined || (await realOf(now)) !== real) return true
+    }
+    return (await realOf(path)) !== real
+  }
+
+  const versionOf = (path: string): Promise<string | undefined> =>
+    $.fs.stat(path, { resolve: true }).then(
+      (s) => (typeof s?.mtimeMs === 'number' ? `${s.mtimeMs}:${s.size}` : undefined),
+      () => undefined,
+    )
+
+  const recordSighting = (f: string, version: string | undefined) => {
+    if (version === undefined) return
+    const stamp = ++readClock
+    noteSeen(f, stamp, version)
+    outdateOlderViews(job, f, version, stamp)
+    if (job.reads.has(f) && (job.readAt.get(f) ?? 0) < stamp && job.reads.get(f) !== version) job.reads.set(f, undefined)
+    if (job.progress.has(f) && (job.progressAt.get(f) ?? 0) < stamp && job.progress.get(f)?.version !== version) {
+      job.progress.delete(f)
+      job.progressAt.delete(f)
+    }
+    for (const [id, started] of job.pages) if (started.real === f && (started.at ?? 0) < stamp && started.version !== version) job.pages.set(id, {})
+    invalidateQueued(job, f, (seen, at) => (at ?? 0) < stamp && seen !== version, true)
+  }
+  const handle = async (m: Request): Promise<Record<string, unknown>> => {
+    const p = m.payload
+    if (late()) return refusal('request')
+    if (m.kind === 'store') {
+      const key = `script:${String(p.key)}`
+      const loadReply = p.value === undefined ? 0 : utf8(JSON.stringify({ ok: true, value: p.value }) ?? '')
+      if (loadReply > 4 * 1024 * 1024) return { ok: false, error: `the value is ${loadReply} bytes as JSON, too large to load back (the most is 4 MiB); store it in a file instead` }
+      if (p.value === undefined) await $.store.delete(key)
+      else await $.store.set(key, p.value as never)
+      return { ok: true }
+    }
+    if (m.kind === 'fresh') {
+      const asked = normal(String(p.path))
+      const path = await realOf(asked)
+      await sampledNow(path)
+      const read = job.reads.has(path) || readPaths.has(path)
+      const was = readVersionFor(job, path)
+      const now = was === undefined ? undefined : await versionOf(path)
+      if (now !== was) recordSighting(path, now)
+      return { ok: true, read, fresh: was !== undefined && now !== undefined && now === was, version: was, real: path }
+    }
+    if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
+    if (m.kind === 'jobs') return { ok: true, value: running(job) }
+    if (m.kind === 'cancel') {
+      const target = jobsById.get(String(p.id))
+      if (!target && deliveredIds.get(String(p.id)) === job.agent) return { ok: true, value: false }
+      if (!target || target.agent !== job.agent) return { ok: false, error: `there is no run ${String(p.id)} here; jobs() lists the runs still going` }
+      if (target === job) return { ok: false, error: 'a run cannot cancel itself; exit() ends it' }
+      if (target.settled || target.exited || target.cancelledBy) return { ok: true, value: false }
+      return { ok: true, value: (await stopJobs($, [target], job.id, 'cancelled')) > 0 }
+    }
+    if (m.kind === 'cut') {
+      if (typeof p.tool === 'string' && SHELL_RE.test(p.tool)) cut.add(p.tool)
+      return { ok: true }
+    }
+    if (m.kind === 'describe') {
+      const t = all.find((x) => x.name === p.tool)
+      if (!t) {
+        const near = similar(String(p.tool), all.map((x) => x.name))
+        return { ok: true, value: { name: String(p.tool), description: '', input: `not in this session${near.length ? `; similar: ${near.join(', ')}` : ''}` } }
+      }
+      if (typeSources === undefined) {
+        const found: string[] = []
+        for (const f of ['claude-code-tools', 'claude-code-mcp']) {
+          const text = await $.fs.read(`${$.plugin.root}/.claude-plugin/types/${f}/index.d.ts`).catch(() => '')
+          if (typeof text === 'string' && text) found.push(text.split('interface BuiltinToolResults')[0] ?? text)
+        }
+        typeSources = found
+      }
+      // A type this process just learned beats a generated file, which beats one stored earlier.
+      let input = learned.get(t.name) ?? typeSources.map((s) => inputType(s, t.name)).find(Boolean)
+      if (input === undefined && !isMcp.has(t.name)) {
+        const k = await typeKey(t.name)
+        const kept = k ? await $.store.get(k).catch(() => undefined) : undefined
+        if (typeof kept === 'string') input = kept
+      }
+      // Only a built-in's bad-arguments error carries its type; an MCP server's does not.
+      const unknown = isMcp.has(t.name)
+        ? `not known here; call ToolSearch "select:${t.name}" directly to load its schema`
+        : `not known here; a call with wrong arguments answers with its type (never probe a tool that changes things), or call ToolSearch "select:${t.name}" directly`
+      return { ok: true, value: { ...t, input: input ?? unknown } }
+    }
+    if (m.kind === 'ask') {
+      const effort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(String(p.effort)) ? (p.effort as 'low') : undefined
+      const r = await $.model.complete({
+        model: typeof p.model === 'string' && p.model ? p.model : 'haiku',
+        prompt: String(p.prompt ?? ''),
+        ...(typeof p.system === 'string' ? { system: p.system } : {}),
+        maxTokens: Math.floor(num(p.maxTokens, 1024, 1, 64_000)),
+        ...(effort ? { effort } : {}),
+        timeoutMs: timeout,
+      })
+      if (r.isAnswered) return { ok: true, text: r.text }
+      return { ok: false, error: r.reason === 'api-error' ? `api-error ${r.status ?? ''} ${r.error}` : r.reason }
+    }
+    const tool = String(p.tool)
+    if (tool === FULL) return { ok: false, error: 'A script cannot run another script.' }
+    // Agents a Workflow starts inside this call would skip codemode's hooks.
+    if (tool === 'Workflow') return { ok: false, error: 'Workflow cannot run from a codemode script.' }
+    const given = Object.fromEntries(
+      Object.entries((p.args as Record<string, unknown> | null) ?? {}).filter(([k]) => !RESERVED.has(k)),
+    )
+    const args: Record<string, unknown> = { ...(defaults[tool] ?? {}), ...given }
+    if (p.foreground === true) for (const k of Object.keys(args)) if (/background/i.test(k)) delete args[k]
+    const fill = p.fill && typeof p.fill === 'object' && /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? (p.fill as Record<string, unknown>) : undefined
+    if (fill && typeof fill.raw === 'boolean' && !('raw' in args)) args.raw = fill.raw
+    if (fill && typeof fill.timeout_ms === 'number' && Number.isFinite(fill.timeout_ms) && !('timeout_ms' in args)) args.timeout_ms = fill.timeout_ms
+    let writeKey: string | undefined
+    let writeVersion: string | undefined
+    if ((tool === 'Write' || tool === 'Edit') && args.file_path !== undefined) {
+      const given = String(args.file_path).trim()
+      const expanded = given === '~' || given.startsWith('~/') ? home + given.slice(1) : given
+      if (!expanded.startsWith('/')) return { ok: false, error: `${tool} takes an absolute path from a script: ${given} is relative, and a shell cd can move where it lands` }
+      const path = normal(expanded)
+      args.file_path = path
+      const key = await realOf(path)
+      const exists = await $.fs.exists(key).catch(() => true)
+      if (!readPaths.has(key) && !job.reads.has(key) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
+      if (exists) {
+        const was = readVersionFor(job, key)
+        const now = await versionOf(key)
+        if (now !== was) recordSighting(key, now)
+        if (was === undefined || now === undefined || now !== was || (await movedSinceLocked(m, path, key)))
+          return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+        args.file_path = key
+        writeKey = key
+        writeVersion = now
+      } else {
+        if (await movedSinceLocked(m, path, key)) return { ok: false, error: `${path} now names another file than the one this write waited to lock, so nothing was created; write it again` }
+        args.file_path = key
+        writeKey = key
+      }
+    }
+    if (typeof p.expectedVersion === 'string' && isPatchTool(tool) && typeof args.path === 'string') {
+      const path = normal(absolute(args.path.trim(), cwd, home))
+      const real = typeof p.expectedReal === 'string' ? p.expectedReal : await realOf(path)
+      if (!job.reads.has(real) && !readPaths.has(real)) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
+      const recorded = readVersionFor(job, real)
+      const now = await versionOf(real)
+      if (now !== recorded) recordSighting(real, now)
+      if (recorded !== p.expectedVersion || now !== p.expectedVersion || (await movedSinceLocked(m, path, real))) return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
+      args.path = real
+    }
+    if (tool === 'Read' && typeof args.file_path === 'string') args.file_path = absolute(args.file_path.trim(), cwd, home)
+    // Plugins cannot run the Agent tool; codemode-agents spawns instead.
+    const target = tool === 'Agent' || tool === 'Task' ? AGENTS_TOOL : tool
+    const key = skillKey(String(args.skill ?? ''))
+    // Calls to one skill take turns, so each gets its own expansion (its args may
+    // differ); only text expanded after this call started counts.
+    if (late()) return refusal('call')
+    const timer: { handle?: { cancel: () => unknown } } = {}
+    const release =
+      tool === 'Skill' ? await skillTurn(key, new Promise((r) => (timer.handle = $.clock.after(60_000, () => r(undefined))))) : undefined
+    timer.handle?.cancel()
+    if (tool === 'Skill' && !release)
+      return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
+    const since = skillSeq
+    const realBefore = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
+    pinRead(m, realBefore)
+    const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+    if (realBefore !== undefined && (await realOf(String(args.file_path))) === realBefore) recordSighting(realBefore, readBefore)
+    const askedAt = readClock
+    const forgottenSinceAsked = (real?: string) => forgottenFor(real, askedAt, readBefore)
+    const liveChains = (k: string) => {
+      const own = job.progress.get(k)
+      const session = readProgress.get(k)
+      const ownAt = own ? job.progressAt.get(k) : undefined
+      const sessionAt = session ? progressAt.get(k) : undefined
+      return [
+        chainIsCurrent(own, ownAt ?? 0, [[readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)], [sessionAt, session?.version]]) && !forgottenFor(k, ownAt ?? 0, own?.version) ? own : undefined,
+        chainIsCurrent(session, sessionAt ?? 0, [[job.reads.has(k) ? job.readAt.get(k) : undefined, job.reads.get(k)], [ownAt, own?.version], [readPaths.has(k) ? versionAt.get(k) : undefined, readVersions.get(k)]]) && !forgottenFor(k, sessionAt ?? 0, session?.version) ? session : undefined,
+      ]
+    }
+    const patchPath = (v: unknown) => (typeof v === 'string' && !!v.trim() && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
+    const isPatch = isPatchTool(tool)
+    const patchPaths = isPatch ? [args.path, ...(Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).map((o) => o?.path) : [])] : []
+    if (patchPaths.some((v) => typeof v === 'string' && v.trim().startsWith('~')))
+      return { ok: false, error: 'The patch tool reads a path starting with ~ as a folder named ~ inside its working folder, not as your home folder; give the full path' }
+    const patchOps = isPatch
+      ? (Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : [args])
+          .map((o) => ({ op: String(o?.op ?? ''), path: patchPath(o?.path ?? args.path) }))
+          .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))
+      : []
+    const patchFresh = new Map<string, boolean>()
+    const sentVersions = new Map<string, string | undefined>()
+    const patchKeys = new Map<string, string>()
+    for (const o of patchOps) if (!patchKeys.has(o.path)) patchKeys.set(o.path, await realOf(o.path))
+    for (const [given, real] of patchKeys)
+      if (await movedSinceLocked(m, given, real)) return { ok: false, error: `${given} now names another file than the one this patch waited to lock, so nothing was changed; patch it again` }
+    const pinned = (v: unknown) => patchKeys.get(patchPath(v) ?? '') ?? v
+    if (patchOps.length) {
+      if (typeof args.path === 'string') args.path = pinned(args.path)
+      if (Array.isArray(args.ops)) args.ops = (args.ops as Record<string, unknown>[]).map((o) => (o && typeof o.path === 'string' ? { ...o, path: pinned(o.path) } : o))
+    }
+    for (const o of patchOps)
+      if (o.op !== 'create' && !patchFresh.has(patchKeys.get(o.path) as string)) {
+        const key = patchKeys.get(o.path) as string
+        const was = latestReadVersion(job, key)
+        const now = await versionOf(key)
+        if (now !== was) recordSighting(key, now)
+        sentVersions.set(key, now)
+        patchFresh.set(key, was !== undefined && was === now)
+      }
+    if (writeKey !== undefined) sentVersions.set(writeKey, writeVersion)
+    const sentAt = ++readClock
+    let settledAt = sentAt
+    const afterVersions = new Map<string, string | undefined>()
+    const sawBeforeSent = (k: string, version: string | undefined, at: number | undefined) =>
+      at === undefined || at < sentAt || version === undefined || (at < settledAt && (version !== afterVersions.get(k) || afterVersions.get(k) === sentVersions.get(k)))
+    const beforeSent = (stamp: number | undefined) => Math.max(stamp ?? 0, sentAt)
+    const stampForgotten = (k: string) => {
+      const prev = forgottenEntry(k)
+      const entry: PendingChange = { settledAt, sentVersion: sentVersions.get(k), afterVersion: afterVersions.get(k) }
+      keepForgotten(k, { ...prev, before: Math.max(prev.before, sentAt), pending: [...prev.pending.filter((e) => e.settledAt !== settledAt), entry].sort((x, y) => x.settledAt - y.settledAt).slice(-16) })
+    }
+    const resetOpenPages = (j: Job, k: string) => {
+      for (const [id, started] of j.pages) if (started.real === k && sawBeforeSent(k, started.version, started.at)) j.pages.set(id, {})
+    }
+    const forgetEverywhere = (k: string) => {
+      const forgetIn = (j: Job) => {
+        invalidateQueued(j, k, (version, at) => sawBeforeSent(k, version, at), false)
+        if (sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) {
+          j.reads.delete(k)
+          j.readAt.delete(k)
+        }
+        if (sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
+          j.progress.delete(k)
+          j.progressAt.delete(k)
+        }
+        resetOpenPages(j, k)
+      }
+      forgetIn(job)
+      for (const j of jobsById.values()) if (j.gen === sessionGen) forgetIn(j)
+      for (const session of sessionReads.values()) {
+        if (sawBeforeSent(k, session.readVersions.get(k), session.versionAt.get(k))) {
+          const at = beforeSent(session.versionAt.get(k))
+          session.readPaths.delete(k)
+          session.readVersions.delete(k)
+          session.versionAt.delete(k)
+          session.versionAt.set(k, at)
+        }
+        if (sawBeforeSent(k, session.readProgress.get(k)?.version, session.progressAt.get(k))) {
+          const at = beforeSent(session.progressAt.get(k))
+          session.readProgress.delete(k)
+          session.progressAt.delete(k)
+          session.progressAt.set(k, at)
+        }
+      }
+      stampForgotten(k)
+    }
+    const outdateEverywhere = (k: string) => {
+      const outdateIn = (j: Job) => {
+        invalidateQueued(j, k, (version, at) => sawBeforeSent(k, version, at), true)
+        if (j.reads.has(k) && sawBeforeSent(k, j.reads.get(k), j.readAt.get(k))) j.reads.set(k, undefined)
+        if (sawBeforeSent(k, j.progress.get(k)?.version, j.progressAt.get(k))) {
+          j.progress.delete(k)
+          j.progressAt.delete(k)
+        }
+        resetOpenPages(j, k)
+      }
+      outdateIn(job)
+      for (const j of jobsById.values()) if (j.gen === sessionGen) outdateIn(j)
+      for (const session of sessionReads.values()) {
+        if (sawBeforeSent(k, session.readVersions.get(k), session.versionAt.get(k))) session.readVersions.delete(k)
+        if (sawBeforeSent(k, session.readProgress.get(k)?.version, session.progressAt.get(k))) session.readProgress.delete(k)
+      }
+      stampForgotten(k)
+    }
+    const forgetOwnView = (k: string) => {
+      invalidateQueued(job, k, (version, at) => sawBeforeSent(k, version, at), true)
+      if (job.reads.has(k) && sawBeforeSent(k, job.reads.get(k), job.readAt.get(k))) job.reads.set(k, undefined)
+      if (job.progress.has(k) && sawBeforeSent(k, job.progress.get(k)?.version, job.progressAt.get(k))) {
+        job.progress.delete(k)
+        job.progressAt.delete(k)
+      }
+    }
+    const patchKeysBefore = (appliedBefore = Infinity) => {
+      const opPaths = Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]).slice(0, appliedBefore).map((o) => patchPath(o?.path ?? args.path)) : appliedBefore > 0 ? [patchPath(args.path)] : []
+      return new Set(opPaths.map((v) => patchKeys.get(v ?? '') ?? (v ? [...patchKeys.values()].find((k) => k === v) : undefined)).filter((k): k is string => !!k))
+    }
+    const patchUnsure = (appliedBefore = Infinity) => {
+      for (const key of patchKeysBefore(appliedBefore)) {
+        if (patchFresh.get(key) !== true) {
+          forgetEverywhere(key)
+          continue
+        }
+        outdateEverywhere(key)
+        forgetOwnView(key)
+      }
+    }
+    const writeUnsure = () => {
+      if (writeKey === undefined) return
+      outdateEverywhere(writeKey)
+      forgetOwnView(writeKey)
+    }
+    const changeUnsure = () => {
+      if (isPatch) patchUnsure()
+      writeUnsure()
+    }
+    if (late()) {
+      release?.()
+      return refusal('call')
+    }
+    const counted = p.poll !== true
+    const tally = (counted ? calls.get(tool) : undefined) ?? { ok: 0, failed: 0, open: 0 }
+    if (counted) calls.set(tool, tally)
+    tally.open++
+    if (counted) open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
+    startedCalls.add(m.id as number)
+    const changedKeys = [...new Set([...patchKeysBefore(), ...(writeKey !== undefined ? [writeKey] : [])])]
+    const stillNamed = async (key: string) => {
+      const version = await versionOf(key)
+      return (await realOf(key)) === key ? version : undefined
+    }
+    const settle = async (keys: Iterable<string>) => {
+      settledAt = ++readClock
+      const touched = [...keys]
+      for (const key of touched) {
+        afterVersions.set(key, undefined)
+        stampForgotten(key)
+      }
+      const sampling = Promise.all(touched.map(async (key) => [key, await stillNamed(key)] as const))
+      for (const key of touched) samplingFiles.set(key, sampling)
+      for (const [key, version] of await sampling) afterVersions.set(key, version)
+      for (const key of touched) {
+        if (samplingFiles.get(key) === sampling) samplingFiles.delete(key)
+        stampForgotten(key)
+      }
+    }
+    let r = await $.tool.call({ ...args, tool: target } as never).catch(async (err: unknown) => {
+      tally.open--
+      tally.failed++
+      tally.arg ??= firstArg(args)
+      release?.()
+      const msg = (err as Error)?.message ?? String(err)
+      const neverRan = msg.includes(`no tool named "${target}"`) && !all.some((x) => x.name === target)
+      await settle(neverRan ? [] : changedKeys)
+      if (!neverRan) changeUnsure()
+      // A tool a setting or another mod removed: name what may replace it.
+      const near = msg.includes('no tool named') ? similar(tool, all.map((x) => x.name)) : []
+      throw new Error(near.length ? `${msg}; similar: ${near.join(', ')}` : msg)
+    })
+    const failedSaid = isPatch && r.isError ? String(r.text ?? show(r.result)).replace(/^\s*(?:<tool_use_error>)?\s*/, '') : ''
+    const failedAt = /^ops\[(\d+)\]/.exec(failedSaid)
+    const partlyApplied = !!failedAt && /Earlier ops in this batch were already applied/.test(failedSaid)
+    await settle(r.deny !== undefined ? [] : !r.isError ? changedKeys : partlyApplied ? patchKeysBefore(Number(failedAt?.[1])) : [])
+    const body = release ? skillTexts.get(key) : undefined
+    release?.()
+    if (partlyApplied) patchUnsure(Number(failedAt?.[1]))
+    const capped =
+      tool === 'Read' &&
+      !r.isError &&
+      args.limit === undefined &&
+      (infoOf(r.result)?.truncatedByTokenCap === true || ((args.offset === undefined || args.offset === 1) && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
+    let pagedView: { version?: string; real?: string; at: number } | undefined
+    if (tool === 'Read' && args.limit === undefined && (capped || (r.isError && /exceeds maximum allowed (?:tokens|size)/i.test(String(r.text ?? show(r.result)))))) {
+      const paged = await pageRead(args, m)
+      if (paged === undefined && late()) {
+        tally.open--
+        tally.cutOff = (tally.cutOff ?? 0) + 1
+        tally.arg ??= firstArg(args)
+        return refusal('call')
+      }
+      if (paged?.text !== undefined) {
+        r = { text: paged.text, result: paged.result } as typeof r
+        pagedView = { version: paged.version, real: paged.real, at: paged.sampledAt ?? settledAt }
+      }
+      else if (paged?.error !== undefined) r = { isError: true, text: paged.error } as typeof r
+      else if (capped)
+        r = { isError: true, text: `${String(args.file_path)} is over Read's token cap and could not be read in pages (a single line may be over the cap); read part of it with sh() and head -c, or with offset and limit` } as typeof r
+    }
+    tally.open--
+    const failed = r.deny !== undefined || r.isError === true
+    if (failed) {
+      tally.failed++
+      tally.arg ??= firstArg(args)
+    } else tally.ok++
+    const saveDenied = () =>
+      $.store.set('denied', Object.fromEntries([...deniedTools].map(([n, v]) => [n, { alt: v.alt, at: v.at }])) as never).catch(() => {})
+    if (!failed && job.gen === sessionGen && deniedTools.delete(tool)) await saveDenied()
+    const said = String(r.deny ?? (r.isError ? (r.text ?? show(r.result)) : ''))
+    const refused = r.deny !== undefined || (r.isError === true && HOOK_RE.test(said) && !(SHELL_RE.test(tool) && exitOf(said, false, tool).code !== undefined))
+    if (refused) {
+      const plain = said.replace(/^\s*<tool_use_error>/, '').replace(/<\/tool_use_error>\s*$/, '')
+      const whole = WHOLE_RE.exec(plain)
+      const wants = whole && whole[1] === tool ? all.map((x) => x.name).filter((n) => n !== tool && (n === whole[2] || short(n) === whole[2])) : []
+      const fits = (n: string) => (tool === 'Bash' ? /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(n) : /^(?:Write|Edit)$/.test(tool) && isPatchTool(n))
+      const alt = wants.length === 1 && fits(wants[0] as string) ? wants[0] : undefined
+      if (!alt) return { ok: false, error: plain, refused: true }
+      if (!deniedTools.has(tool) && job.gen === sessionGen) {
+        deniedTools.set(tool, { alt, at: Date.now() })
+        await saveDenied()
+      }
+      return { ok: false, error: `${plain}\n${tool} is denied by a hook in this session; use tools.${ident(alt)}({...}) instead.`, denied: true, alt }
+    }
+    const markers: string[] = []
+    const result = strip(r.result, pictures, markers)
+    let text = r.text ?? show(result)
+    if (tool === 'Skill' && !r.isError) {
+      if (body && body.seq > since) text = `${text}\n\n${body.text}`
+    }
+    if (markers.length) text = [text.trim(), ...markers].filter(Boolean).join('\n')
+    const toolResult = (path: string) => path.startsWith(`${configDir}/projects/`) && /\/tool-results\/[^/]+\.txt$/.test(path)
+    const readBack = async (path: string, shell?: string) => {
+      const paged = await pageRead({ file_path: path })
+      if (paged?.text !== undefined) return paged.text.split('\n').map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
+      if (shell && (paged === undefined || /over Read's token cap/.test(paged.error ?? ''))) return viaBytes(shell, path)
+      return undefined
+    }
+    const saved = tool === 'Bash' ? PERSISTED.exec(text) : null
+    if (saved) {
+      const path = normal((saved[2] as string).trim())
+      const head = (saved[3] as string).replace(/\r/g, '').slice(0, 1000)
+      const whole = toolResult(path) ? await readBack(path, 'Bash') : undefined
+      if (whole !== undefined && head && whole.replace(/\r/g, '').startsWith(head)) text = (saved[1] as string) + whole + (saved[4] as string)
+      else persisted = true
+    }
+    const swapped = !r.isError && isMcp.has(tool) ? SAVED.exec(text) : null
+    if (swapped) {
+      const path = normal((swapped[2] as string).trim())
+      const size = Number((swapped[1] as string).replace(/,/g, ''))
+      const lean = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? tool : undefined
+      const back = toolResult(path) ? await readBack(path, lean) : undefined
+      const whole = back !== undefined && back.length + 1 === size ? back + '\n' : back
+      if (whole !== undefined && whole.length === size) text = whole
+      else savedAway.add(tool)
+    }
+    const shell = SHELL_RE.test(tool) ? exitOf(text, !r.isError, tool) : undefined
+    const exit = shell ? { ...(shell.code === undefined ? {} : { exitCode: shell.code }), shellText: shell.out } : {}
+    if (!r.isError) {
+      if (text.length > MAX_REPLY) {
+        changeUnsure()
+        tally.ok--
+        tally.failed++
+        tally.arg ??= firstArg(args)
+        if (isPatch || writeKey !== undefined) return { ok: false, error: `The answer of ${tool} is ${text.length} chars, too large to hand to the script, but it may have changed the file; read the file again before changing it.` }
+        return { ok: false, error: `The result of ${tool} is ${text.length} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
+      }
+      const target = typeof args.file_path === 'string' ? args.file_path : undefined
+      const wrote = tool === 'Write' || tool === 'Edit'
+      const moved = p.foreground === true && tool === 'Bash' ? (r.result as { backgroundTaskId?: unknown } | undefined)?.backgroundTaskId : undefined
+      if (moved !== undefined) {
+        tally.ok--
+        tally.failed++
+        tally.arg ??= firstArg(args)
+        return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
+      }
+      const windowOf = (key: string): ChangeWindow => ({ sentAt, settledAt, sentVersion: sentVersions.get(key) })
+      const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => patchKeys.get(o.path) as string))
+      const freshKeys = new Set<string>()
+      for (const o of patchOps) {
+        const key = patchKeys.get(o.path) as string
+        if (created.has(key) || patchFresh.get(key) === true) {
+          outdateEverywhere(key)
+          freshKeys.add(key)
+        } else forgetEverywhere(key)
+      }
+      if (wrote && writeKey !== undefined) outdateEverywhere(writeKey)
+      const patchReads: PatchRead[] = [...freshKeys].map((key) => ({ key, version: afterVersions.get(key), window: windowOf(key) }))
+      const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
+      const realAfter = tool === 'Read' && typeof args.file_path === 'string' ? await realOf(args.file_path) : undefined
+      await sampledNow(realAfter)
+      if (tool === 'Read' && realAfter !== undefined) recordSighting(realAfter, realAfter === realBefore ? readAfter : await stillNamed(realAfter))
+      if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
+        const from = typeof args.offset === 'number' ? args.offset : 1
+        const pages = typeof p.readId === 'number' ? `#${p.readId}` : args.file_path
+        const first = job.pages.get(pages)
+        const heldStill = readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter)
+        if (from === 1) job.pages.set(pages, heldStill ? { version: readBefore, real: realBefore, at: askedAt } : {})
+        else if (first !== undefined && (!heldStill || readBefore !== first.version || realBefore !== first.real || forgottenFor(first.real, first.at ?? 0, first.version))) {
+          tally.ok--
+          tally.failed++
+          return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
+        }
+      }
+      const heldVersion = pagedView
+        ? pagedView.version !== undefined && pagedView.version === readAfter && pagedView.real === realAfter && !forgottenFor(realAfter, pagedView.at, pagedView.version) ? pagedView.version : undefined
+        : readBefore !== undefined && readBefore === readAfter && realBefore === realAfter && !forgottenSinceAsked(realAfter) ? readBefore : undefined
+      const ownPages = tool === 'Read' && p.handled === true && typeof p.readId === 'number' ? job.pages.get(`#${p.readId}`) : undefined
+      const ownChain = ownPages?.next !== undefined ? { next: ownPages.next, version: ownPages.version } : undefined
+      const receipt =
+        tool === 'Read' && p.internal !== true && typeof args.file_path === 'string'
+          ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, heldVersion, [ownChain, ...liveChains(realAfter ?? args.file_path)])
+          : wrote && writeKey !== undefined
+            ? ({ file: writeKey, whole: true, version: afterVersions.get(writeKey), window: windowOf(writeKey) } as Receipt)
+            : wrote && typeof target === 'string' && target.startsWith('/')
+              ? ({ file: normal(target), whole: true } as Receipt)
+              : undefined
+      if (receipt?.whole && receipt.version === undefined && !receipt.window) receipt.version = await versionOf(receipt.file)
+      if (ownPages && receipt && !receipt.whole && receipt.next !== undefined) ownPages.next = receipt.next
+      if (receipt) receipt.file = tool === 'Read' && realAfter !== undefined ? realAfter : wrote && writeKey !== undefined ? writeKey : await realOf(receipt.file)
+      if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
+      else if (isStub(text, tool) && p.handled !== true) {
+        stubs.add(tool)
+        if (/read-dedup/.test(text)) deduped = true
+      }
+      const leanJob = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
+      return { ok: true, text, result, ...exit, ...(tool === 'Read' && p.handled === true ? { real: heldVersion !== undefined && realBefore === realAfter ? realAfter : null } : {}), ...(leanJob ? { job: leanJob } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(receipt ? { [READ]: receipt } : {}), ...(patchReads.length ? { [PATCH_READS]: patchReads } : {}), ...(isPatch || writeKey !== undefined ? { [UNDELIVERED]: changeUnsure } : {}) }
+    }
+    const bad = tidy(tool, text)
+    if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
+      const at = args.file_path.lastIndexOf('/')
+      const folder = args.file_path.slice(0, at) || '/'
+      const root = cwd ? normal(cwd) : undefined
+      const inside = root !== undefined && (folder === root || folder.startsWith(root === '/' ? '/' : `${root}/`))
+      const listed = inside ? ((await $.fs.list(folder).catch(() => [])) ?? []).map((x) => x.name) : []
+      const near: string[] = []
+      for (const n of nearNames(args.file_path.slice(at + 1), listed)) {
+        const path = `${folder === '/' ? '' : folder}/${n}`
+        const probe = late() ? undefined : await $.tool.call({ file_path: path, limit: 1, tool: 'Read' } as never).catch(() => undefined)
+        const said = String(probe?.text ?? '')
+        if (probe && probe.deny === undefined && (probe.isError !== true || /exceeds maximum allowed/i.test(said))) near.push(path)
+      }
+      if (near.length) bad.message = `${bad.message} Similar files: ${near.join(', ')}`
+    }
+    // Learned from built-ins only: an MCP server writes its own error text.
+    if (bad.type && !isMcp.has(tool)) {
+      if (learned.size >= 200) learned.delete(learned.keys().next().value as string)
+      learned.set(tool, bad.type)
+      // Kept across sessions: the engine no longer writes the type files, so a
+      // built-in's bad-arguments error is the only other source of its type.
+      const k = await typeKey(tool)
+      if (k) await $.store.set(k, bad.type as never).catch(() => {})
+    }
+    const engineCut = SHELL_RE.test(tool) && ENGINE_CUT.test(text) && !LEAN_ARCHIVED.test(text)
+    if (engineCut && p.poll !== true) cut.add(tool)
+    return { ok: false, error: bad.message, text: bad.message, result, ...exit, ...(engineCut ? { cut: true } : {}) }
+  }
+
+  const viaBytes = async (shell: string, path: string): Promise<string | undefined> => {
+    const step = 21000
+    const extra = shell === 'Bash' ? {} : { raw: true }
+    const ask = (command: string) => (late() ? Promise.resolve(undefined) : $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined))
+    const sized = await ask('wc -c < ' + shellQuote(path))
+    const size = Number(String(sized?.text ?? '').trim())
+    if (!sized || sized.isError || sized.deny !== undefined || !Number.isInteger(size)) return undefined
+    const bytes: number[] = []
+    for (let at = 0; at < size; at += step) {
+      if (over) return undefined
+      const r = await ask('tail -c +' + (at + 1) + ' ' + shellQuote(path) + ' | head -c ' + step + ' | base64')
+      if (!r || r.isError || r.deny !== undefined) return undefined
+      const part = bytesOf(String(r.text ?? '').replace(/\s+/g, ''))
+      if (!part || part.length !== Math.min(step, size - at)) return undefined
+      for (const b of part) bytes.push(b)
+    }
+    return bytes.length === size ? fromUtf8(bytes) : undefined
+  }
+  const pageRead = async (args: Record<string, unknown>, pinFor?: Request): Promise<{ text?: string; error?: string; result?: unknown; version?: string; real?: string; sampledAt?: number } | undefined> => {
+    const pages: string[] = []
+    let size = 0
+    let offset = typeof args.offset === 'number' && args.offset > 1 ? args.offset : 1
+    let limit = 2000
+    let stubbed = 0
+    let tried = new Set<number>()
+    let cap = 2000
+    let total: number | undefined
+    const start = offset
+    const file = String(args.file_path)
+    const real = await realOf(file)
+    if (pinFor) pinRead(pinFor, real)
+    const version = await versionOf(file)
+    const pagingFrom = readClock
+    recordSighting(real, version)
+    const moved = async () => {
+      const now = await versionOf(file)
+      const stillThere = (await realOf(file)) === real
+      if (version === undefined || now !== version || !stillThere) {
+        if (stillThere) recordSighting(real, now)
+        return true
+      }
+      await sampledNow(real)
+      return forgottenFor(real, pagingFrom, version)
+    }
+    for (let guard = 0; guard < 10_000; guard++) {
+      if (over) return undefined
+      const r = late() ? undefined : await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
+      if (r && !r.isError && r.deny === undefined && (await moved())) return { error: `${file} changed while it was read in pages; read it again` }
+      if (!r) return undefined
+      if (r.deny !== undefined) return { error: `Reading ${file} in pages stopped at line ${offset}: ${r.deny}` }
+      const t = String(r.text ?? show(r.result))
+      const cutAtCap = !r.isError && infoOf(r.result)?.truncatedByTokenCap === true
+      if (r.isError || cutAtCap) {
+        if (cutAtCap || /exceeds maximum allowed/i.test(t)) {
+          tried.add(limit)
+          cap = Math.min(cap, limit - 1)
+          limit = pickLimit(limit, tried, cap, Math.floor(limit / 2))
+          if (limit) continue
+          if (offset === 1) return undefined
+          return { error: `${file} has a line over Read's token cap at line ${offset}, so it cannot be read in pages; read part of it with sh() and head -c` }
+        }
+        return { error: offset > 1 ? `Reading ${file} in pages stopped at line ${offset}: ${t.slice(0, 300)}` : t.slice(0, 2000) }
+      }
+      if (isStub(t) && /read-dedup/.test(t)) {
+        tried.add(limit)
+        limit = ++stubbed > 6 ? 0 : pickLimit(limit, tried, cap, Math.max(1, Math.min(limit, 2000) - 1 - Math.floor(Math.random() * Math.min(400, Math.floor(limit / 2)))))
+        if (!limit) return { error: `Reading ${file} in pages: Read keeps answering with a stub, not the file` }
+        continue
+      }
+      const rows = t.split('\n').filter((l) => /^\s*\d+\t/.test(l))
+      if (!rows.length && !NOTICE.test(t)) return { error: `Reading ${file} in pages stopped at line ${offset}: Read answered with no file lines: ${t.slice(0, 200)}` }
+      size += t.length
+      if (size > MAX_REPLY) return { error: `${file} is too large to pass to the script whole (over ${MAX_REPLY} chars); read it with read(path), which reads in pages, or with offset and limit` }
+      if (rows.length) pages.push(rows.join('\n'))
+      const info = infoOf(r.result)
+      if (typeof info?.totalLines === 'number') total = info.totalLines
+      if (rows.length < limit && !(total !== undefined && offset + rows.length - 1 < total)) break
+      offset += rows.length
+      tried = new Set()
+      cap = 2000
+      limit = Math.min(2000, limit * 2)
+      stubbed = 0
+      if (guard === 9_999) return { error: `Reading ${file} in pages stopped after 10000 pages` }
+    }
+    const text = pages.join('\n')
+    const lines = text ? text.split('\n') : []
+    const content = lines.map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
+    return { text, version, real, sampledAt: pagingFrom, result: { type: 'text', file: { filePath: file, content, numLines: lines.length, startLine: start, totalLines: total ?? start + lines.length - 1 } } }
+  }
+
+  let over = false
+  const late = () => over || !!job.cancelledBy || killed || Date.now() >= started + timeout
+  const refusal = (what: string) => ({ ok: false, error: `the run was stopped by ${job.cancelledBy ?? 'its timeout'} before this ${what} started` })
+  const writes = new Set<Promise<unknown>>()
+  const replies = new Set<Promise<unknown>>()
+  const items: string[] = []
+  const keys: (string[] | undefined)[] = []
+  const logs: string[] = []
+  let aborted = false
+  let printed = 0
+  const take = (s: string): string | undefined => {
+    const left = 1_000_000 - printed
+    if (left <= 0) return undefined
+    const kept = s.length > left ? `${s.slice(0, safeEnd(s, left))}\n…output cut at 1000000 chars…` : s
+    printed += Math.min(s.length, left)
+    return kept
+  }
+  const pictures: Picture[] = []
+  const realpath = (p: string) => $.process.run(['realpath', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : undefined), () => undefined)
+  const readlink = (p: string) => $.process.run(['readlink', p]).then((r) => (r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : undefined), () => undefined)
+  const realOf = async (p: string) => {
+    let path = p
+    for (let links = 0, steps = 0; links < 40 && steps < 2048; steps++) {
+      const next = await resolveOnce(path)
+      if (next.done) return next.path
+      if (next.link) links++
+      path = next.path
+    }
+    return path
+  }
+  const resolveOnce = async (p: string): Promise<{ done: boolean; path: string; link?: boolean }> => {
+    let missing = ''
+    for (let head = p; ; ) {
+      const found = await realpath(head)
+      if (found) {
+        const base = found.replace(/\/$/, '')
+        if (/^\/\.\.(?=\/|$)/.test(missing)) return { done: false, path: base.slice(0, base.lastIndexOf('/')) + missing.slice(3) || '/' }
+        const folded = missing.replace(/\/(?!\.\.(?:\/|$))[^/]+\/\.\.(?=\/|$)/, '')
+        return { done: folded === missing, path: base + folded || '/' }
+      }
+      const target = await readlink(head)
+      if (target) {
+        const parent = head.slice(0, head.lastIndexOf('/')) || '/'
+        const base = target.startsWith('/') ? '' : ((await realpath(parent)) ?? parent).replace(/\/$/, '') + '/'
+        return { done: false, link: true, path: (base + target + missing).replace(/\/(?:\.?\/)+/g, '/') }
+      }
+      const slash = head.lastIndexOf('/')
+      if (slash < 0 || head === '/') return { done: true, path: p }
+      missing = head.slice(slash) + missing
+      head = slash ? head.slice(0, slash) : '/'
+    }
+  }
+  const climbs = (v: unknown) => typeof v === 'string' && /(^|\/)\.\.(\/|$)/.test(v.trim())
+  const isFolder = (p: string) => $.fs.stat(p, { resolve: true }).then((st) => st?.kind === 'dir', () => false)
+  const climb = async (p: string, hops = 0): Promise<string | undefined> => {
+    const segs = p.split('/').filter((seg) => seg !== '' && seg !== '.')
+    const kept: string[] = []
+    for (let i = 0; i < segs.length; i++) {
+      if (segs[i] !== '..') {
+        kept.push(segs[i] as string)
+        continue
+      }
+      if (hops >= 40) return undefined
+      const link = kept.length ? await readlink('/' + kept.join('/')) : undefined
+      if (link === undefined) {
+        if (hops && kept.length && !(await isFolder('/' + kept.join('/')))) return undefined
+        kept.pop()
+        continue
+      }
+      const into = link.startsWith('/') ? link : '/' + kept.slice(0, -1).join('/') + '/' + link
+      return climb(into + '/' + segs.slice(i).join('/'), hops + 1)
+    }
+    return '/' + kept.join('/')
+  }
+  const onDisk = async (v: string, relative = true) => {
+    const t = v.trim()
+    const e = t === '~' || t.startsWith('~/') ? home + t.slice(1) : t
+    if (e.startsWith('/')) return climb(e)
+    return relative && cwd ? climb(`${cwd.replace(/\/$/, '')}/${e}`) : v
+  }
+  const namesNoFile = (v: string) => `${v} climbs out of a symlinked folder and then through a folder that does not exist there, so it names no file on disk`
+  const resolveClimbs = async (m: Request): Promise<string | undefined> => {
+    if (m.kind === 'fresh' && climbs(m.payload.path)) {
+      const found = await onDisk(String(m.payload.path))
+      if (found === undefined) return namesNoFile(String(m.payload.path).trim())
+      m.payload.path = found
+    }
+    if (m.kind !== 'call') return undefined
+    const tool = String(m.payload.tool)
+    const lean = /^mcp__lean[-_]ctx__/.test(tool)
+    if (!lean && !/^(?:Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead|Grep|Glob|LS)$/.test(tool)) return undefined
+    const relative = /^(?:Read|NotebookRead|Grep|Glob|LS)$/.test(tool) || isPatchTool(tool)
+    const given = (m.payload.args && typeof m.payload.args === 'object' ? m.payload.args : {}) as Record<string, unknown>
+    const preset = defaults[tool] ?? {}
+    const args = { ...given }
+    const lost: string[] = []
+    const climbed = new Map<string, [string, boolean][]>()
+    climbedFrom.set(m, climbed)
+    const place = async (v: unknown) => {
+      const found = await onDisk(String(v), relative)
+      if (found === undefined) lost.push(String(v).trim())
+      else climbed.set(found, [...(climbed.get(found) ?? []), [String(v), relative]])
+      return found ?? String(v)
+    }
+    const climbable = (v: unknown) => climbs(v) && !(lean && String(v).trim().startsWith('~'))
+    for (const k of ['file_path', 'notebook_path', 'path']) {
+      const v = k in given ? given[k] : preset[k]
+      if (climbable(v)) args[k] = await place(v)
+    }
+    if (Array.isArray(args.ops)) args.ops = await Promise.all((args.ops as Record<string, unknown>[]).map(async (o) => (o && climbable(o.path) ? { ...o, path: await place(o.path) } : o)))
+    m.payload.args = args
+    return lost.length ? namesNoFile(lost[0] as string) : undefined
+  }
+  const untakenAnswers = new Map<number, () => void>()
+  const stackUndo = <V,>(stacks: Map<string, { before: V }[]>, f: string, before: V, putBack: (v: V) => void) => {
+    const stack = stacks.get(f) ?? []
+    stacks.set(f, stack)
+    const entry = { before }
+    stack.push(entry)
+    return () => {
+      const at = stack.indexOf(entry)
+      if (at < 0) return
+      if (at === stack.length - 1) putBack(entry.before)
+      else stack[at + 1]!.before = entry.before
+      stack.splice(at, 1)
+    }
+  }
+  const putBackReads = (f: string) => (v: ReadsView) => {
+    if (v.had) job.reads.set(f, v.value)
+    else job.reads.delete(f)
+    if (v.at === undefined) job.readAt.delete(f)
+    else job.readAt.set(f, v.at)
+  }
+  const putBackChain = (f: string) => (v: ChainView) => {
+    if (v.chain === undefined) job.progress.delete(f)
+    else job.progress.set(f, v.chain)
+    if (v.chainAt === undefined) job.progressAt.delete(f)
+    else job.progressAt.set(f, v.chainAt)
+  }
+  const booked = (f: string, parts: { reads: boolean; chain: boolean }) => {
+    const undos = [
+      ...(parts.reads ? [stackUndo<ReadsView>(job.readUndo, f, { had: job.reads.has(f), value: job.reads.get(f), at: job.readAt.get(f) }, putBackReads(f))] : []),
+      ...(parts.chain ? [stackUndo<ChainView>(job.chainUndo, f, { chain: job.progress.get(f), chainAt: job.progressAt.get(f) }, putBackChain(f))] : []),
+    ]
+    return () => {
+      for (const undo of undos) undo()
+    }
+  }
+  const startedCalls = new Set<number>()
+  const respond = async (m: Request) => {
+    const lost = await resolveClimbs(m)
+    let out: Record<string, unknown>
+    const unlocks: (() => void)[] = []
+    const real = await Promise.all(writeTargets(m, cwd, home, defaults).map(realOf))
+    lockedReals.set(m, new Set(real))
+    for (const path of [...new Set(real)].sort()) unlocks.push(await lockFile(path))
+    const heldForChange = holdChanging(real)
+    const releaseChanging = () => {
+      heldForChange()
+      readPins.get(m)?.()
+      readPins.delete(m)
+    }
+    try {
+      out = lost ? { ok: false, error: lost } : await handle(m)
+    } catch (err) {
+      out = { ok: false, error: (err as Error)?.message ?? String(err) }
+    } finally {
+      for (const unlock of unlocks.reverse()) unlock()
+    }
+    open.delete(m.id)
+    // The child is gone after a timeout; writing would recreate its run dir.
+    if (over) {
+      releaseChanging()
+      ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
+      return
+    }
+    const file = `${dir}/${m.id}.json`
+    const claimed = out[READ as never] as Receipt | undefined
+    const receipt = claimed?.window && !changeHeld(claimed.file, claimed.version, claimed.window) ? undefined : claimed
+    let undo: (() => void) | undefined
+    const outdateOwnUndo = (f: string, version: string | undefined, stamp: number) => {
+      if (version !== undefined) invalidateQueued(job, f, (seen, at) => (at ?? 0) < stamp && seen !== version, true)
+    }
+    if (receipt) {
+      const f = receipt.file
+      const stamp = ++readClock
+      noteSeen(f, stamp, receipt.version)
+      if (receipt.version !== undefined) outdateOlderViews(job, f, receipt.version, stamp)
+      for (const [id, started] of job.pages) if (started.real === f && (started.at ?? 0) < stamp && started.version !== receipt.version) job.pages.set(id, {})
+      if (receipt.whole) {
+        undo = booked(f, { reads: true, chain: true })
+        outdateOwnUndo(f, receipt.version, stamp)
+        job.progress.delete(f)
+        job.progressAt.delete(f)
+        job.reads.delete(f)
+        job.reads.set(f, receipt.version)
+        job.readAt.delete(f)
+        job.readAt.set(f, stamp)
+      } else if (receipt.next !== undefined) {
+        const ownReadIsOlder = job.reads.has(f) && (job.readAt.get(f) ?? 0) < stamp && job.reads.get(f) !== receipt.version
+        undo = booked(f, { reads: ownReadIsOlder, chain: true })
+        outdateOwnUndo(f, receipt.version, stamp)
+        if (ownReadIsOlder) job.reads.set(f, undefined)
+        job.progress.delete(f)
+        job.progress.set(f, { next: receipt.next, version: receipt.version })
+        job.progressAt.delete(f)
+        job.progressAt.set(f, stamp)
+      }
+    }
+    const patched = ((out[PATCH_READS as never] ?? []) as PatchRead[]).filter((r) => changeHeld(r.key, r.version, r.window))
+    if (patched.length) {
+      const restores = patched.map(({ key: f, version }) => {
+        const restore = booked(f, { reads: true, chain: true })
+        const stamp = ++readClock
+        job.progress.delete(f)
+        job.progressAt.delete(f)
+        job.reads.delete(f)
+        job.reads.set(f, version)
+        job.readAt.delete(f)
+        job.readAt.set(f, stamp)
+        noteSeen(f, stamp, version)
+        return restore
+      })
+      const undoReceipt = undo
+      undo = () => {
+        undoReceipt?.()
+        for (const restore of [...restores].reverse()) restore()
+      }
+    }
+    releaseChanging()
+    // Tracked whole, fallbacks included, so the run dir is removed only after it.
+    const delivered = (async () => {
+      if (await $.fs.write(file, JSON.stringify(out)).then(() => true, () => false)) return true
+      const size = typeof out.text === 'string' ? out.text.length : 0
+      const tool = String((m.payload as { tool?: unknown }).tool ?? 'the tool')
+      if (m.kind === 'call') {
+        const sameText = out.result === out.text
+        const base = { ok: out.ok, error: out.error, text: out.shellText ?? out.text, exitCode: out.exitCode, whole: out.whole }
+        const slim = sameText ? { ...base, resultIsText: true } : { ...base, result: out.result }
+        if (await $.fs.write(file, JSON.stringify(slim)).then(() => true, () => false)) return true
+        if (!sameText && (await $.fs.write(file, JSON.stringify({ ...base, droppedResult: true })).then(() => true, () => false))) return true
+      }
+      const changedFile = m.kind === 'call' && out.ok === true && (tool === 'Write' || tool === 'Edit' || isPatchTool(tool))
+      const failed = m.kind !== 'call' ? { ok: false, error: `The answer to ${m.kind} is too large to pass to the script whole.` } : changedFile ? { ok: false, error: `The answer of ${tool} could not be handed to the script, but it may have changed the file; read the file again before changing it.` } : { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
+      const t = m.kind === 'call' ? calls.get(tool) : undefined
+      if (t && out.ok) {
+        t.ok--
+        t.failed++
+        t.arg ??= firstArg(((m.payload as { args?: unknown }).args ?? {}) as Record<string, unknown>)
+      }
+      await $.fs.write(file, JSON.stringify(failed)).catch(() => {})
+      return false
+    })()
+    const cleanUp = () => {
+      undo?.()
+      ;(out[UNDELIVERED as never] as (() => void) | undefined)?.()
+    }
+    const reply = delivered.then((ok) => {
+      if (!ok) return cleanUp()
+      if (undo || out[UNDELIVERED as never]) untakenAnswers.set(m.id as number, cleanUp)
+    })
+    writes.add(reply)
+    void reply.finally(() => writes.delete(reply))
+    await reply
+  }
+
+  // The child may only touch its own run dir, so it has to exist before the child starts.
+  if (job.cancelledBy) {
+    if (!job.settled) job.stopped = true
+    return { result: format(0, { items: [], logs: [], kind: job.stopKind ?? 'cancelled', failure: `stopped before it started, by ${job.cancelledBy}; none of its tool calls ran.` }) }
+  }
+  const shellPref = await $.env.get('CODEMODE_SHELL')
+  await $.fs.write(`${dir}/.keep`, '')
+
+  let started = Date.now()
+  let done: Done | undefined
+  let stderr = ''
+  let buf = ''
+  let pid: number | undefined
+  let discard = false
+  let killed = false
+  // The child's own timer cannot fire while a script spins synchronously, so
+  // the mod kills it a little after the deadline.
+  let gone = false
+  const killRunner = () => {
+    killed = true
+    if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
+  }
+  let watchdog: { cancel: () => unknown } = { cancel: () => undefined }
+  const armWatchdog = (ms: number) => {
+    watchdog.cancel()
+    watchdog = $.clock.after(ms, async () => {
+      const now = await clockNow($)
+      if (gone || pid === undefined) return
+      const left = started + timeout + 5_000 - now
+      if (left > 0) armWatchdog(Math.max(50, left))
+      else killRunner()
+    })
+  }
+  armWatchdog(timeout + 5_000)
+  try {
+    if (!job.cancelledBy && !job.pid && Date.now() > job.deadline) expire(job)
+    if (job.cancelledBy) throw new Error('codemode: stopped before its runner started')
+    const child = $.process.spawn({
+      argv: [node, '--permission', `--allow-fs-read=${dir}`, `--allow-fs-write=${dir}`, '-e', RUNNER],
+      input: JSON.stringify({ script, tools: all, dir, timeout, texts, cwd, home, denied: [...deniedTools.keys()], shell: shellPref }),
+    })
+    for await (const piece of child) {
+      if (piece.stream === 'stderr') {
+        stderr = (stderr + piece.text).slice(-20_000)
+        continue
+      }
+      buf += piece.text
+      for (let nl = buf.indexOf('\n'); nl >= 0; nl = buf.indexOf('\n')) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        if (!line.startsWith('\x1eCM')) continue
+        let m: Partial<Request & Done & { pid: number; out: string; text: string; keys: unknown }>
+        try {
+          m = JSON.parse(line.slice(3))
+        } catch {
+          continue
+        }
+        // The pid is the runner's first line, before any script code runs.
+        if (pid === undefined) {
+          pid = Number.isSafeInteger(m.pid) && (m.pid as number) > 1 ? m.pid : 0
+          const childStarted = (m as { started?: unknown }).started
+          if (typeof childStarted === 'number' && childStarted >= started && childStarted <= Date.now()) started = childStarted
+          watchdog.cancel()
+          armWatchdog(Math.max(0, started + timeout + 5_000 - Date.now()))
+          job.pid = pid || undefined
+          job.onPid()
+          if (killed || job.cancelledBy) {
+            discard = true
+            if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
+          }
+          continue
+        }
+        if (discard) continue
+        if (m.done === true && job.cancelledBy) {
+          over = true
+          continue
+        }
+        if (m.done === true) {
+          job.exited = true
+          const idsOf = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is number => Number.isSafeInteger(x)) : undefined)
+          done = { done: true, failure: m.failure, kind: m.kind, failedId: (m as { failedId?: number }).failedId, alongside: Number((m as { alongside?: unknown }).alongside) || 0, alongsideIds: idsOf((m as { alongsideIds?: unknown }).alongsideIds), answered: idsOf((m as { answered?: unknown }).answered) }
+          over = true
+        } else if (m.out === 'log' && typeof m.text === 'string') {
+          const t = take(m.text)
+          if (t !== undefined) logs.push(t)
+        } else if (m.out === 'item' && (typeof m.text === 'string' || Array.isArray(m.keys))) {
+          const parts = Array.isArray(m.keys) && m.keys.every((k) => typeof k === 'string') ? (m.keys as string[]) : undefined
+          const whole =
+            typeof m.text === 'string'
+              ? m.text
+              : (m as { json?: unknown }).json === true
+                ? `{\n${(parts ?? []).map((k) => `  ${k.split('\n').join('\n  ')}`).join(',\n')}\n}`
+                : (parts ?? []).join('\n')
+          const t = take(whole)
+          if (t !== undefined) {
+            items.push(t)
+            keys.push(t === whole ? parts : undefined)
+          }
+        }
+        else if (!done && !killed && !job.cancelledBy && Number.isSafeInteger(m.id) && (m.id as number) > 0 && KINDS.has(m.kind as string) && m.payload && typeof m.payload === 'object') {
+          const reply = respond(m as Request)
+          replies.add(reply)
+          void reply.finally(() => replies.delete(reply))
+        }
+      }
+      if (buf.length > 8_000_000) buf = ''
+    }
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err)
+    if ((err as Error)?.name === 'AbortError' || /\$\.process\.spawn\([^)]*\) aborted|AbortError/.test(msg)) aborted = true
+    else stderr += `\n${msg}`
+  }
+  gone = true
+  job.exited = true
+  job.pid = undefined
+  watchdog.cancel()
+  if (done?.failure && done.kind !== 'timeout' && open.size)
+  {
+    const grace: { handle?: { cancel: () => unknown } } = {}
+    await Promise.race([Promise.allSettled([...replies]), new Promise((r) => (grace.handle = $.clock.after(1_500, () => r(undefined))))])
+    grace.handle?.cancel()
+  }
+  over = true
+  watchdog.cancel()
+  // A reply already being written could recreate the dir after it is removed.
+  await Promise.allSettled([...writes])
+  const answered = new Set(done?.answered ?? [])
+  for (const [id, cleanUp] of untakenAnswers) if (!answered.has(id)) cleanUp()
+  untakenAnswers.clear()
+  await $.process.run(['rm', '-rf', dir]).catch(() => {})
+  let ended: Ended = job.cancelledBy
+    ? { items, keys, logs, kind: job.stopKind ?? 'cancelled', failure: job.stopKind === 'aborted' ? 'stopped because its turn was interrupted; what it printed is above, and its tool calls may have run.' : `stopped by cancel() from ${job.cancelledBy}; what it printed is above, and its tool calls may have run.` }
+    : done
+    ? { items, keys, logs, failure: done.failure, kind: done.kind }
+    : aborted
+      ? { items, keys, logs, kind: 'aborted', failure: 'the run was interrupted before it finished (the session stopped it); what it printed is above, and its tool calls may have run.' }
+      : killed
+        ? { items, keys, logs, kind: 'timeout', failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
+        : { items, keys, logs, kind: 'runner', failure: `script runner exited without a result.\n${stderr.trim()}` }
+  if (!job.settled) job.stopped = !!job.cancelledBy || ended.kind === 'aborted'
+  const first = ended.failure?.split('\n')[0] ?? ''
+  if (ended.failure && (ended.kind === 'timeout' || job.stopped) && open.size) {
+    const now = Date.now()
+    const still = [...open.values()].map((o) => `${o.tool} (${((now - o.at) / 1000).toFixed(1)}s${o.arg ? `, ${o.arg}` : ''})`)
+    const when = ended.kind === 'timeout' ? 'when it timed out' : 'when it was stopped'
+    ended = { ...ended, failure: `${ended.failure}\nstill running ${when} (abandoned, not stopped: they may still finish, so do not repeat them blind): ${still.join('; ')}` }
+  }
+  const notes = [
+    ...(stubs.size
+      ? [`Note: a result from ${[...stubs].join(', ')} was a compressed stub, not the tool's full text; ${deduped ? 'read(path) gets a whole file past a repeated-read stub, and ' : ''}call the tool with raw: true, or set CODEMODE_TOOL_DEFAULTS, to get the full text.`]
+      : []),
+    ...(cut.size
+      ? [`Note: Claude Code cut the middle out of a failed command's output from ${[...cut].join(', ')} (it keeps the first and last 5,000 chars of a failed result over 10,000); that sh() result is marked .truncated, and sending the output to a file (cmd > /tmp/out.txt 2>&1) and reading it with read(path) gets all of it.`]
+      : []),
+    ...(savedAway.size
+      ? [`Note: Claude Code saved a result from ${[...savedAway].join(', ')} to a file instead of returning it (it was over its token limit), and it could not be read back here; read(path) of the file the result names gets it where Read may open it.`]
+      : []),
+    ...(withheld.size ? [`Note: lean-ctx withheld a result from ${[...withheld].join(', ')} by its storage policy; that text is not available to scripts here.`] : []),
+    ...(persisted ? ['Note: Bash saved a big output to a file instead of returning it (<persisted-output>), and it could not be read back here; read(path) of the file it names gets it whole where Read may open it.'] : []),
+  ]
+  if (notes.length) ended = { ...ended, notes }
+  // A failed call can have changed things too (a command that wrote, then exited non-zero).
+  const only = calls.size === 1 ? [...calls][0] : undefined
+  // One failed call whose own error ended the run says nothing the error does not.
+  const echo =
+    only !== undefined &&
+    only[1].ok + only[1].open === 0 &&
+    only[1].failed === 1 &&
+    [only[0], ident(only[0])].some((n) => ended.failure?.includes(`Error: ${n}: `) === true)
+  const ran = echo ? '' : ledger(calls)
+  if (ended.failure && ran) ended = { ...ended, failure: `${ended.failure}\nTool calls before the failure: ${ran}` }
+  const now = Date.now()
+  const alongside = !done?.failedId ? 0 : done.alongsideIds ? done.alongsideIds.filter((id) => startedCalls.has(id)).length : (done.alongside ?? 0)
+  if (ended.failure && ended.kind === 'tool' && alongside > 0)
+    ended = {
+      ...ended,
+      failure: `${ended.failure}\n${alongside} call${alongside === 1 ? '' : 's'} that ran alongside it had succeeded or were still running; their results are lost with this failure: use call(), which never throws, or Promise.allSettled to keep them.`,
+    }
+  const current = job.gen === sessionGen
+  const before = current ? failedScripts.get(raw) : undefined
+  if (ended.failure && ended.kind !== 'aborted' && ended.kind !== 'cancelled') {
+    if (before)
+      ended = {
+        ...ended,
+        failure:
+          before.first === first
+            ? `${ended.failure}\nThis is the same script as a run that failed ${Math.round((now - before.at) / 1000)}s ago with the same error: change the script, not just run it again.`
+            : `${ended.failure}\nThis is the same script as a run that failed ${Math.round((now - before.at) / 1000)}s ago with: ${before.first.slice(0, 200)}`,
+      }
+    if (current) {
+      failedScripts.delete(raw)
+      failedScripts.set(raw, { first, at: now })
+    }
+    if (failedScripts.size > 20) failedScripts.delete(failedScripts.keys().next().value as string)
+  } else if (!ended.failure && current) failedScripts.delete(raw)
+  const room = maxChars - 400
+  let parts = sections(now - started, ended)
+  let full = parts.join('\n')
+  if (full.length > room) {
+    parts = sections(now - started, ended, true)
+    full = parts.join('\n')
+  }
+  // A cut output is kept whole on disk, so nothing in it needs a second run.
+  let file: string | undefined
+  if (full.length > room) {
+    const spills = `${home}/.claude/codemode/out`
+    const path = `${spills}/${dir.slice(root.length + 1)}.txt`
+    job.spill = `${dir.slice(root.length + 1)}.txt`
+    ownSpills.add(job.spill)
+    while (ownSpills.size > 1000) ownSpills.delete(ownSpills.values().next().value as string)
+    const waiting = new Set([...jobsById.values()].filter((j) => !j.delivered && j.spill).map((j) => j.spill))
+    file = await $.fs.write(path, full).then(() => path, () => undefined)
+    let mine = 0
+    const old = ((await $.fs.list(spills).catch(() => [])) ?? [])
+      .filter((x) => x.name.endsWith('.txt'))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .filter((x) => {
+        const aged = Date.now() - x.mtimeMs > SPILL_AGE_MS
+        if (!ownSpills.has(x.name)) return aged
+        const extra = mine++ >= KEEP_SPILLS
+        return !waiting.has(x.name) && Date.now() - (handedSpills.get(x.name) ?? 0) > SPILL_AGE_MS && (extra || aged)
+      })
+    if (old.length) await $.process.run(['rm', '-f', ...old.map((x) => `${spills}/${x.name}`)]).catch(() => {})
+  }
+  const out = fit(parts, room, file, (ended.notes?.length ?? 0) + (ended.failure ? 1 : 0))
+  // A marker the cut removed still counts: the script chose to show it.
+  const blocks = attach(full, pictures)
+  return { result: blocks.length ? ([{ type: 'text', text: out }, ...blocks] as never) : out }
+}
+
 export const register: Register = (on) => {
   on('session.start', async ($, e, next) => {
     // The session's own tools pick the description's argument lines; a list the
@@ -1606,11 +3250,6 @@ export const register: Register = (on) => {
     sessionCwd = typeof cwd === 'string' && cwd ? cwd : undefined
     const kept = (await $.store.get('denied').catch(() => undefined)) as Record<string, { alt?: string; at?: number }> | undefined
     deniedTools.clear()
-    readPaths.clear()
-    readProgress.clear()
-    readVersions.clear()
-    pageStart.clear()
-    failedScripts.clear()
     for (const [n, v] of Object.entries(kept && typeof kept === 'object' ? kept : {}))
       if (v && Date.now() - Number(v.at ?? 0) < DENIED_MS && (names.size === 0 || (typeof v.alt === 'string' && names.has(v.alt)))) deniedTools.set(n, { alt: v.alt, at: Number(v.at) })
     await $.tool.register({
@@ -1626,16 +3265,92 @@ export const register: Register = (on) => {
     return next(e)
   })
 
+  on('session.end', async ($, e, next) => {
+    sessionGen++
+    const jobs = [...jobsById.values()]
+    for (const j of jobs) j.quiet = true
+    void stopJobs($, jobs, 'the end of its session', 'aborted')
+    jobsById.clear()
+    deliveredIds.clear()
+    for (const agent of sessionReads.keys()) forgetSessionReads(agent)
+    forgottenAt.clear()
+    for (const j of jobs) j.expiry?.cancel()
+    mainTurn = false
+    mainTurnId = undefined
+    failedScripts.clear()
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
     const skipped = !!r && typeof r === 'object' && 'skip' in r && (r as { skip?: unknown }).skip !== undefined
-    if (!e.agentId && e.trigger !== 'precompute' && !skipped) {
-      readPaths.clear()
-      readProgress.clear()
-      readVersions.clear()
-      pageStart.clear()
-    }
+    if (e.trigger !== 'precompute' && !skipped) forgetSessionReads(agentOf(e.agentId))
     return r
+  }).catch(($, e, next) => next(e))
+
+  on('turn.start', async ($, e, next) => {
+    if (agentOf((e as { agentId?: unknown }).agentId) === MAIN) {
+      mainTurn = true
+      turnSeq++
+      mainTurnId = String((e as { turnId?: unknown }).turnId ?? '') || undefined
+    }
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const agent = agentOf((e as { agentId?: unknown }).agentId)
+    const turnId = String((e as { turnId?: unknown }).turnId ?? '') || undefined
+    const seq = turnSeq
+    const current = !mainTurnId || !turnId || turnId === mainTurnId
+    try {
+      return await next(e)
+    } finally {
+      if (agent !== MAIN) {
+        forgetSessionReads(agent)
+        sessionReads.delete(agent)
+        const jobs = agentJobs(agent)
+        await stopJobs($, jobs, 'the end of its agent\'s turn', 'cancelled')
+        for (const j of jobs) {
+          j.expiry?.cancel()
+          jobsById.delete(j.id)
+        }
+        sessionReads.delete(agent)
+      } else {
+        if ((e as { isAborted?: unknown }).isAborted === true) {
+          const jobs = agentJobs(MAIN).filter((j) => (turnId ? j.turnId === turnId : current && j.turnSeq === seq))
+          for (const j of jobs) j.quiet = true
+          await stopJobs($, jobs, 'the interrupt', 'aborted')
+        }
+        if (current && turnSeq === seq) {
+          mainTurn = false
+          mainTurnId = undefined
+          await wake($)
+        }
+      }
+    }
+  })
+
+  on('classic.Stop', async ($, e, next) => {
+    const surfaces: unknown = await $.session.surfaces().catch(() => [])
+    const watched = Array.isArray(surfaces) && surfaces.length > 0
+    if (watched) return next(e)
+    const signal = (next as { signal?: AbortSignal }).signal
+    const ready = await holdTurn($, MAIN, signal)
+    const r = await next(e)
+    if (!ready.length || signal?.aborted) return r
+    for (const j of ready) j.noticed = true
+    return withHeld(r, notice(ready)) as never
+  }).catch(($, e, next) => next(e))
+
+  on('classic.SubagentStop', async ($, e, next) => {
+    const id = (e as { agent_id?: unknown }).agent_id
+    if (typeof id !== 'string' || !id) return next(e)
+    const signal = (next as { signal?: AbortSignal }).signal
+    const ready = await holdTurn($, agentOf(id), signal)
+    const r = await next(e)
+    if (!ready.length || signal?.aborted) return r
+    for (const j of ready) j.noticed = true
+    return withHeld(r, notice(ready)) as never
   }).catch(($, e, next) => next(e))
 
   on('skill.prompt', async ($, e, next) => {
@@ -1684,6 +3399,9 @@ export const register: Register = (on) => {
     }
 
     const raw = String((e as unknown as { script?: unknown }).script ?? '')
+    const caller = agentOf((e as { agentId?: unknown }).agentId)
+    if (caller === MAIN) mainTurn = true
+    if (!raw.trim()) return { result: collectReply(caller) as never }
     const { options, error } = parseOptions(raw)
     if (error) return { result: format(0, { items: [], logs: [], failure: error, kind: 'syntax' }) }
     const pre = extractText(raw)
@@ -1691,651 +3409,14 @@ export const register: Register = (on) => {
     const script = pre.script
     const timeout = num(options.timeout_ms, DEFAULT_TIMEOUT_MS, 1_000, 3_600_000)
     const maxChars = num(options.max_output_chars, DEFAULT_MAX_CHARS, 1_000, 1_000_000)
-
-    const listing = (await $.tool.list()).filter((t) => t.name !== FULL && t.name !== AGENTS_TOOL)
-    const all = listing.map((t) => ({ name: t.name, description: t.description }))
-    const isMcp = new Set(listing.filter((t) => (t as { mcp?: boolean }).mcp ?? t.name.startsWith('mcp__')).map((t) => t.name))
-    // Every tool call this run made, so a failure can say what already ran.
-    const calls = new Map<string, Tally>()
-    const open = new Map<number, { tool: string; arg?: string; at: number }>()
-    const stubs = new Set<string>()
-    let deduped = false
-    let persisted = false
-    const withheld = new Set<string>()
-    const cut = new Set<string>()
-    const savedAway = new Set<string>()
-    const defaults = toolDefaults(await $.env.get('CODEMODE_TOOL_DEFAULTS'))
-    const cwd = sessionCwd ?? (await $.env.get('PWD')) ?? undefined
-    // Stored types belong to one engine version: an upgrade can change a schema.
-    // No version known: nothing is stored or read, rather than a key every version shares.
-    let version: Promise<string> | undefined
-    const typeKey = async (tool: string): Promise<string | undefined> => {
-      version ??= Promise.resolve()
-        .then(() => $.session.version())
-        .then((v) => (typeof v?.version === 'string' ? v.version : ''), () => '')
-      const v = await version
-      return v ? `type:${v}:${tool}` : undefined
-    }
-    const home = (await $.env.get('HOME')) || '/tmp'
-    const configDir = normal((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`)
-    // A host whose own node is older than 25 points this at a newer one.
-    const node = (await $.env.get('CODEMODE_NODE')) || 'node'
-    const root = `${home}/.claude/codemode/runs`
-    const dir = `${root}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${++runs}`
-
-    const versionOf = (path: string): Promise<string | undefined> =>
-      $.fs.stat(path, { resolve: true }).then(
-        (s) => (typeof s?.mtimeMs === 'number' ? `${s.mtimeMs}:${s.size}` : undefined),
-        () => undefined,
-      )
-
-    const handle = async (m: Request): Promise<Record<string, unknown>> => {
-      const p = m.payload
-      if (m.kind === 'store') {
-        const key = `script:${String(p.key)}`
-        if (p.value === undefined) await $.store.delete(key)
-        else await $.store.set(key, p.value as never)
-        return { ok: true }
-      }
-      if (m.kind === 'fresh') {
-        const path = normal(String(p.path))
-        const was = readVersions.get(path)
-        const now = was === undefined ? undefined : await versionOf(path)
-        return { ok: true, fresh: was !== undefined && now !== undefined && now === was }
-      }
-      if (m.kind === 'load') return { ok: true, value: await $.store.get(`script:${String(p.key)}`) }
-      if (m.kind === 'cut') {
-        if (typeof p.tool === 'string' && SHELL_RE.test(p.tool)) cut.add(p.tool)
-        return { ok: true }
-      }
-      if (m.kind === 'describe') {
-        const t = all.find((x) => x.name === p.tool)
-        if (!t) {
-          const near = similar(String(p.tool), all.map((x) => x.name))
-          return { ok: true, value: { name: String(p.tool), description: '', input: `not in this session${near.length ? `; similar: ${near.join(', ')}` : ''}` } }
-        }
-        if (typeSources === undefined) {
-          const found: string[] = []
-          for (const f of ['claude-code-tools', 'claude-code-mcp']) {
-            const text = await $.fs.read(`${$.plugin.root}/.claude-plugin/types/${f}/index.d.ts`).catch(() => '')
-            if (typeof text === 'string' && text) found.push(text.split('interface BuiltinToolResults')[0] ?? text)
-          }
-          typeSources = found
-        }
-        // A type this process just learned beats a generated file, which beats one stored earlier.
-        let input = learned.get(t.name) ?? typeSources.map((s) => inputType(s, t.name)).find(Boolean)
-        if (input === undefined && !isMcp.has(t.name)) {
-          const k = await typeKey(t.name)
-          const kept = k ? await $.store.get(k).catch(() => undefined) : undefined
-          if (typeof kept === 'string') input = kept
-        }
-        // Only a built-in's bad-arguments error carries its type; an MCP server's does not.
-        const unknown = isMcp.has(t.name)
-          ? `not known here; call ToolSearch "select:${t.name}" directly to load its schema`
-          : `not known here; a call with wrong arguments answers with its type (never probe a tool that changes things), or call ToolSearch "select:${t.name}" directly`
-        return { ok: true, value: { ...t, input: input ?? unknown } }
-      }
-      if (m.kind === 'ask') {
-        const effort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(String(p.effort)) ? (p.effort as 'low') : undefined
-        const r = await $.model.complete({
-          model: typeof p.model === 'string' && p.model ? p.model : 'haiku',
-          prompt: String(p.prompt ?? ''),
-          ...(typeof p.system === 'string' ? { system: p.system } : {}),
-          maxTokens: Math.floor(num(p.maxTokens, 1024, 1, 64_000)),
-          ...(effort ? { effort } : {}),
-          timeoutMs: timeout,
-        })
-        if (r.isAnswered) return { ok: true, text: r.text }
-        return { ok: false, error: r.reason === 'api-error' ? `api-error ${r.status ?? ''} ${r.error}` : r.reason }
-      }
-      const tool = String(p.tool)
-      if (tool === FULL) return { ok: false, error: 'A script cannot run another script.' }
-      // Agents a Workflow starts inside this call would skip codemode's hooks.
-      if (tool === 'Workflow') return { ok: false, error: 'Workflow cannot run from a codemode script.' }
-      const given = Object.fromEntries(
-        Object.entries((p.args as Record<string, unknown> | null) ?? {}).filter(([k]) => !RESERVED.has(k)),
-      )
-      const args: Record<string, unknown> = { ...(defaults[tool] ?? {}), ...given }
-      if (p.foreground === true) for (const k of Object.keys(args)) if (/background/i.test(k)) delete args[k]
-      const fill = p.fill && typeof p.fill === 'object' && /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? (p.fill as Record<string, unknown>) : undefined
-      if (fill && typeof fill.raw === 'boolean' && !('raw' in args)) args.raw = fill.raw
-      if (fill && typeof fill.timeout_ms === 'number' && Number.isFinite(fill.timeout_ms) && !('timeout_ms' in args)) args.timeout_ms = fill.timeout_ms
-      if ((tool === 'Write' || tool === 'Edit') && args.file_path !== undefined) {
-        const given = String(args.file_path).trim()
-        const expanded = given === '~' || given.startsWith('~/') ? home + given.slice(1) : given
-        if (!expanded.startsWith('/')) return { ok: false, error: `${tool} takes an absolute path from a script: ${given} is relative, and a shell cd can move where it lands` }
-        const path = normal(expanded)
-        args.file_path = path
-        const exists = await $.fs.exists(path).catch(() => true)
-        if (!readPaths.has(path) && exists) return { ok: false, error: `File has not been read yet. Read it first before writing to it: ${path}` }
-        if (exists) {
-          const was = readVersions.get(path)
-          const now = await versionOf(path)
-          if (was === undefined || now === undefined || now !== was)
-            return { ok: false, error: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it: ${path}` }
-        }
-      }
-      if (tool === 'Read' && typeof args.file_path === 'string') args.file_path = absolute(args.file_path.trim(), cwd, home)
-      // Plugins cannot run the Agent tool; codemode-agents spawns instead.
-      const target = tool === 'Agent' || tool === 'Task' ? AGENTS_TOOL : tool
-      const key = skillKey(String(args.skill ?? ''))
-      // Calls to one skill take turns, so each gets its own expansion (its args may
-      // differ); only text expanded after this call started counts.
-      const timer: { handle?: { cancel: () => unknown } } = {}
-      const release =
-        tool === 'Skill' ? await skillTurn(key, new Promise((r) => (timer.handle = $.clock.after(60_000, () => r(undefined))))) : undefined
-      timer.handle?.cancel()
-      if (tool === 'Skill' && !release)
-        return { ok: false, error: `An earlier Skill call for ${key} is still running after 60 s, so this one did not start; call it again once that one is done.` }
-      const since = skillSeq
-      const counted = p.poll !== true
-      const tally = (counted ? calls.get(tool) : undefined) ?? { ok: 0, failed: 0, open: 0 }
-      if (counted) calls.set(tool, tally)
-      tally.open++
-      if (counted) open.set(m.id, { tool, arg: firstArg(args), at: Date.now() })
-      const readBefore = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
-      const patchPath = (v: unknown) => (typeof v === 'string' && !v.trim().startsWith('~') ? absolute(v.trim(), cwd, home) : undefined)
-      const patchOps = /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(tool)
-        ? (Array.isArray(args.ops) ? (args.ops as Record<string, unknown>[]) : [args])
-            .map((o) => ({ op: String(o?.op ?? ''), path: patchPath(o?.path ?? args.path) }))
-            .filter((o): o is { op: string; path: string } => !!o.path && o.path.startsWith('/'))
-        : []
-      const patchFresh = new Map<string, boolean>()
-      for (const o of patchOps)
-        if (o.op !== 'create' && !patchFresh.has(o.path))
-          patchFresh.set(o.path, readPaths.has(o.path) && readVersions.get(o.path) !== undefined && readVersions.get(o.path) === (await versionOf(o.path)))
-      let r = await $.tool.call({ ...args, tool: target } as never).catch((err: unknown) => {
-        tally.open--
-        tally.failed++
-        tally.arg ??= firstArg(args)
-        release?.()
-        const msg = (err as Error)?.message ?? String(err)
-        // A tool a setting or another mod removed: name what may replace it.
-        const near = msg.includes('no tool named') ? similar(tool, all.map((x) => x.name)) : []
-        throw new Error(near.length ? `${msg}; similar: ${near.join(', ')}` : msg)
-      })
-      const body = release ? skillTexts.get(key) : undefined
-      release?.()
-      const capped =
-        tool === 'Read' &&
-        !r.isError &&
-        args.limit === undefined &&
-        (infoOf(r.result)?.truncatedByTokenCap === true || ((args.offset === undefined || args.offset === 1) && isStub(String(r.text ?? '')) && /read-dedup/.test(String(r.text ?? ''))))
-      if (tool === 'Read' && args.limit === undefined && (capped || (r.isError && /exceeds maximum allowed (?:tokens|size)/i.test(String(r.text ?? show(r.result)))))) {
-        const paged = await pageRead(args)
-        if (paged?.text !== undefined) r = { text: paged.text, result: paged.result } as typeof r
-        else if (paged?.error !== undefined) r = { isError: true, text: paged.error } as typeof r
-        else if (capped)
-          r = { isError: true, text: `${String(args.file_path)} is over Read's token cap and could not be read in pages (a single line may be over the cap); read part of it with sh() and head -c, or with offset and limit` } as typeof r
-      }
-      tally.open--
-      const failed = r.deny !== undefined || r.isError === true
-      if (failed) {
-        tally.failed++
-        tally.arg ??= firstArg(args)
-      } else tally.ok++
-      const saveDenied = () =>
-        $.store.set('denied', Object.fromEntries([...deniedTools].map(([n, v]) => [n, { alt: v.alt, at: v.at }])) as never).catch(() => {})
-      if (!failed && deniedTools.delete(tool)) await saveDenied()
-      const said = String(r.deny ?? (r.isError ? (r.text ?? show(r.result)) : ''))
-      const refused = r.deny !== undefined || (r.isError === true && HOOK_RE.test(said) && !(SHELL_RE.test(tool) && exitOf(said, false, tool).code !== undefined))
-      if (refused) {
-        const plain = said.replace(/^\s*<tool_use_error>/, '').replace(/<\/tool_use_error>\s*$/, '')
-        const whole = WHOLE_RE.exec(plain)
-        const wants = whole && whole[1] === tool ? all.map((x) => x.name).filter((n) => n !== tool && (n === whole[2] || short(n) === whole[2])) : []
-        const fits = (n: string) => (tool === 'Bash' ? /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(n) : /^(?:Write|Edit)$/.test(tool) && /^mcp__lean[-_]ctx__(?:ctx_)?patch$/.test(n))
-        const alt = wants.length === 1 && fits(wants[0] as string) ? wants[0] : undefined
-        if (!alt) return { ok: false, error: plain, refused: true }
-        if (!deniedTools.has(tool)) {
-          deniedTools.set(tool, { alt, at: Date.now() })
-          await saveDenied()
-        }
-        return { ok: false, error: `${plain}\n${tool} is denied by a hook in this session; use tools.${ident(alt)}({...}) instead.`, denied: true, alt }
-      }
-      const markers: string[] = []
-      const result = strip(r.result, pictures, markers)
-      let text = r.text ?? show(result)
-      if (tool === 'Skill' && !r.isError) {
-        if (body && body.seq > since) text = `${text}\n\n${body.text}`
-      }
-      if (markers.length) text = [text.trim(), ...markers].filter(Boolean).join('\n')
-      const toolResult = (path: string) => path.startsWith(`${configDir}/projects/`) && /\/tool-results\/[^/]+\.txt$/.test(path)
-      const readBack = async (path: string, shell?: string) => {
-        const paged = await pageRead({ file_path: path })
-        if (paged?.text !== undefined) return paged.text.split('\n').map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
-        if (shell && (paged === undefined || /over Read's token cap/.test(paged.error ?? ''))) return viaBytes(shell, path)
-        return undefined
-      }
-      const saved = tool === 'Bash' ? PERSISTED.exec(text) : null
-      if (saved) {
-        const path = normal((saved[2] as string).trim())
-        const head = (saved[3] as string).replace(/\r/g, '').slice(0, 1000)
-        const whole = toolResult(path) ? await readBack(path, 'Bash') : undefined
-        if (whole !== undefined && head && whole.replace(/\r/g, '').startsWith(head)) text = (saved[1] as string) + whole + (saved[4] as string)
-        else persisted = true
-      }
-      const swapped = !r.isError && isMcp.has(tool) ? SAVED.exec(text) : null
-      if (swapped) {
-        const path = normal((swapped[2] as string).trim())
-        const size = Number((swapped[1] as string).replace(/,/g, ''))
-        const lean = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) ? tool : undefined
-        const back = toolResult(path) ? await readBack(path, lean) : undefined
-        const whole = back !== undefined && back.length + 1 === size ? back + '\n' : back
-        if (whole !== undefined && whole.length === size) text = whole
-        else savedAway.add(tool)
-      }
-      const shell = SHELL_RE.test(tool) ? exitOf(text, !r.isError, tool) : undefined
-      const exit = shell ? { ...(shell.code === undefined ? {} : { exitCode: shell.code }), shellText: shell.out } : {}
-      if (!r.isError) {
-        if (text.length > MAX_REPLY) {
-          tally.ok--
-          tally.failed++
-          tally.arg ??= firstArg(args)
-          return { ok: false, error: `The result of ${tool} is ${text.length} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
-        }
-        const target = typeof args.file_path === 'string' ? args.file_path : undefined
-        const wrote = tool === 'Write' || tool === 'Edit'
-        const moved = p.foreground === true && tool === 'Bash' ? (r.result as { backgroundTaskId?: unknown } | undefined)?.backgroundTaskId : undefined
-        if (moved !== undefined) {
-          tally.ok--
-          tally.failed++
-          tally.arg ??= firstArg(args)
-          return { ok: false, error: `Bash moved the command to the background before it finished (task ${String(moved ?? 'unknown')}), so sh() cannot give its exit code: ${text.trim().slice(0, 300)} Wait for its output with waitFor, or give sh() a longer { timeout }.` }
-        }
-        const readNow: string[] = []
-        const created = new Set(patchOps.filter((o) => o.op === 'create').map((o) => o.path))
-        for (const o of patchOps) {
-          if (created.has(o.path) || patchFresh.get(o.path) === true) {
-            const version = await versionOf(o.path)
-            readPaths.add(o.path)
-            if (version === undefined) readVersions.delete(o.path)
-            else readVersions.set(o.path, version)
-            readNow.push(o.path)
-          } else {
-            readPaths.delete(o.path)
-            readVersions.delete(o.path)
-          }
-        }
-        const readAfter = tool === 'Read' && typeof args.file_path === 'string' ? await versionOf(args.file_path) : undefined
-        if (tool === 'Read' && p.handled === true && typeof args.file_path === 'string') {
-          const from = typeof args.offset === 'number' ? args.offset : 1
-          const first = pageStart.get(args.file_path)
-          if (from === 1) pageStart.set(args.file_path, readBefore)
-          else if (first !== undefined && (readBefore !== first || readAfter !== first)) {
-            tally.ok--
-            tally.failed++
-            return { ok: false, error: `${args.file_path} changed while it was read in pages; read it again` }
-          }
-          if (pageStart.size > 200) pageStart.delete(pageStart.keys().next().value as string)
-        }
-        const receipt =
-          tool === 'Read' && typeof args.file_path === 'string'
-            ? receiptOf(args.file_path, args.offset, args.limit, text, r.result, readBefore !== undefined && readBefore === readAfter ? readBefore : undefined)
-            : wrote && typeof target === 'string' && target.startsWith('/')
-              ? ({ file: normal(target), whole: true } as Receipt)
-              : undefined
-        if (receipt?.whole && receipt.version === undefined) receipt.version = await versionOf(receipt.file)
-        if (isStub(text, tool) && p.handled !== true && isWithheld(text, tool)) withheld.add(tool)
-        else if (isStub(text, tool) && p.handled !== true) {
-          stubs.add(tool)
-          if (/read-dedup/.test(text)) deduped = true
-        }
-        const job = /^mcp__lean[-_]ctx__(?:ctx_)?shell$/.test(tool) && typeof r.result === 'string' ? jobOf(r.result) : undefined
-        return { ok: true, text, result, ...exit, ...(job ? { job } : {}), ...(receipt?.whole ? { whole: true } : {}), ...(readNow.length ? { readNow } : {}), ...(receipt ? { [READ]: receipt } : {}) }
-      }
-      const bad = tidy(tool, text)
-      if (tool === 'Read' && /File does not exist/i.test(bad.message) && typeof args.file_path === 'string' && args.file_path.startsWith('/')) {
-        const at = args.file_path.lastIndexOf('/')
-        const folder = args.file_path.slice(0, at) || '/'
-        const root = cwd ? normal(cwd) : undefined
-        const inside = root !== undefined && (folder === root || folder.startsWith(root === '/' ? '/' : `${root}/`))
-        const listed = inside ? ((await $.fs.list(folder).catch(() => [])) ?? []).map((x) => x.name) : []
-        const near: string[] = []
-        for (const n of nearNames(args.file_path.slice(at + 1), listed)) {
-          const path = `${folder === '/' ? '' : folder}/${n}`
-          const probe = await $.tool.call({ file_path: path, limit: 1, tool: 'Read' } as never).catch(() => undefined)
-          const said = String(probe?.text ?? '')
-          if (probe && probe.deny === undefined && (probe.isError !== true || /exceeds maximum allowed/i.test(said))) near.push(path)
-        }
-        if (near.length) bad.message = `${bad.message} Similar files: ${near.join(', ')}`
-      }
-      // Learned from built-ins only: an MCP server writes its own error text.
-      if (bad.type && !isMcp.has(tool)) {
-        if (learned.size >= 200) learned.delete(learned.keys().next().value as string)
-        learned.set(tool, bad.type)
-        // Kept across sessions: the engine no longer writes the type files, so a
-        // built-in's bad-arguments error is the only other source of its type.
-        const k = await typeKey(tool)
-        if (k) await $.store.set(k, bad.type as never).catch(() => {})
-      }
-      const engineCut = SHELL_RE.test(tool) && ENGINE_CUT.test(text) && !LEAN_ARCHIVED.test(text)
-      if (engineCut && p.poll !== true) cut.add(tool)
-      return { ok: false, error: bad.message, text: bad.message, result, ...exit, ...(engineCut ? { cut: true } : {}) }
-    }
-
-    const viaBytes = async (shell: string, path: string): Promise<string | undefined> => {
-      const step = 21000
-      const extra = shell === 'Bash' ? {} : { raw: true }
-      const ask = (command: string) => $.tool.call({ ...extra, command, tool: shell } as never).catch(() => undefined)
-      const sized = await ask('wc -c < ' + shellQuote(path))
-      const size = Number(String(sized?.text ?? '').trim())
-      if (!sized || sized.isError || sized.deny !== undefined || !Number.isInteger(size)) return undefined
-      const bytes: number[] = []
-      for (let at = 0; at < size; at += step) {
-        if (over) return undefined
-        const r = await ask('tail -c +' + (at + 1) + ' ' + shellQuote(path) + ' | head -c ' + step + ' | base64')
-        if (!r || r.isError || r.deny !== undefined) return undefined
-        const part = bytesOf(String(r.text ?? '').replace(/\s+/g, ''))
-        if (!part || part.length !== Math.min(step, size - at)) return undefined
-        for (const b of part) bytes.push(b)
-      }
-      return bytes.length === size ? fromUtf8(bytes) : undefined
-    }
-    const pageRead = async (args: Record<string, unknown>): Promise<{ text?: string; error?: string; result?: unknown } | undefined> => {
-      const pages: string[] = []
-      let size = 0
-      let offset = typeof args.offset === 'number' && args.offset > 1 ? args.offset : 1
-      let limit = 2000
-      let stubbed = 0
-      let tried = new Set<number>()
-      let cap = 2000
-      let total: number | undefined
-      const start = offset
-      const file = String(args.file_path)
-      const version = await versionOf(file)
-      const moved = async () => version === undefined || (await versionOf(file)) !== version
-      for (let guard = 0; guard < 10_000; guard++) {
-        if (over) return undefined
-        const r = await $.tool.call({ ...args, offset, limit, tool: 'Read' } as never).catch(() => undefined)
-        if (r && !r.isError && r.deny === undefined && (await moved())) return { error: `${file} changed while it was read in pages; read it again` }
-        if (!r) return undefined
-        if (r.deny !== undefined) return { error: `Reading ${file} in pages stopped at line ${offset}: ${r.deny}` }
-        const t = String(r.text ?? show(r.result))
-        const cutAtCap = !r.isError && infoOf(r.result)?.truncatedByTokenCap === true
-        if (r.isError || cutAtCap) {
-          if (cutAtCap || /exceeds maximum allowed/i.test(t)) {
-            tried.add(limit)
-            cap = Math.min(cap, limit - 1)
-            limit = pickLimit(limit, tried, cap, Math.floor(limit / 2))
-            if (limit) continue
-            if (offset === 1) return undefined
-            return { error: `${file} has a line over Read's token cap at line ${offset}, so it cannot be read in pages; read part of it with sh() and head -c` }
-          }
-          return { error: offset > 1 ? `Reading ${file} in pages stopped at line ${offset}: ${t.slice(0, 300)}` : t.slice(0, 2000) }
-        }
-        if (isStub(t) && /read-dedup/.test(t)) {
-          tried.add(limit)
-          limit = ++stubbed > 6 ? 0 : pickLimit(limit, tried, cap, Math.max(1, Math.min(limit, 2000) - 1 - Math.floor(Math.random() * Math.min(400, Math.floor(limit / 2)))))
-          if (!limit) return { error: `Reading ${file} in pages: Read keeps answering with a stub, not the file` }
-          continue
-        }
-        const rows = t.split('\n').filter((l) => /^\s*\d+\t/.test(l))
-        if (!rows.length && !NOTICE.test(t)) return { error: `Reading ${file} in pages stopped at line ${offset}: Read answered with no file lines: ${t.slice(0, 200)}` }
-        size += t.length
-        if (size > MAX_REPLY) return { error: `${file} is too large to pass to the script whole (over ${MAX_REPLY} chars); read it with read(path), which reads in pages, or with offset and limit` }
-        if (rows.length) pages.push(rows.join('\n'))
-        const info = infoOf(r.result)
-        if (typeof info?.totalLines === 'number') total = info.totalLines
-        if (rows.length < limit && !(total !== undefined && offset + rows.length - 1 < total)) break
-        offset += rows.length
-        tried = new Set()
-        cap = 2000
-        limit = Math.min(2000, limit * 2)
-        stubbed = 0
-        if (guard === 9_999) return { error: `Reading ${file} in pages stopped after 10000 pages` }
-      }
-      const text = pages.join('\n')
-      const lines = text ? text.split('\n') : []
-      const content = lines.map((l) => l.replace(/^\s*\d+\t/, '')).join('\n')
-      return { text, result: { type: 'text', file: { filePath: file, content, numLines: lines.length, startLine: start, totalLines: total ?? start + lines.length - 1 } } }
-    }
-
-    let over = false
-    const writes = new Set<Promise<unknown>>()
-    const replies = new Set<Promise<unknown>>()
-    const items: string[] = []
-    const keys: (string[] | undefined)[] = []
-    const logs: string[] = []
-    let aborted = false
-    let printed = 0
-    const take = (s: string): string | undefined => {
-      const left = 1_000_000 - printed
-      if (left <= 0) return undefined
-      const kept = s.length > left ? `${s.slice(0, safeEnd(s, left))}\n…output cut at 1000000 chars…` : s
-      printed += Math.min(s.length, left)
-      return kept
-    }
-    const pictures: Picture[] = []
-    const respond = async (m: Request) => {
-      let out: Record<string, unknown>
-      try {
-        out = await handle(m)
-      } catch (err) {
-        out = { ok: false, error: (err as Error)?.message ?? String(err) }
-      }
-      open.delete(m.id)
-      // The child is gone after a timeout; writing would recreate its run dir.
-      if (over) return
-      const file = `${dir}/${m.id}.json`
-      const receipt = out[READ as never] as Receipt | undefined
-      let undo: (() => void) | undefined
-      if (receipt) {
-        const had = readPaths.has(receipt.file)
-        const version = readVersions.get(receipt.file)
-        const progress = readProgress.get(receipt.file)
-        undo = () => {
-          if (readVersions.get(receipt.file) !== receipt.version || readProgress.get(receipt.file)?.next !== (receipt.whole ? undefined : receipt.next)) return
-          if (!had) readPaths.delete(receipt.file)
-          if (version === undefined) readVersions.delete(receipt.file)
-          else readVersions.set(receipt.file, version)
-          if (progress === undefined) readProgress.delete(receipt.file)
-          else readProgress.set(receipt.file, progress)
-        }
-        if (receipt.whole) {
-          readProgress.delete(receipt.file)
-          readPaths.add(receipt.file)
-          if (receipt.version !== undefined) readVersions.set(receipt.file, receipt.version)
-          if (readVersions.size > 2000) readVersions.delete(readVersions.keys().next().value as string)
-          if (readPaths.size > 2000) readPaths.delete(readPaths.values().next().value as string)
-        } else if (receipt.next !== undefined) {
-          readProgress.set(receipt.file, { next: receipt.next, version: receipt.version })
-          if (readProgress.size > 200) readProgress.delete(readProgress.keys().next().value as string)
-        }
-      }
-      // Tracked whole, fallbacks included, so the run dir is removed only after it.
-      const delivered = (async () => {
-        if (await $.fs.write(file, JSON.stringify(out)).then(() => true, () => false)) return true
-        const size = typeof out.text === 'string' ? out.text.length : 0
-        const tool = String((m.payload as { tool?: unknown }).tool ?? 'the tool')
-        const sameText = out.result === out.text
-        const base = { ok: out.ok, error: out.error, text: out.shellText ?? out.text, exitCode: out.exitCode, whole: out.whole }
-        const slim = sameText ? { ...base, resultIsText: true } : { ...base, result: out.result }
-        if (await $.fs.write(file, JSON.stringify(slim)).then(() => true, () => false)) return true
-        if (!sameText && (await $.fs.write(file, JSON.stringify({ ...base, droppedResult: true })).then(() => true, () => false))) return true
-        const failed = { ok: false, error: `The result of ${tool} is ${size} chars, too large to pass to the script whole; read a file with read(path), which reads in pages, or ask for less (offset and limit, a narrower command).` }
-        const t = calls.get(tool)
-        if (t && out.ok) {
-          t.ok--
-          t.failed++
-          t.arg ??= firstArg(((m.payload as { args?: unknown }).args ?? {}) as Record<string, unknown>)
-        }
-        await $.fs.write(file, JSON.stringify(failed)).catch(() => {})
-        return false
-      })()
-      const reply = delivered.then((ok) => {
-        if (!ok) undo?.()
-      })
-      writes.add(reply)
-      void reply.finally(() => writes.delete(reply))
-      await reply
-    }
-
-    // The child may only touch its own run dir, so it has to exist before the child starts.
-    await $.fs.write(`${dir}/.keep`, '')
-
-    const started = Date.now()
-    let done: Done | undefined
-    let stderr = ''
-    let buf = ''
-    let pid: number | undefined
-    let killed = false
-    // The child's own timer cannot fire while a script spins synchronously, so
-    // the mod kills it a little after the deadline.
-    const watchdog = $.clock.after(timeout + 5_000, () => {
-      killed = true
-      if (pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
-    })
-    try {
-      const child = $.process.spawn({
-        argv: [node, '--permission', `--allow-fs-read=${dir}`, `--allow-fs-write=${dir}`, '-e', RUNNER],
-        input: JSON.stringify({ script, tools: all, dir, timeout, texts: pre.texts, cwd, home, denied: [...deniedTools.keys()], shell: await $.env.get('CODEMODE_SHELL'), seen: [...readPaths] }),
-      })
-      for await (const piece of child) {
-        if (piece.stream === 'stderr') {
-          stderr = (stderr + piece.text).slice(-20_000)
-          continue
-        }
-        buf += piece.text
-        for (let nl = buf.indexOf('\n'); nl >= 0; nl = buf.indexOf('\n')) {
-          const line = buf.slice(0, nl)
-          buf = buf.slice(nl + 1)
-          if (!line.startsWith('\x1eCM')) continue
-          let m: Partial<Request & Done & { pid: number; out: string; text: string; keys: unknown }>
-          try {
-            m = JSON.parse(line.slice(3))
-          } catch {
-            continue
-          }
-          // The pid is the runner's first line, before any script code runs.
-          if (pid === undefined) {
-            pid = Number.isSafeInteger(m.pid) && (m.pid as number) > 1 ? m.pid : 0
-            if (killed && pid) void $.process.run(['kill', '-9', String(pid)]).catch(() => {})
-            continue
-          }
-          if (m.done === true) {
-            done = { done: true, failure: m.failure, kind: m.kind, failedId: (m as { failedId?: number }).failedId, alongside: Number((m as { alongside?: unknown }).alongside) || 0 }
-            over = true
-          } else if (m.out === 'log' && typeof m.text === 'string') {
-            const t = take(m.text)
-            if (t !== undefined) logs.push(t)
-          } else if (m.out === 'item' && (typeof m.text === 'string' || Array.isArray(m.keys))) {
-            const parts = Array.isArray(m.keys) && m.keys.every((k) => typeof k === 'string') ? (m.keys as string[]) : undefined
-            const whole =
-              typeof m.text === 'string'
-                ? m.text
-                : (m as { json?: unknown }).json === true
-                  ? `{\n${(parts ?? []).map((k) => `  ${k.split('\n').join('\n  ')}`).join(',\n')}\n}`
-                  : (parts ?? []).join('\n')
-            const t = take(whole)
-            if (t !== undefined) {
-              items.push(t)
-              keys.push(t === whole ? parts : undefined)
-            }
-          }
-          else if (!done && Number.isSafeInteger(m.id) && (m.id as number) > 0 && KINDS.has(m.kind as string) && m.payload && typeof m.payload === 'object') {
-            const reply = respond(m as Request)
-            replies.add(reply)
-            void reply.finally(() => replies.delete(reply))
-          }
-        }
-        if (buf.length > 8_000_000) buf = ''
-      }
-    } catch (err) {
-      const msg = (err as Error)?.message ?? String(err)
-      if ((err as Error)?.name === 'AbortError' || /\$\.process\.spawn\([^)]*\) aborted|AbortError/.test(msg)) aborted = true
-      else stderr += `\n${msg}`
-    }
-    if (done?.failure && done.kind !== 'timeout' && open.size)
-    {
-      const grace: { handle?: { cancel: () => unknown } } = {}
-      await Promise.race([Promise.allSettled([...replies]), new Promise((r) => (grace.handle = $.clock.after(1_500, () => r(undefined))))])
-      grace.handle?.cancel()
-    }
-    over = true
-    watchdog.cancel()
-    // A reply already being written could recreate the dir after it is removed.
-    await Promise.allSettled([...writes])
-    await $.process.run(['rm', '-rf', dir]).catch(() => {})
-    let ended: Ended = done
-      ? { items, keys, logs, failure: done.failure, kind: done.kind }
-      : aborted
-        ? { items, keys, logs, kind: 'aborted', failure: 'the run was interrupted before it finished (the session stopped it); what it printed is above, and its tool calls may have run.' }
-        : killed
-          ? { items, keys, logs, kind: 'timeout', failure: `timed out after ${timeout}ms (the script never yielded, so its runner was killed)` }
-          : { items, keys, logs, kind: 'runner', failure: `script runner exited without a result.\n${stderr.trim()}` }
-    const first = ended.failure?.split('\n')[0] ?? ''
-    if (ended.failure && ended.kind === 'timeout' && open.size) {
-      const now = Date.now()
-      const still = [...open.values()].map((o) => `${o.tool} (${((now - o.at) / 1000).toFixed(1)}s${o.arg ? `, ${o.arg}` : ''})`)
-      ended = { ...ended, failure: `${ended.failure}\nstill running when it timed out (abandoned, not stopped: they may still finish, so do not repeat them blind): ${still.join('; ')}` }
-    }
-    const notes = [
-      ...(stubs.size
-        ? [`Note: a result from ${[...stubs].join(', ')} was a compressed stub, not the tool's full text; ${deduped ? 'read(path) gets a whole file past a repeated-read stub, and ' : ''}call the tool with raw: true, or set CODEMODE_TOOL_DEFAULTS, to get the full text.`]
-        : []),
-      ...(cut.size
-        ? [`Note: Claude Code cut the middle out of a failed command's output from ${[...cut].join(', ')} (it keeps the first and last 5,000 chars of a failed result over 10,000); that sh() result is marked .truncated, and sending the output to a file (cmd > /tmp/out.txt 2>&1) and reading it with read(path) gets all of it.`]
-        : []),
-      ...(savedAway.size
-        ? [`Note: Claude Code saved a result from ${[...savedAway].join(', ')} to a file instead of returning it (it was over its token limit), and it could not be read back here; read(path) of the file the result names gets it where Read may open it.`]
-        : []),
-      ...(withheld.size ? [`Note: lean-ctx withheld a result from ${[...withheld].join(', ')} by its storage policy; that text is not available to scripts here.`] : []),
-      ...(persisted ? ['Note: Bash saved a big output to a file instead of returning it (<persisted-output>), and it could not be read back here; read(path) of the file it names gets it whole where Read may open it.'] : []),
-    ]
-    if (notes.length) ended = { ...ended, notes }
-    // A failed call can have changed things too (a command that wrote, then exited non-zero).
-    const only = calls.size === 1 ? [...calls][0] : undefined
-    // One failed call whose own error ended the run says nothing the error does not.
-    const echo =
-      only !== undefined &&
-      only[1].ok + only[1].open === 0 &&
-      only[1].failed === 1 &&
-      [only[0], ident(only[0])].some((n) => ended.failure?.includes(`Error: ${n}: `) === true)
-    const ran = echo ? '' : ledger(calls)
-    if (ended.failure && ran) ended = { ...ended, failure: `${ended.failure}\nTool calls before the failure: ${ran}` }
-    const now = Date.now()
-    const alongside = done?.failedId ? (done.alongside ?? 0) : 0
-    if (ended.failure && ended.kind === 'tool' && alongside > 0)
-      ended = {
-        ...ended,
-        failure: `${ended.failure}\n${alongside} call${alongside === 1 ? '' : 's'} that ran alongside it had succeeded or were still running; their results are lost with this failure: use call(), which never throws, or Promise.allSettled to keep them.`,
-      }
-    const before = failedScripts.get(raw)
-    if (ended.failure && ended.kind !== 'aborted') {
-      if (before)
-        ended = {
-          ...ended,
-          failure:
-            before.first === first
-              ? `${ended.failure}\nThis is the same script as a run that failed ${Math.round((now - before.at) / 1000)}s ago with the same error: change the script, not just run it again.`
-              : `${ended.failure}\nThis is the same script as a run that failed ${Math.round((now - before.at) / 1000)}s ago with: ${before.first.slice(0, 200)}`,
-        }
-      failedScripts.delete(raw)
-      failedScripts.set(raw, { first, at: now })
-      if (failedScripts.size > 20) failedScripts.delete(failedScripts.keys().next().value as string)
-    } else if (!ended.failure) failedScripts.delete(raw)
-    let parts = sections(now - started, ended)
-    let full = parts.join('\n')
-    if (full.length > maxChars) {
-      parts = sections(now - started, ended, true)
-      full = parts.join('\n')
-    }
-    // A cut output is kept whole on disk, so nothing in it needs a second run.
-    let file: string | undefined
-    if (full.length > maxChars) {
-      const spills = `${home}/.claude/codemode/out`
-      const path = `${spills}/${dir.slice(root.length + 1)}.txt`
-      file = await $.fs.write(path, full).then(() => path, () => undefined)
-      const old = ((await $.fs.list(spills).catch(() => [])) ?? [])
-        .filter((x) => x.name.endsWith('.txt'))
-        .sort((a, b) => b.mtimeMs - a.mtimeMs)
-        .filter((x, i) => i >= KEEP_SPILLS || Date.now() - x.mtimeMs > SPILL_AGE_MS)
-      if (old.length) await $.process.run(['rm', '-f', ...old.map((x) => `${spills}/${x.name}`)]).catch(() => {})
-    }
-    const out = fit(parts, maxChars, file, (ended.notes?.length ?? 0) + (ended.failure ? 1 : 0))
-    // A marker the cut removed still counts: the script chose to show it.
-    const blocks = attach(full, pictures)
-    return { result: blocks.length ? ([{ type: 'text', text: out }, ...blocks] as never) : out }
+    const job = startJob(caller, timeout)
+    expireLater($, job)
+    job.done = execute($, job, raw, script, pre.texts, timeout, maxChars).then(
+      (r) => settle(job, r.result),
+      (err: unknown) => settle(job, format(0, { items: [], logs: [], failure: `codemode's own hook failed: ${(err as Error)?.message ?? String(err)}`, kind: 'runner' })),
+    )
+    if (job.agent === MAIN) void job.done.then(() => wake($))
+    return { result: startedReply(job) as never }
   }).catch(($, e, next) => {
     const why = next.error?.message ?? next.error?.kind ?? 'unknown failure'
     if ((e.tool as string) === FULL) return { result: format(0, { items: [], logs: [], failure: `codemode's own hook failed: ${why}`, kind: 'runner' }) }

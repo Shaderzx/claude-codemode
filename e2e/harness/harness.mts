@@ -1,9 +1,38 @@
-import { spawn, spawnSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { Buffer } from 'node:buffer'
+import { spawn } from 'node:child_process'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 type Case = {
+  clockEarlyMs?: number
+  clockFrozen?: boolean
+  killDelayMs?: number
+  writeDelayMs?: number
+  patchDelayMs?: number
+  patchLostAfterApply?: boolean
+  patchErrorWrapped?: boolean
+  padPatchReply?: number
+  patchAnswerGate?: { applied: string; gate: string }
+  existsGapMs?: number
+  lastPartMayBeMissing?: boolean
+  holdLaterPages?: { asked: string; gate: string }
+  holdReplyContaining?: { text: string; asked: string; gate: string; giveUpMs?: number }
+  holdRealpath?: { match: string; afterTool: string; asked: string; gate: string }
+  denyWritePaths?: string[]
+  throwNoToolFor?: string[]
+  statDelayMs?: number
+  statDelayFor?: string
+  hangListMs?: number
+  hangListCount?: number
+  strictRealpath?: boolean
+  clockNowDelayMs?: number
+  loadDelayMs?: number
+  failReplyAfter?: { fail: number; after: number }
+  surfaces?: string[]
+  submitDelayMs?: number
+  hangListDuringRuns?: boolean
+  submitRefusals?: number
   tools?: string[]
   denied?: string[]
   home?: string
@@ -31,7 +60,10 @@ type Case = {
   abortStyle?: string
   engineForgets?: boolean
   changeAfterPage?: number
+  rewriteDuringFirstRead?: string
   readDelayMs?: number
+  readLagMs?: number
+  changeEveryRead?: boolean
   listThrows?: boolean
   detachAfterMs?: number
   slowWritesMs?: number
@@ -54,24 +86,35 @@ type Case = {
   archiveBytes?: string
   shortPages?: number
 }
-type Step = { compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
+type Step = { clockMark?: boolean; abortDuringNext?: { abort: string; start: string }; keepTurn?: boolean; agentId?: string; interrupt?: boolean; stop?: boolean; untilRunsDone?: boolean; collect?: boolean; untilWake?: boolean; turnStart?: string; turnComplete?: string; stopAborted?: boolean; clear?: boolean; reload?: boolean; turnAborted?: string; untilRunDone?: string; untilQuiet?: boolean; ageSpills?: boolean; abortAndStart?: { abort: string; start: string }; link?: { from: string; to: string }; untilFile?: string; untilStatPending?: boolean; stopAbortAfterMs?: number; agentEnd?: string; untilTool?: string; untilCalls?: { tool: string; count: number }; untilExists?: 'asked' | 'answered'; untilReadlink?: string; untilRealpath?: string; relink?: { from: string; to: string }; touch?: string; subagentStopWithoutId?: boolean; compact?: boolean; compactAgent?: string; compactSkipped?: boolean; script?: string; direct?: { tool: string; args: Record<string, unknown> }; search?: string; describe?: string; newSession?: boolean; setDenied?: string[]; setCwd?: string }
 
 const root = join(import.meta.dirname, '..', '..')
 const c: Case = JSON.parse(readFileSync(process.argv[2] as string, 'utf8'))
 const work = mkdtempSync(join(tmpdir(), 'codemode-mod-'))
 const live = new Set<number>()
+const direct = new Set<number>()
 const stop = (pid: number | undefined) => {
   if (pid === undefined) return
   live.delete(pid)
   try { process.kill(-pid, 'SIGKILL') } catch {}
 }
+const stopDirect = (pid: number | undefined) => {
+  if (pid === undefined) return
+  direct.delete(pid)
+  try { process.kill(pid, 'SIGKILL') } catch {}
+}
 const home = c.home ?? mkdtempSync(join(tmpdir(), 'codemode-home-'))
-process.on('exit', () => {
+const cleanup = () => {
   for (const pid of [...live]) stop(pid)
+  for (const pid of [...direct]) stopDirect(pid)
   rmSync(work, { recursive: true, force: true })
   if (c.home === undefined) rmSync(home, { recursive: true, force: true })
-})
+}
+process.on('exit', cleanup)
+process.on('SIGTERM', () => process.exit(143))
+process.on('SIGINT', () => process.exit(130))
 copyFileSync(join(root, 'codemode/hooks/register.tsx'), join(work, 'register.mts'))
+Reflect.deleteProperty(globalThis, 'Buffer')
 const mod = await import(join(work, 'register.mts'))
 let cwd = c.cwd ?? home
 const store: Record<string, unknown> = { ...(c.store ?? {}) }
@@ -106,6 +149,17 @@ const shellOk = (t: string) => ok(t, [{ type: 'text', text: t }])
 const firewalled = (id: string, body: string) => '[Firewalled ctx_shell output — ' + body.length + ' chars, ' + body.split('\n').length + ' lines stored out-of-band]\n--- head ---\n' + body.slice(0, 200) + '\n--- retrieve full output ---\nFull:    ctx_expand(id="' + id + '")'
 const archive = (id: string) => join(home, '.local', 'share', 'lean-ctx', 'archives', id.slice(0, 2), id + '.txt')
 let archived = 0
+let replyHeld = false
+let realpathHolds = 0
+const realpathsAsked: string[] = []
+const realpathHeld = async (argv: string[]) => {
+  const hold = c.holdRealpath
+  if (!hold || realpathHolds || argv[0] !== 'realpath' || !String(argv[1]).includes(hold.match) || !calls.some((x) => x.tool === hold.afterTool)) return
+  realpathHolds++
+  writeFileSync(hold.asked, '')
+  await until(() => existsSync(hold.gate), 30_000, hold.gate + ' appearing')
+}
+let heldFakes = 0
 let swapped = 0
 const tokensOf = (rows: string[]) => rows.reduce((n, l) => n + (l.length > 200 && !/\s/.test(l) ? l.length : Math.ceil(l.length / 4)) + 1, 0)
 const leanReply = (tool: string, r: { code: number; out: string }) => {
@@ -159,6 +213,8 @@ const shell = (command: string, keepCwd = false) => {
 
 const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<string, unknown>> => {
   calls.push({ tool, args: a })
+  if ((c.throwNoToolFor ?? []).includes(tool)) throw new Error('codemode: $.tool.call: no tool named "' + tool + '" in this session')
+  if (tool === 'Write' && (c.denyWritePaths ?? []).some((d) => String(a.file_path ?? '').endsWith(d))) return { deny: 'Permission to write ' + String(a.file_path) + ' has been denied.' }
   if (tool === 'Bash' && (c.deniedCommands ?? []).some((d) => String(a.command ?? '').includes(d)))
     return err(c.deniedMessage ?? 'PreToolUse:Bash hook error: blocked: this command is not allowed here')
   if ((c.denied ?? []).includes(tool))
@@ -166,6 +222,13 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
   if (!names.includes(tool)) throw new Error('codemode: $.tool.call: no tool named "' + tool + '" in this session')
   switch (tool) {
     case 'Read': {
+      const hold = c.holdLaterPages
+      if (hold && Number(a.offset ?? 1) > 1) {
+        writeFileSync(hold.asked, '')
+        heldFakes++
+        for (let waited = 0; !existsSync(hold.gate) && waited < 30_000; waited += 20) await new Promise((r) => setTimeout(r, 20))
+        heldFakes--
+      }
       if (c.readDelayMs) await new Promise((r) => setTimeout(r, c.readDelayMs))
       if ((c.denyReadPaths ?? []).some((d) => String(a.file_path ?? '').endsWith(d))) return { deny: 'Permission to read ' + String(a.file_path) + ' has been denied.' }
       if (c.readRewrite !== undefined) return ok(c.readRewrite)
@@ -174,6 +237,7 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       const p = String(a.file_path ?? '').trim()
       if (!p.startsWith('/') || !existsSync(p)) return err('File does not exist. Note: your current working directory is ' + cwd + '.')
       const text = readFileSync(p, 'utf8')
+      if (c.readLagMs) await new Promise((r) => setTimeout(r, c.readLagMs))
       if (!text) return ok('<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>')
       const lines = text.split('\n').map((l) => l.replace(/\r$/, ''))
       const key = p + ':' + String(a.offset) + ':' + String(a.limit)
@@ -200,12 +264,19 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       seen.set(key, statSync(p).mtimeMs)
       readTimes.set(p, statSync(p).mtimeMs)
       if (typeof a.limit === 'number' && c.changeAfterPage === offset) writeFileSync(p, text + 'changed meanwhile\n')
+      if (c.changeEveryRead) writeFileSync(p, text + 'changed\n')
+      if (c.rewriteDuringFirstRead !== undefined && !rewrittenDuringRead) {
+        rewrittenDuringRead = true
+        writeFileSync(p, c.rewriteDuringFirstRead)
+      }
       return ok(numbered(part, offset), { type: 'text', file: { filePath: p, content: part.join('\n'), numLines: part.length, startLine: offset, totalLines: lines.length, ...(cut ? { truncatedByTokenCap: true } : {}) } })
     }
     case 'Write': {
+      if (c.writeDelayMs) await new Promise((r) => setTimeout(r, c.writeDelayMs))
       if (c.deniedWriteMessage !== undefined) return err(c.deniedWriteMessage)
       const w = writePath(a.file_path)
       if (!c.engineForgets && existsSync(w) && readTimes.has(w) && statSync(w).mtimeMs !== readTimes.get(w)) return err('<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>')
+      mkdirSync(dirname(w), { recursive: true })
       writeFileSync(w, String(a.content))
       readTimes.set(w, statSync(w).mtimeMs)
       return ok('File created successfully at: ' + a.file_path)
@@ -292,14 +363,19 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
       return leanReply(tool, r)
     }
     case 'mcp__lean-ctx__ctx_patch': {
+      if (c.patchDelayMs) await new Promise((r) => setTimeout(r, c.patchDelayMs))
       if (Array.isArray(a.ops)) {
         const said: string[] = []
-        for (const o of a.ops as Record<string, unknown>[]) {
+        for (const [i, o] of (a.ops as Record<string, unknown>[]).entries()) {
           const r = await fake('mcp__lean-ctx__ctx_patch', { ...(a.path === undefined ? {} : { path: a.path }), ...o })
-          if ((r as { isError?: boolean }).isError) return r
-          said.push(String((r as { text?: string }).text))
+          const text = String((r as { text?: string }).text)
+          if ((r as { isError?: boolean }).isError) {
+            const failed = i === 0 ? text : 'ops[' + i + '] (' + String(o.op) + '): ' + text + '\nEarlier ops in this batch were already applied:\n' + said.join('\n\n')
+            return err(c.patchErrorWrapped ? '<tool_use_error>' + failed + '</tool_use_error>' : failed)
+          }
+          said.push(text)
         }
-        return ok(said.join('\n'))
+        return ok(said.join('\n') + (c.padPatchReply ? '\n' + 'x'.repeat(c.padPatchReply) : ''))
       }
       const p = String(a.path).startsWith('/') ? String(a.path) : join(cwd, String(a.path))
       if (a.op === 'create' && c.deniedCreateMessage !== undefined) return err(c.deniedCreateMessage)
@@ -381,6 +457,8 @@ const fake = async (tool: string, a: Record<string, unknown>): Promise<Record<st
     }
     case 'mcp__t3-code__big_report':
       return ok('x'.repeat(2_100_000), { structuredContent: { data: 'y'.repeat(2_100_000) } })
+    case 'mcp__shots__snap':
+      return { text: '', result: { type: 'image', file: { base64: 'QUJDREVG', type: 'image/png', originalSize: 6 } } }
     case 'mcp__other__git_patch':
       return err('git_patch must never be chosen by write() or edit()')
     case 'mcp__aaa-ssh__remote_shell':
@@ -413,12 +491,66 @@ const handlers: Record<string, (...x: unknown[]) => Promise<unknown>> = Object.f
 let listing = true
 
 const registered: Record<string, unknown>[] = []
+const submitted: string[] = []
+const stops: string[] = []
+type Result = { text: string; attachments: number; ms: number; id?: string; immediate?: string; immediateMs?: number; heldMs?: number }
+const byRun = new Map<string, Result>()
+const SECTION = /^\[(r\d+) (?:finished|stopped) after [^\]\n]*\]$/gm
+const absorb = (text: string) => {
+  const heads = [...text.matchAll(SECTION)]
+  heads.forEach((m, i) => {
+    const r = byRun.get(m[1] as string)
+    if (!r) return
+    const from = (m.index ?? 0) + m[0].length + 1
+    const to = i + 1 < heads.length ? (heads[i + 1]!.index ?? text.length) : text.length
+    r.text = text.slice(from, to).replace(/\n\n$/, '')
+  })
+}
+let inTurn = false
+let sessionStarted = false
+let wakesPending = 0
+let wakesSeen = 0
+let statsPending = 0
+let existsAsked = 0
+const lstatSafe = (p: string) => { try { return lstatSync(p) } catch { return undefined } }
+const linksRead: string[] = []
+let existsAnswered = 0
+let bashWaits = 0
+let listsHanging = 0
+let rewrittenDuringRead = false
+let clockNowCalls = 0
+const clockMarks: number[] = []
+const writtenReplies = new Set<string>()
+const failedReplies = new Set<string>()
+let listsHung = 0
+let fakesPending = 0
+let lastActivity = Date.now()
+let wakeAttempts = 0
+let refusals = c.submitRefusals ?? 0
+const kills: string[][] = []
+const waits = new Set<number>()
+let runsStarted = 0
+let inflight = 0
+const until = async (check: () => boolean, ms: number, what = 'a harness wait') => {
+  const end = Date.now() + ms
+  while (!check()) {
+    if (Date.now() >= end) throw new Error(what + ' never happened within ' + ms + 'ms')
+    await new Promise((r) => setTimeout(r, 20))
+  }
+}
 let started = Date.now()
 const $ = {
   plugin: { root: join(root, 'codemode') },
   tool: {
     list: async () => {
       if (!listing) throw new Error('$.tool.list failed')
+      if (c.hangListDuringRuns && sessionStarted) await new Promise(() => {})
+      if (c.hangListMs && sessionStarted && (c.hangListCount === undefined || listsHung++ < c.hangListCount)) {
+        listsHanging++
+        await new Promise((r) => setTimeout(r, c.hangListMs))
+        listsHanging--
+        lastActivity = Date.now()
+      }
       return names.map((n) => ({ name: n, description: DESCRIPTIONS[n] ?? n, mcp: n.startsWith('mcp__') }))
     },
     register: async (d: Record<string, unknown>) => {
@@ -427,7 +559,17 @@ const $ = {
     },
     call: async (args: Record<string, unknown>) => {
       const { tool, ...rest } = args
-      const r = await fake(String(tool), rest)
+      fakesPending++
+      const r = await fake(String(tool), rest).finally(() => {
+        fakesPending--
+        lastActivity = Date.now()
+      })
+      if (c.patchLostAfterApply && ['mcp__lean-ctx__ctx_patch', 'Write', 'Edit'].includes(String(tool)) && r.isError !== true) throw new Error('MCP error -32000: Connection closed')
+      const answering = c.patchAnswerGate
+      if (answering && ['mcp__lean-ctx__ctx_patch', 'Write', 'Edit'].includes(String(tool))) {
+        writeFileSync(answering.applied, '')
+        await until(() => existsSync(answering.gate), 60_000, answering.gate + ' appearing')
+      }
       const t = typeof r.text === 'string' ? r.text : undefined
       if (r.isError !== true && t !== undefined && t.length > 50000 && String(tool).startsWith('mcp__') && !c.noSwap) {
         const saved = join(c.env?.CLAUDE_CONFIG_DIR ?? join(home, '.claude'), 'projects', 'p', 's', 'tool-results', String(tool).slice(5).replace(/__/g, '-') + '-' + Date.now() + '-' + ++swapped + '.txt')
@@ -443,26 +585,69 @@ const $ = {
       return r
     },
   },
-  env: { get: async (k: string) => ({ HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },
+  env: { get: async (k: string) => (lastActivity = Date.now(), { HOME: home, CODEMODE_NODE: process.execPath, PWD: cwd, ...(c.env ?? {}) } as Record<string, string>)[k] },
   fs: {
     write: async (p: string, t: string) => {
-      if (Buffer.byteLength(t) > 4 * 1024 * 1024) throw new Error('fs.write: over the 4 MiB limit')
-      mkdirSync(dirname(p), { recursive: true })
-      writeFileSync(p, t)
-      if (c.slowWritesMs) await new Promise((r) => setTimeout(r, c.slowWritesMs))
-      return p
+      const holding = c.holdReplyContaining
+      if (holding && !replyHeld && p.endsWith('.json') && t.includes(holding.text)) {
+        replyHeld = true
+        writeFileSync(holding.asked, '')
+        await until(() => existsSync(holding.gate), holding.giveUpMs ?? 30_000, holding.gate + ' appearing')
+      }
+      inflight++
+      try {
+        writtenReplies.add(p)
+        const failing = c.failReplyAfter
+        if (failing && p.endsWith('/' + failing.fail + '.json') && t.includes('"ok":true')) {
+          const after = p.slice(0, p.lastIndexOf('/') + 1) + failing.after + '.json'
+          if (!failedReplies.has(p)) await until(() => writtenReplies.has(after), 30_000, 'reply ' + failing.after + ' being written')
+          failedReplies.add(p)
+          throw new Error('fs.write: failed on purpose')
+        }
+        if (Buffer.byteLength(t) > 4 * 1024 * 1024) throw new Error('fs.write: over the 4 MiB limit')
+        mkdirSync(dirname(p), { recursive: true })
+        writeFileSync(p, t)
+        if (c.slowWritesMs) await new Promise((r) => setTimeout(r, c.slowWritesMs))
+        return p
+      } finally {
+        inflight--
+      }
     },
     read: async (p: string) => readFileSync(p, 'utf8'),
     list: async (p: string) => readdirSync(p).map((n) => ({ name: n, mtimeMs: statSync(join(p, n)).mtimeMs })),
-    exists: async (p: string) => existsSync(p),
+    exists: async (p: string) => {
+      if (!c.existsGapMs || !sessionStarted) return existsSync(p)
+      existsAsked++
+      await new Promise((r) => setTimeout(r, c.existsGapMs))
+      const found = existsSync(p)
+      existsAnswered++
+      await new Promise((r) => setTimeout(r, c.existsGapMs))
+      return found
+    },
     stat: async (p: string) => {
+      if (c.statDelayMs && sessionStarted && (!c.statDelayFor || String(p).includes(c.statDelayFor))) {
+        statsPending++
+        await new Promise((r) => setTimeout(r, c.statDelayMs))
+        statsPending--
+      }
       const s = statSync(p)
       return { kind: s.isDirectory() ? 'dir' : s.isFile() ? 'file' : 'other', size: s.size, mtimeMs: s.mtimeMs, isLink: false }
     },
   },
   process: {
     spawn: ({ argv, input }: { argv: string[]; input?: string }) => {
+      if (argv.includes('--permission')) runsStarted++
       const child = spawn(argv[0] as string, argv.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
+      const runner = argv.includes('--permission')
+      if (child.pid !== undefined) {
+        direct.add(child.pid)
+        child.on('close', () => direct.delete(child.pid as number))
+        child.on('error', () => direct.delete(child.pid as number))
+      }
+      if (!runner && child.pid) {
+        waits.add(child.pid)
+        child.on('close', () => waits.delete(child.pid as number))
+      }
       child.stdin.end(input ?? '')
       const queue: { stream: string; text: string }[] = []
       let wake: (() => void) | undefined
@@ -473,6 +658,7 @@ const $ = {
       child.on('error', (e) => { queue.push({ stream: 'stderr', text: String(e.message) }); ended = true; wake?.() })
       const abortAt = c.abortAfterMs === undefined ? undefined : started + c.abortAfterMs
       return (async function* () {
+        try {
         while (true) {
           if (abortAt !== undefined && Date.now() >= abortAt) {
             child.kill('SIGKILL')
@@ -485,25 +671,77 @@ const $ = {
           await new Promise<void>((r) => { wake = r; setTimeout(r, 20) })
           wake = undefined
         }
+        } finally {
+          if (!ended && !runner) child.kill('SIGKILL')
+        }
       })()
     },
-    run: async (argv: string[]) => {
-      const r = spawnSync(argv[0] as string, argv.slice(1), { encoding: 'utf8' })
-      return { exitCode: r.status ?? 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
-    },
+    run: (argv: string[], _init?: unknown) => realpathHeld(argv).then(() =>
+      c.lastPartMayBeMissing && argv[0] === 'realpath' && !lstatSafe(String(argv[1])) && existsSync(dirname(String(argv[1])))
+        ? Promise.resolve({ exitCode: 0, stdout: join(realpathSync(dirname(String(argv[1]))), basename(String(argv[1]))) + '\n', stderr: '' })
+        : c.strictRealpath && argv[0] === 'realpath' && !existsSync(String(argv[1]))
+        ? Promise.resolve({ exitCode: 1, stdout: '', stderr: 'realpath: ' + argv[1] + ': No such file or directory' })
+        : (argv[0] === 'kill' ? kills.push([...argv]) : 0, (argv[0] === 'kill' && c.killDelayMs ? new Promise((r) => setTimeout(r, c.killDelayMs)) : Promise.resolve()).then(() => new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
+        if (argv[0] === 'readlink') linksRead.push(String(argv[1]))
+        const p = spawn(argv[0] as string, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
+        if (p.pid !== undefined) direct.add(p.pid)
+        if (argv[0] === 'bash') bashWaits++
+        if (p.pid) {
+          waits.add(p.pid)
+          p.on('close', () => { waits.delete(p.pid as number); direct.delete(p.pid as number) })
+          p.on('error', () => { waits.delete(p.pid as number); direct.delete(p.pid as number) })
+        }
+        let stdout = ''
+        let stderr = ''
+        p.stdout.setEncoding('utf8').on('data', (t: string) => { stdout += t })
+        p.stderr.setEncoding('utf8').on('data', (t: string) => { stderr += t })
+        p.on('error', (e) => done({ exitCode: 127, stdout, stderr: stderr + String(e.message) }))
+        p.on('close', (code) => {
+          done({ exitCode: code ?? 1, stdout, stderr })
+        })
+      })))).then((answer) => {
+        if (argv[0] === 'realpath') realpathsAsked.push(String(argv[1]))
+        return answer
+      }),
   },
   clock: {
+    now: async () => {
+      clockNowCalls++
+      if (c.clockNowDelayMs) await new Promise((r) => setTimeout(r, c.clockNowDelayMs))
+      return Date.now()
+    },
     after: (ms: number, fn: () => void) => {
-      const h = setTimeout(fn, ms)
+      if (c.clockFrozen && sessionStarted) return { cancel: () => undefined }
+      const h = setTimeout(fn, Math.max(0, ms - (c.clockEarlyMs ?? 0)))
       return { cancel: () => clearTimeout(h) }
     },
   },
   store: {
-    get: async (k: string) => store[k],
+    get: async (k: string) => {
+      if (c.loadDelayMs && k.startsWith('script:')) await new Promise((r) => setTimeout(r, c.loadDelayMs))
+      return store[k]
+    },
     set: async (k: string, v: unknown) => { store[k] = v },
     delete: async (k: string) => { delete store[k] },
   },
-  session: { version: async () => ({ version: '2.1.325' }) },
+  session: { version: async () => ({ version: '2.1.325' }), surfaces: async () => c.surfaces ?? [] },
+  prompt: {
+    submit: async (a: { text: string }) => {
+      wakeAttempts++
+      wakesPending++
+      try {
+        if (c.submitDelayMs) await new Promise((r) => setTimeout(r, c.submitDelayMs))
+      } finally {
+        wakesPending--
+      }
+      if (refusals > 0) {
+        refusals--
+        throw new Error('prompt.submit refused')
+      }
+      submitted.push(a.text)
+      return { text: a.text, origin: { kind: 'plugin', name: 'codemode' } }
+    },
+  },
   model: { complete: async (r: { model: string; prompt: string }) => ({ isAnswered: true, text: 'answer from ' + r.model + ' to: ' + r.prompt.slice(0, 60) }) },
 }
 
@@ -515,13 +753,48 @@ const flatten = (r: unknown): { text: string; attachments: number } => {
   return { text: JSON.stringify(v), attachments: 0 }
 }
 
-const out: { description?: string; results: { text: string; attachments: number; ms: number }[]; calls: typeof calls; store: typeof store } = { results: [], calls, store }
+const out: { description?: string; results: Result[]; calls: typeof calls; store: typeof store; submitted: string[]; stops: string[]; collected: string[]; collectedAttachments: number[]; kills: string[][]; waitsAlive: number; wakeAttempts: number; clockNowCalls?: number; clockMarks?: number[]; bashWaits?: number; runnersSpawned?: number } = { results: [], calls, store, submitted, stops, collected: [], collectedAttachments: [], kills, waitsAlive: 0, wakeAttempts: 0 }
+const collect = async (agentId?: string) => {
+  const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: '', ...(agentId ? { agentId } : {}) }, engine(async () => ({})))
+  const flat = flatten(r)
+  out.collected.push(flat.text)
+  out.collectedAttachments.push(flat.attachments)
+  absorb(flat.text)
+  return flat
+}
+const endTurn = async (agentId: string | undefined, interrupt: boolean) => {
+  const t0 = Date.now()
+  if (interrupt) {
+    inTurn = false
+    await handlers['turn.complete']?.($, { turnId: 'turn', isAborted: true }, engine(async () => ({})))
+    return Date.now() - t0
+  }
+  const hook = agentId ? handlers['classic.SubagentStop'] : handlers['classic.Stop']
+  const e = agentId ? { hook_event_name: 'SubagentStop', agent_id: agentId, stop_hook_active: false } : { hook_event_name: 'Stop', stop_hook_active: false, background_tasks: [] }
+  const r = (await hook?.($, e, engine(async () => ({})))) as { block?: string } | undefined
+  if (typeof r?.block === 'string') {
+    stops.push(r.block)
+    absorb(r.block)
+    if (/empty script/.test(r.block)) {
+      await collect(agentId)
+      const again = (await hook?.($, { ...e, stop_hook_active: true }, engine(async () => ({})))) as { block?: string } | undefined
+      if (typeof again?.block === 'string') stops.push(again.block)
+    }
+  }
+  const stopped = Date.now() - t0
+  if (!agentId) {
+    inTurn = false
+    await handlers['turn.complete']?.($, { turnId: 'turn' }, engine(async () => ({})))
+  }
+  return stopped
+}
 const startSession = async () => {
   registered.length = 0
   await handlers['session.start']?.($, { cwd }, engine(async () => ({})))
   out.description = String(registered.at(-1)?.description ?? '')
 }
 await startSession()
+sessionStarted = true
 if (c.listThrows) listing = false
 for (const s of c.steps) {
   started = Date.now()
@@ -531,10 +804,174 @@ for (const s of c.steps) {
     await handlers['session.compact']?.($, { trigger: 'manual', ...(s.compactAgent ? { agentId: s.compactAgent } : {}) }, engine(async () => (s.compactSkipped ? { skip: 'kept by a hook' } : { messages: [] })))
     continue
   }
-  if (s.newSession) { await startSession(); continue }
+  if (s.newSession) {
+    await handlers['session.end']?.($, { reason: 'clear' }, engine(async () => ({})))
+    await startSession()
+    continue
+  }
+  if (s.clear) {
+    await handlers['session.end']?.($, { reason: 'clear' }, engine(async () => ({})))
+    continue
+  }
+  if (s.reload) {
+    await startSession()
+    continue
+  }
+  if (s.turnAborted !== undefined) {
+    inTurn = false
+    await handlers['turn.complete']?.($, { ...(s.turnAborted ? { turnId: s.turnAborted } : {}), isAborted: true }, engine(async () => ({})))
+    continue
+  }
+  if (s.untilRunsDone) {
+    await until(() => mod.openRunIds().length === 0 && inflight === 0 && statsPending === 0, 60_000, 'every run settling')
+    await new Promise((r) => setTimeout(r, 0))
+    continue
+  }
+  if (s.stop) {
+    await endTurn(s.agentId, !!s.interrupt)
+    continue
+  }
+  if (s.untilRunDone) {
+    await until(() => !mod.openRunIds().includes(s.untilRunDone) && inflight === 0, 60_000, s.untilRunDone + ' settling')
+    await new Promise((r) => setTimeout(r, 0))
+    continue
+  }
+  if (s.ageSpills) {
+    const spills = join(home, '.claude', 'codemode', 'out')
+    const old = (Date.now() - 3 * 86_400_000) / 1000
+    for (const n of existsSync(spills) ? readdirSync(spills) : []) utimesSync(join(spills, n), old, old)
+    continue
+  }
+  if (s.clockMark) {
+    clockMarks.push(clockNowCalls)
+    continue
+  }
+  if (s.abortDuringNext) {
+    const { abort, start } = s.abortDuringNext
+    inTurn = false
+    await handlers['turn.complete']?.($, { ...(abort ? { turnId: abort } : {}), isAborted: true }, engine(async () => {
+      inTurn = true
+      await handlers['turn.start']?.($, start ? { turnId: start } : {}, engine(async () => ({})))
+      return {}
+    }))
+    continue
+  }
+  if (s.abortAndStart) {
+    inTurn = false
+    const aborting = handlers['turn.complete']?.($, { turnId: s.abortAndStart.abort, isAborted: true }, engine(async () => ({})))
+    await until(() => kills.length > 0, 30_000, 'the abort sending its kill')
+    inTurn = true
+    await handlers['turn.start']?.($, { turnId: s.abortAndStart.start }, engine(async () => ({})))
+    await aborting
+    continue
+  }
+  if (s.link) {
+    symlinkSync(s.link.to, s.link.from)
+    continue
+  }
+  if (s.relink) {
+    rmSync(s.relink.from, { force: true, recursive: true })
+    symlinkSync(s.relink.to, s.relink.from)
+    continue
+  }
+  if (s.untilReadlink) {
+    const link = s.untilReadlink
+    await until(() => linksRead.some((p) => p === link || p.endsWith(link)), 30_000, 'the mod reading the link ' + link)
+    continue
+  }
+  if (s.untilExists) {
+    const phase = s.untilExists
+    await until(() => (phase === 'asked' ? existsAsked : existsAnswered) > 0, 30_000, 'a file existence check ' + phase)
+    continue
+  }
+  if (s.untilQuiet) {
+    await until(() => listsHanging === 0 && inflight === 0 && fakesPending - heldFakes === 0 && statsPending === 0 && Date.now() - lastActivity > 500, 60_000, 'the mod going quiet')
+    continue
+  }
+  if (s.untilFile) {
+    await until(() => existsSync(s.untilFile as string), 240_000, s.untilFile + ' appearing')
+    continue
+  }
+  if (s.untilRealpath) {
+    await until(() => realpathsAsked.includes(s.untilRealpath as string), 30_000, 'a path check of ' + s.untilRealpath)
+    continue
+  }
+  if (s.untilStatPending) {
+    await until(() => statsPending > 0, 30_000, 'a file check starting')
+    continue
+  }
+  if (s.stopAbortAfterMs !== undefined) {
+    const ac = new AbortController()
+    setTimeout(() => ac.abort(), s.stopAbortAfterMs)
+    const r = (await handlers['classic.Stop']?.($, { hook_event_name: 'Stop', stop_hook_active: false }, Object.assign(engine(async () => ({})), { signal: ac.signal }))) as { block?: string } | undefined
+    stops.push(String(r?.block ?? ''))
+    await new Promise((r) => setTimeout(r, 400))
+    continue
+  }
+  if (s.turnStart !== undefined) {
+    inTurn = true
+    await handlers['turn.start']?.($, s.turnStart ? { turnId: s.turnStart } : {}, engine(async () => ({})))
+    continue
+  }
+  if (s.turnComplete !== undefined) {
+    await handlers['turn.complete']?.($, s.turnComplete ? { turnId: s.turnComplete } : {}, engine(async () => ({})))
+    continue
+  }
+  if (s.stopAborted) {
+    const ac = new AbortController()
+    ac.abort()
+    const r = (await handlers['classic.Stop']?.($, { hook_event_name: 'Stop', stop_hook_active: false }, Object.assign(engine(async () => ({})), { signal: ac.signal }))) as { block?: string } | undefined
+    stops.push(String(r?.block ?? ''))
+    continue
+  }
+  if (s.untilWake) {
+    await until(() => wakeAttempts > wakesSeen && wakesPending === 0, 30_000, 'a wake prompt')
+    wakesSeen = wakeAttempts
+    continue
+  }
+  if (s.collect) {
+    await collect(s.agentId)
+    continue
+  }
+  if (s.agentEnd) {
+    await handlers['turn.complete']?.($, { turnId: 'agent-turn', agentId: s.agentEnd }, engine(async () => ({})))
+    continue
+  }
+  if (s.subagentStopWithoutId) {
+    const r = (await handlers['classic.SubagentStop']?.($, { hook_event_name: 'SubagentStop', stop_hook_active: false }, engine(async () => ({})))) as { block?: string } | undefined
+    stops.push(String(r?.block ?? ''))
+    continue
+  }
+  if (s.untilCalls) {
+    const want = s.untilCalls
+    await until(() => calls.filter((x) => x.tool === want.tool).length >= want.count, 30_000, want.count + ' ' + want.tool + ' calls')
+    continue
+  }
+  if (s.untilTool) {
+    await until(() => calls.some((x) => x.tool === s.untilTool), 30_000, 'a ' + s.untilTool + ' call')
+    continue
+  }
+  if (s.touch) {
+    writeFileSync(s.touch, '')
+    continue
+  }
   if (s.script !== undefined) {
-    const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: s.script }, engine(async () => ({})))
-    out.results.push({ ...flatten(r), ms: Date.now() - started })
+    if (!inTurn && !s.agentId) {
+      inTurn = true
+      await handlers['turn.start']?.($, { turnId: 'turn' }, engine(async () => ({})))
+    }
+    const r = await handlers['tool.call']?.($, { tool: 'mcp__codemode__run', script: s.script, ...(s.agentId ? { agentId: s.agentId } : {}) }, engine(async () => ({})))
+    const flat = flatten(r)
+    const result: Result = { ...flat, ms: Date.now() - started, immediate: flat.text, immediateMs: Date.now() - started }
+    const id = /^Started (r\d+) in the background/.exec(flat.text)?.[1]
+    absorb(flat.text)
+    if (id) {
+      result.id = id
+      byRun.set(id, result)
+    }
+    out.results.push(result)
+    if (!s.keepTurn) result.heldMs = await endTurn(s.agentId, !!s.interrupt)
+    result.ms = Date.now() - started
   } else if (s.direct) {
     const r = await handlers['tool.call']?.($, { tool: s.direct.tool, ...s.direct.args }, engine(async (e) => fake(String(e.tool), s.direct!.args)))
     out.results.push({ ...flatten(r), ms: Date.now() - started })
@@ -546,4 +983,10 @@ for (const s of c.steps) {
     out.results.push({ text: String((r as { description?: string })?.description ?? ''), attachments: 0, ms: 0 })
   }
 }
+out.waitsAlive = waits.size
+out.bashWaits = bashWaits
+out.runnersSpawned = runsStarted
+out.wakeAttempts = wakeAttempts
+out.clockNowCalls = clockNowCalls
+out.clockMarks = clockMarks
 process.stdout.write(JSON.stringify(out), () => process.exit(0))

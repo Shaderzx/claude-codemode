@@ -8,12 +8,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        shard: [1, 2, 3, 4]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '26'
       - name: Install the suite
@@ -24,19 +34,18 @@ jobs:
         run: npx tsrs --noEmit -p .
       - name: Run the suite
         working-directory: e2e
-        run: npx e2e run
+        run: npx e2e run --shard ${{ matrix.shard }}/4
   mods:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '26'
-      - name: Install Claude Code
-        run: npm install -g @anthropic-ai/claude-code@2.1.325
       - name: Validate and test codemode
         working-directory: codemode
-        run: claude plugin validate . && claude plugin test
+        run: npx --yes @anthropic-ai/claude-code@2.1.325 plugin validate . && npx --yes @anthropic-ai/claude-code@2.1.325 plugin test
       - name: Validate and test codemode-agents
         working-directory: codemode-agents
-        run: claude plugin validate . && claude plugin test
+        run: npx --yes @anthropic-ai/claude-code@2.1.325 plugin validate . && npx --yes @anthropic-ai/claude-code@2.1.325 plugin test
